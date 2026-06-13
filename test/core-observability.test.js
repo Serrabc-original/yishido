@@ -238,11 +238,13 @@ test("WhatsApp /version uses memberId and does not throw when Woztell returns 50
 
 test("normal WhatsApp text does not send generic fallback when OpenAI returns a valid plan", async () => {
   const sentTexts = [];
+  const openAiBodies = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
     const cleanUrl = String(url);
 
     if (cleanUrl.includes("api.openai.com/v1/responses")) {
+      openAiBodies.push(JSON.parse(options.body));
       return new Response(JSON.stringify({
         output_text: JSON.stringify({
           intent: "general",
@@ -286,8 +288,75 @@ test("normal WhatsApp text does not send generic fallback when OpenAI returns a 
 
     assert.deepEqual(sentTexts, ["Hola, estoy listo para ayudarte."]);
     assert.equal(sentTexts.includes("Tuve un problema procesando tu solicitud. Intenta nuevamente en unos minutos."), false);
+    assert.equal(openAiBodies.length, 1);
+    assert.equal(openAiBodies[0].reasoning.effort, "low");
+    assert.notEqual(openAiBodies[0].reasoning.effort, "minimal");
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("invalid OPENAI_REASONING_EFFORT is normalized to low", async () => {
+  const openAiBodies = [];
+  const logLines = [];
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+
+  console.log = (...args) => {
+    logLines.push(args.map(String).join(" "));
+  };
+
+  globalThis.fetch = async (url, options) => {
+    const cleanUrl = String(url);
+
+    if (cleanUrl.includes("api.openai.com/v1/responses")) {
+      openAiBodies.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({
+        output_text: JSON.stringify({
+          intent: "general",
+          confidence: 0.9,
+          should_handle_in_core: false,
+          target_module: "core",
+          needs_clarification: false,
+          clarification_question: "",
+          actions: [],
+          user_facing_ack: "Hola.",
+          state_updates: {}
+        })
+      }), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json"
+        }
+      });
+    }
+
+    return new Response(JSON.stringify({ ok: 1 }), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json"
+      }
+    });
+  };
+
+  const coordinator = new ConversationCoordinator(createMemoryState(), {
+    OPENAI_API_KEY: "sk-test",
+    WOZTELL_ACCESS_TOKEN: "test-token",
+    ORCHESTRATOR_PROVIDER: "openai",
+    ORCHESTRATOR_MODEL: "gpt-5.4-mini",
+    OPENAI_REASONING_EFFORT: "minimal"
+  });
+
+  try {
+    await coordinator.receiveMessage(buildTextWebhookBody("Hola"));
+    await coordinator.processBuffer();
+
+    assert.equal(openAiBodies.length, 1);
+    assert.equal(openAiBodies[0].reasoning.effort, "low");
+    assert.equal(logLines.some((line) => line.includes("OPENAI_REASONING_EFFORT_NORMALIZED")), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
   }
 });
 
@@ -350,6 +419,126 @@ test("normal WhatsApp text logs clear OpenAI failure cause before generic fallba
     globalThis.fetch = originalFetch;
     console.error = originalError;
     console.log = originalLog;
+  }
+});
+
+test("OpenAI failure skips Claude fallback when ANTHROPIC_API_KEY is missing", async () => {
+  const urls = [];
+  const logLines = [];
+  const originalFetch = globalThis.fetch;
+  const originalError = console.error;
+  const originalLog = console.log;
+
+  console.error = (...args) => {
+    logLines.push(args.map(String).join(" "));
+  };
+  console.log = (...args) => {
+    logLines.push(args.map(String).join(" "));
+  };
+
+  globalThis.fetch = async (url, options) => {
+    const cleanUrl = String(url);
+    urls.push(cleanUrl);
+
+    if (cleanUrl.includes("api.openai.com/v1/responses")) {
+      return new Response(JSON.stringify({
+        error: {
+          message: "Unsupported value: 'minimal' is not supported."
+        }
+      }), {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json"
+        }
+      });
+    }
+
+    return new Response(JSON.stringify({ ok: 1 }), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json"
+      }
+    });
+  };
+
+  const coordinator = new ConversationCoordinator(createMemoryState(), {
+    OPENAI_API_KEY: "sk-test",
+    WOZTELL_ACCESS_TOKEN: "test-token",
+    ORCHESTRATOR_PROVIDER: "openai",
+    ORCHESTRATOR_MODEL: "gpt-5.4-mini",
+    ORCHESTRATOR_FALLBACK_PROVIDER: "claude"
+  });
+
+  try {
+    await coordinator.receiveMessage(buildTextWebhookBody("Hola"));
+    await coordinator.processBuffer();
+
+    assert.equal(urls.some((url) => url.includes("anthropic") || url.includes("claude")), false);
+    assert.equal(logLines.some((line) => line.includes("ORCHESTRATOR_FALLBACK_SKIPPED_MISSING_KEY")), true);
+    assert.equal(logLines.some((line) => line.includes("FALLBACK_REASON")), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.error = originalError;
+    console.log = originalLog;
+  }
+});
+
+test("/debug-openai uses valid reasoning effort and never falls back to Claude", async () => {
+  const urls = [];
+  const openAiBodies = [];
+  const sentTexts = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, options) => {
+    const cleanUrl = String(url);
+    urls.push(cleanUrl);
+
+    if (cleanUrl.includes("api.openai.com/v1/responses")) {
+      openAiBodies.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({
+        error: {
+          message: "diagnostic model failure"
+        }
+      }), {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json"
+        }
+      });
+    }
+
+    const body = JSON.parse(options.body);
+    sentTexts.push(body.response && body.response[0] && body.response[0].text || "");
+    return new Response(JSON.stringify({ ok: 1 }), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json"
+      }
+    });
+  };
+
+  const coordinator = new ConversationCoordinator(createMemoryState(), {
+    OPENAI_API_KEY: "sk-test",
+    WOZTELL_ACCESS_TOKEN: "test-token",
+    ORCHESTRATOR_PROVIDER: "openai",
+    ORCHESTRATOR_MODEL: "gpt-5.4-mini",
+    ORCHESTRATOR_FALLBACK_PROVIDER: "claude",
+    OPENAI_REASONING_EFFORT: "minimal"
+  });
+
+  try {
+    const response = await coordinator.receiveMessage(buildTextWebhookBody("/debug-openai"));
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(body.status, "debug_openai_sent");
+    assert.equal(body.ok, false);
+    assert.equal(openAiBodies.length, 1);
+    assert.equal(openAiBodies[0].reasoning.effort, "low");
+    assert.equal(urls.some((url) => url.includes("anthropic") || url.includes("claude")), false);
+    assert.equal(sentTexts.some((text) => text.includes("OpenAI debug") && text.includes("status: fail")), true);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 

@@ -522,6 +522,28 @@ export class ConversationCoordinator {
       });
     }
 
+    if (normalizeTextForIntent(normalized.text) === "/debug-openai") {
+      const diagnostic = await runOpenAIDebugCheck(this.env, {
+        traceId: incomingTraceId || data.currentTraceId || "",
+        doName: data.doName
+      });
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: formatOpenAIDebugForWhatsApp(diagnostic)
+      });
+
+      return jsonResponse({
+        status: "debug_openai_sent",
+        ok: diagnostic.ok,
+        diagnostic: diagnostic
+      });
+    }
+
     if (normalizeTextForIntent(normalized.text) === "/reset") {
       data.pendingMessages = [];
       data.hasMedia = false;
@@ -2106,6 +2128,28 @@ function summarizeTextForLog(value) {
     .slice(0, 500);
 }
 
+function normalizeOpenAIReasoningEffort(value, context) {
+  const allowed = ["none", "low", "medium", "high", "xhigh"];
+  const raw = String(value || "low").trim().toLowerCase();
+
+  if (allowed.includes(raw)) {
+    return raw;
+  }
+
+  logEvent("OPENAI_REASONING_EFFORT_NORMALIZED", {
+    traceId: context && context.traceId || "",
+    turnId: context && context.turnId || "",
+    doName: context && context.doName || "",
+    model: context && context.model || "",
+    source: context && context.source || "",
+    configuredValue: raw || "(empty)",
+    normalizedValue: "low",
+    allowedValues: allowed
+  });
+
+  return "low";
+}
+
 async function callOrchestratorPlan(env, params) {
   const provider = String(env.ORCHESTRATOR_PROVIDER || "openai").toLowerCase();
   const model = env.ORCHESTRATOR_MODEL || (provider === "openai" ? "gpt-5.4-mini" : "");
@@ -2153,6 +2197,22 @@ async function callOrchestratorPlan(env, params) {
     const fallbackProvider = String(env.ORCHESTRATOR_FALLBACK_PROVIDER || "").toLowerCase();
 
     if (provider !== "claude" && fallbackProvider === "claude") {
+      if (!env.ANTHROPIC_API_KEY) {
+        logEvent("ORCHESTRATOR_FALLBACK_SKIPPED_MISSING_KEY", {
+          traceId: traceId,
+          turnId: turnId,
+          doName: params.doName || "",
+          fromProvider: provider,
+          fallbackProvider: "claude",
+          missingKey: "ANTHROPIC_API_KEY",
+          originalError: summarizeErrorForLog(error)
+        }, {
+          level: "error",
+          traceId: traceId
+        });
+        throw error;
+      }
+
       logEvent("ORCHESTRATOR_FALLBACK_USED", {
         traceId: traceId,
         turnId: turnId,
@@ -2180,6 +2240,13 @@ async function openaiOrchestratorProvider(env, params) {
   const traceId = context.userTurn.trace_id || "";
   const turnId = context.userTurn.turn_id || "";
   const model = env.ORCHESTRATOR_MODEL || "gpt-5.4-mini";
+  const reasoningEffort = normalizeOpenAIReasoningEffort(env.OPENAI_REASONING_EFFORT, {
+    traceId: traceId,
+    turnId: turnId,
+    doName: params.doName || "",
+    model: model,
+    source: "orchestrator"
+  });
 
   if (!env.OPENAI_API_KEY) {
     logEvent("OPENAI_API_KEY_MISSING", {
@@ -2219,6 +2286,7 @@ async function openaiOrchestratorProvider(env, params) {
     doName: params.doName || "",
     endpoint: "https://api.openai.com/v1/responses",
     model: model,
+    reasoningEffort: reasoningEffort,
     inputShape: {
       compactKeys: Object.keys(context.compactInput),
       currentTurnTextLength: context.compactInput.current_turn_text.length,
@@ -2241,7 +2309,7 @@ async function openaiOrchestratorProvider(env, params) {
         }
       ],
       reasoning: {
-        effort: "minimal"
+        effort: reasoningEffort
       },
       text: {
         verbosity: "low"
@@ -2319,6 +2387,150 @@ async function openaiOrchestratorProvider(env, params) {
 
   logOrchestratorPlanSelected(plan, context.userTurn, params, "openai");
   return plan;
+}
+
+async function runOpenAIDebugCheck(env, params) {
+  const model = env.ORCHESTRATOR_MODEL || "gpt-5.4-mini";
+  const traceId = params && params.traceId || "";
+  const doName = params && params.doName || "";
+  const reasoningEffort = normalizeOpenAIReasoningEffort(env.OPENAI_REASONING_EFFORT, {
+    traceId: traceId,
+    doName: doName,
+    model: model,
+    source: "debug-openai"
+  });
+
+  if (!env.OPENAI_API_KEY) {
+    logEvent("OPENAI_API_KEY_MISSING", {
+      traceId: traceId,
+      doName: doName,
+      provider: "openai",
+      model: model,
+      source: "debug-openai"
+    }, {
+      level: "error",
+      traceId: traceId
+    });
+
+    return {
+      ok: false,
+      status: 0,
+      model: model,
+      reasoningEffort: reasoningEffort,
+      error: "OPENAI_API_KEY_MISSING"
+    };
+  }
+
+  logEvent("OPENAI_REQUEST_START", {
+    traceId: traceId,
+    doName: doName,
+    endpoint: "https://api.openai.com/v1/responses",
+    model: model,
+    reasoningEffort: reasoningEffort,
+    source: "debug-openai"
+  });
+
+  try {
+    const res = await fetchWithTimeout("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + env.OPENAI_API_KEY,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: model,
+        input: [
+          {
+            role: "user",
+            content: "Return exactly this JSON: {\"ok\":true}"
+          }
+        ],
+        reasoning: {
+          effort: reasoningEffort
+        },
+        text: {
+          verbosity: "low"
+        },
+        max_output_tokens: 80
+      })
+    }, 30000, "OPENAI_DEBUG_TIMEOUT");
+
+    const responseText = await res.text();
+
+    if (!res.ok) {
+      logEvent("OPENAI_REQUEST_FAILED", {
+        traceId: traceId,
+        doName: doName,
+        model: model,
+        reasoningEffort: reasoningEffort,
+        source: "debug-openai",
+        status: res.status,
+        errorSummary: summarizeTextForLog(responseText)
+      }, {
+        level: "error",
+        traceId: traceId
+      });
+
+      return {
+        ok: false,
+        status: res.status,
+        model: model,
+        reasoningEffort: reasoningEffort,
+        error: summarizeTextForLog(responseText)
+      };
+    }
+
+    logEvent("OPENAI_RESPONSE_RECEIVED", {
+      traceId: traceId,
+      doName: doName,
+      model: model,
+      reasoningEffort: reasoningEffort,
+      source: "debug-openai",
+      status: res.status,
+      responseLength: responseText.length
+    });
+
+    return {
+      ok: true,
+      status: res.status,
+      model: model,
+      reasoningEffort: reasoningEffort
+    };
+  } catch (error) {
+    logEvent("OPENAI_REQUEST_FAILED", {
+      traceId: traceId,
+      doName: doName,
+      model: model,
+      reasoningEffort: reasoningEffort,
+      source: "debug-openai",
+      status: 0,
+      errorSummary: summarizeErrorForLog(error)
+    }, {
+      level: "error",
+      traceId: traceId
+    });
+
+    return {
+      ok: false,
+      status: 0,
+      model: model,
+      reasoningEffort: reasoningEffort,
+      error: summarizeErrorForLog(error)
+    };
+  }
+}
+
+function formatOpenAIDebugForWhatsApp(diagnostic) {
+  const data = diagnostic || {};
+
+  return [
+    "OpenAI debug",
+    "status: " + (data.ok ? "ok" : "fail"),
+    "model: " + (data.model || ""),
+    "reasoning_effort: " + (data.reasoningEffort || ""),
+    "http_status: " + String(data.status || 0),
+    data.error ? "error: " + data.error : ""
+  ].filter(Boolean).join("\n");
 }
 
 function buildOrchestratorRequestContext(env, params) {
@@ -3055,6 +3267,10 @@ async function generateCopyWithOpenAI(env, params) {
   }
 
   const model = env.COPY_MODEL || "gpt-5-nano";
+  const reasoningEffort = normalizeOpenAIReasoningEffort(env.OPENAI_REASONING_EFFORT, {
+    model: model,
+    source: "copy"
+  });
   const visualAnalysis = params.uploaded_image_analysis || params.campaign_state && params.campaign_state.uploaded_image_analysis || {};
   const hasVisualAnalysis = visualAnalysis && typeof visualAnalysis === "object" && Object.keys(visualAnalysis).length > 0;
 
@@ -3111,7 +3327,7 @@ async function generateCopyWithOpenAI(env, params) {
         }
       ],
       reasoning: {
-        effort: "minimal"
+        effort: reasoningEffort
       },
       text: {
         verbosity: "medium"
