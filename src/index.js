@@ -25,6 +25,11 @@
 // - BUFFER_WAIT_SECONDS = 5
 // - IMAGE_MESSAGE_WAIT_SECONDS = 8
 // - BUFFER_MAX_WAIT_SECONDS = 15
+import { captureError, createTraceId, logEvent } from "./logger.js";
+import { getCoreFeatureFlags, updateConversationMemory } from "./conversationMemory.js";
+
+let activeLogContext = {};
+
 const USER_MESSAGES = {
   draftReady: "Te preparé esta propuesta. ¿La apruebas o quieres que haga cambios?",
   approvedAskPublish: "Perfecto, quedó aprobado ✅\n¿Quieres dejarlo listo para publicar ahora o prefieres seguir haciendo cambios?",
@@ -70,6 +75,7 @@ export default {
     try {
       body = await request.json();
     } catch (error) {
+      captureError(error, { route: "fetch", stage: "request_json_parse" });
       console.error("JSON_PARSE_ERROR:", String(error.message || error));
       return jsonResponse({ status: "error", message: "Invalid JSON" }, 400);
     }
@@ -94,6 +100,22 @@ export default {
     }
 
     let parsedMessage = extractWoztellMessage(body);
+    const webhookTraceId = createTraceId([
+      body.channel || "",
+      body.from || "",
+      body.messageId || parsedMessage.messageId || ""
+    ]);
+
+    logEvent("WEBHOOK_RECEIVED", {
+      traceId: webhookTraceId,
+      eventType: body.eventType || "",
+      type: body.type || "",
+      channel: body.channel || "",
+      from: body.from || "",
+      messageId: body.messageId || parsedMessage.messageId || "",
+      hasText: Boolean(parsedMessage.text),
+      hasFileId: Boolean(parsedMessage.fileId)
+    });
 
     console.log("WZ_PARSED_MESSAGE:", JSON.stringify({
       type: parsedMessage.type,
@@ -101,6 +123,14 @@ export default {
       fileId: parsedMessage.fileId || "",
       messageId: body.messageId || parsedMessage.messageId || ""
     }));
+
+    logEvent("MESSAGE_NORMALIZED", {
+      traceId: webhookTraceId,
+      type: parsedMessage.type || "",
+      messageId: body.messageId || parsedMessage.messageId || "",
+      hasText: Boolean(parsedMessage.text),
+      hasFileId: Boolean(parsedMessage.fileId)
+    });
 
     if (!parsedMessage.text && !parsedMessage.fileId) {
       return jsonResponse({
@@ -110,6 +140,14 @@ export default {
     }
 
     if (isAudioMessage(parsedMessage)) {
+      logEvent("AUDIO_RECEIVED", {
+        traceId: webhookTraceId,
+        type: parsedMessage.type || "",
+        mimeType: parsedMessage.mimeType || "",
+        hasFileId: Boolean(parsedMessage.fileId),
+        messageId: body.messageId || parsedMessage.messageId || ""
+      });
+
       console.log("AUDIO_RECEIVED:", JSON.stringify({
         type: parsedMessage.type || "",
         mimeType: parsedMessage.mimeType || "",
@@ -156,7 +194,8 @@ export default {
           type: "woztell_message",
           doName: doName,
           payload: body,
-          parsedMessage: parsedMessage
+          parsedMessage: parsedMessage,
+          traceId: webhookTraceId
         })
       });
 
@@ -170,7 +209,8 @@ export default {
         app: body.app || "",
         member: body.member || "",
         woztellPayload: body,
-        parsedMessage: parsedMessage
+        parsedMessage: parsedMessage,
+        traceId: webhookTraceId
       });
 
       console.log("AUDIO_EVENT_ACKED_FAST:", JSON.stringify({
@@ -203,7 +243,8 @@ export default {
         type: "woztell_message",
         doName: doName,
         payload: body,
-        parsedMessage: parsedMessage
+        parsedMessage: parsedMessage,
+        traceId: webhookTraceId
       })
     });
 
@@ -237,6 +278,15 @@ export default {
           phone: job.woztellPayload && job.woztellPayload.from || ""
         }));
 
+        if (job.type === "transcribe_audio") {
+          logEvent("AUDIO_JOB_RECEIVED", {
+            traceId: job.traceId || "",
+            doName: job.doName || "",
+            messageId: job.messageId || "",
+            fileId: job.fileId || ""
+          });
+        }
+
         if (job.type === "generate_image" || job.type === "edit_image") {
           await processImageQueueJob(env, job);
         } else if (job.type === "transcribe_audio") {
@@ -247,6 +297,7 @@ export default {
 
         message.ack();
       } catch (error) {
+        captureError(error, { route: "queue", stage: "queue_job", traceId: message.body && message.body.traceId || "" });
         console.error("QUEUE_JOB_ERROR:", String(error.message || error));
 
         try {
@@ -295,7 +346,11 @@ export class ConversationCoordinator {
         pendingCount: data.pendingMessages.length,
         processing: data.processing,
         clientProfile: data.clientProfile,
-        campaignState: data.campaignState
+        campaignState: data.campaignState,
+        conversationSummary: data.conversationSummary,
+        userStyleProfile: data.userStyleProfile,
+        customerMemory: data.customerMemory,
+        conversationLogCount: data.conversationLog.length
       });
     }
 
@@ -409,6 +464,7 @@ export class ConversationCoordinator {
     const parsedMessage = body.parsedMessage || extractWoztellMessage(woztellPayload);
     const messageId = parsedMessage.messageId || woztellPayload.messageId || randomId(12);
     const now = Date.now();
+    const incomingTraceId = body.traceId || "";
 
     data.doName = body.doName || data.doName || buildConversationName(woztellPayload);
     data.channel = woztellPayload.channel || data.channel || "";
@@ -450,6 +506,7 @@ export class ConversationCoordinator {
       data.firstMessageAt = 0;
       data.lastMessageAt = 0;
       data.processAfter = 0;
+      data.currentTraceId = "";
       data = resetCampaignState(data, "manual_reset");
       data.updatedAt = new Date().toISOString();
 
@@ -483,17 +540,47 @@ export class ConversationCoordinator {
     if (!data.pendingMessages.length) {
       data.firstMessageAt = now;
       data.currentTurnId = "turn_" + now + "_" + randomId(6);
+      data.currentTraceId = incomingTraceId || createTraceId([data.doName, data.currentTurnId, messageId]);
     }
 
     data.lastMessageAt = now;
     normalized.turnId = data.currentTurnId || "turn_" + now + "_" + randomId(6);
+    normalized.traceId = data.currentTraceId || incomingTraceId || createTraceId([data.doName, normalized.turnId, messageId]);
     data.pendingMessages.push(normalized);
+
+    if (normalized.video.length) {
+      logEvent("VIDEO_RECEIVED", {
+        traceId: normalized.traceId,
+        turnId: normalized.turnId,
+        doName: data.doName,
+        count: normalized.video.length,
+        fileIds: normalized.video.map(function (item) { return item.fileId; })
+      });
+    }
+
+    if (normalized.files.length) {
+      logEvent("FILE_RECEIVED", {
+        traceId: normalized.traceId,
+        turnId: normalized.turnId,
+        doName: data.doName,
+        count: normalized.files.length,
+        fileIds: normalized.files.map(function (item) { return item.fileId; })
+      });
+    }
 
     console.log("TURN_CREATED:", JSON.stringify({
       doName: data.doName,
       turnId: normalized.turnId,
       messageCount: data.pendingMessages.length
     }));
+
+    logEvent("TURN_CREATED", {
+      traceId: normalized.traceId,
+      turnId: normalized.turnId,
+      doName: data.doName,
+      messageCount: data.pendingMessages.length,
+      inputType: normalized.type
+    });
 
     if (normalized.media.length || ["IMAGE", "VIDEO"].includes(normalized.type)) {
       data.hasMedia = true;
@@ -573,6 +660,16 @@ export class ConversationCoordinator {
         workflow_status: data.campaignState.workflow_status,
         campaign_type: data.campaignState.campaign_type
       }));
+
+      logEvent("MEDIA_BATCH_CREATED", {
+        traceId: normalized.traceId,
+        turnId: normalized.turnId,
+        doName: data.doName,
+        assetCount: data.campaignState.campaign_assets.length,
+        fileIds: resolvedAssets.map(function (asset) { return asset.file_id; }),
+        campaign_type: data.campaignState.campaign_type,
+        workflow_status: data.campaignState.workflow_status
+      });
     }
 
     data.campaignState.history = appendHistory(data.campaignState.history, {
@@ -830,6 +927,15 @@ export class ConversationCoordinator {
       }));
 
       const userTurn = buildUserTurn(messages, data.campaignState, { turnId: data.currentTurnId || "" });
+      userTurn.trace_id = data.currentTraceId || (messages[0] && messages[0].traceId) || createTraceId([data.doName, userTurn.turn_id]);
+      activeLogContext = {
+        traceId: userTurn.trace_id,
+        turnId: userTurn.turn_id,
+        doName: data.doName
+      };
+      data = updateConversationMemory(data, userTurn, {
+        flags: getCoreFeatureFlags(this.env)
+      });
       data.campaignState.current_turn = buildTurnSummary(userTurn);
       data.campaignState.active_turn = userTurn;
       const mediaBatch = userTurn.media_batch;
@@ -841,6 +947,14 @@ export class ConversationCoordinator {
         messageCount: messages.length,
         contextPolicy: userTurn.context_policy
       }));
+      logEvent("TURN_BUFFER_READY", {
+        traceId: userTurn.trace_id,
+        turnId: userTurn.turn_id,
+        doName: data.doName,
+        messageCount: messages.length,
+        contextPolicy: userTurn.context_policy,
+        inputTypes: userTurn.input_types
+      });
       console.log("TURN_INPUT_TYPES:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, inputTypes: userTurn.input_types }));
       console.log("TURN_TEXT_COUNT:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, count: userTurn.text_count }));
       console.log("TURN_AUDIO_COUNT:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, count: userTurn.audio_count }));
@@ -849,6 +963,12 @@ export class ConversationCoordinator {
       console.log("TURN_FILE_COUNT:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, count: userTurn.file_count }));
       console.log("TURN_CAPTIONS_FOUND:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, captions: userTurn.captions }));
       console.log("TURN_CONTEXT_POLICY:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, policy: userTurn.context_policy }));
+      logEvent("TURN_CONTEXT_POLICY", {
+        traceId: userTurn.trace_id,
+        turnId: userTurn.turn_id,
+        doName: data.doName,
+        policy: userTurn.context_policy
+      });
       if (userTurn.context_policy !== "use_previous_context") {
         console.log("TURN_CONTEXT_RESET_REASON:", JSON.stringify({
           doName: data.doName,
@@ -869,6 +989,18 @@ export class ConversationCoordinator {
           campaign_type: data.campaignState.campaign_type,
           usedFallback: false
         }));
+        logEvent("MEDIA_BATCH_CREATED", {
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName,
+          messageCount: messages.length,
+          assetCount: mediaBatch.assets.length,
+          fileIds: mediaBatch.fileIds,
+          analyzedAssetCount: mediaBatch.analyzedAssetCount,
+          failedAssetCount: mediaBatch.failedAssetCount,
+          workflow_status: data.campaignState.workflow_status,
+          campaign_type: data.campaignState.campaign_type
+        });
         console.log("MEDIA_BATCH_ASSET_COUNT:", JSON.stringify({
           doName: data.doName,
           assetCount: mediaBatch.assets.length,
@@ -886,6 +1018,12 @@ export class ConversationCoordinator {
           channelId: data.channel,
           recipientId: data.phone,
           text: USER_MESSAGES.audioFailed
+        });
+        logEvent("USER_FALLBACK_SENT", {
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName,
+          reason: "audio_only_failed"
         });
 
         console.log("AUDIO_BATCH_TRANSCRIPTION_DONE:", JSON.stringify({
@@ -926,8 +1064,10 @@ export class ConversationCoordinator {
         phone: data.phone,
         messages: messages,
         clientProfile: data.clientProfile,
-        campaignState: data.campaignState
-        ,
+        campaignState: data.campaignState,
+        conversationSummary: data.conversationSummary,
+        userStyleProfile: data.userStyleProfile,
+        customerMemory: data.customerMemory,
         userTurn: userTurn
       });
 
@@ -949,18 +1089,24 @@ export class ConversationCoordinator {
       data.hasMedia = data.pendingMessages.some(function (pending) {
         return pending.fileId || ["IMAGE", "VIDEO"].includes(pending.type || "");
       });
+      if (!data.pendingMessages.length) {
+        data.currentTurnId = "";
+        data.currentTraceId = "";
+      }
       data.firstMessageAt = data.pendingMessages.length ? Date.now() : 0;
       data.lastMessageAt = data.pendingMessages.length ? Date.now() : 0;
       data.processAfter = 0;
       data.updatedAt = new Date().toISOString();
       success = true;
     } catch (error) {
+      captureError(error, { stage: "processBuffer", doName: data.doName, traceId: data.currentTraceId || "" });
       console.error("DO_PROCESS_BUFFER_ERROR:", String(error.message || error));
 
       data = await this.getData();
       data.updatedAt = new Date().toISOString();
       shouldSendFallback = true;
     } finally {
+      activeLogContext = {};
       data.processing = false;
       data.processingStartedAt = null;
       data.updatedAt = new Date().toISOString();
@@ -994,6 +1140,11 @@ export class ConversationCoordinator {
         recipientId: data.phone,
         text: USER_MESSAGES.requestFailed
       });
+      logEvent("USER_FALLBACK_SENT", {
+        traceId: data.currentTraceId || "",
+        doName: data.doName,
+        reason: "process_buffer_error"
+      });
 
       data.pendingMessages = data.pendingMessages.filter(function (pending) {
         return !messages.some(function (processed) {
@@ -1003,6 +1154,10 @@ export class ConversationCoordinator {
       data.hasMedia = data.pendingMessages.some(function (pending) {
         return pending.fileId || ["IMAGE", "VIDEO"].includes(pending.type || "");
       });
+      if (!data.pendingMessages.length) {
+        data.currentTurnId = "";
+        data.currentTraceId = "";
+      }
       data.processAfter = 0;
       data.updatedAt = new Date().toISOString();
       await this.saveData(data);
@@ -1057,6 +1212,8 @@ export class ConversationCoordinator {
 
       const analysisResult = await analyzeMediaBatch(this.env, {
         doName: data.doName,
+        traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+        turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
         campaignState: data.campaignState,
         mediaBatch: imageAnalysisBatch,
         caption: consolidatedMessagesText(messages),
@@ -1380,6 +1537,8 @@ export class ConversationCoordinator {
         await enqueueImageJob(this.env, {
           type: "generate_image",
           doName: data.doName,
+          traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+          turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
           campaignId: data.campaignState.campaign_id,
           prompt: action.prompt || action.brief || consolidatedMessagesText(messages),
           source: action.source || "text_only",
@@ -1407,6 +1566,8 @@ export class ConversationCoordinator {
         await enqueueImageJob(this.env, {
           type: "edit_image",
           doName: data.doName,
+          traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+          turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
           campaignId: data.campaignState.campaign_id,
           prompt: action.prompt || consolidatedMessagesText(messages),
           source: action.source || "last_generated_image",
@@ -1608,6 +1769,12 @@ async function processImageQueueJob(env, job) {
       imageUrl: publicUrl
     }));
   } catch (error) {
+    captureError(error, {
+      stage: "processImageQueueJob",
+      traceId: job.traceId || "",
+      turnId: job.turnId || "",
+      doName: job.doName || ""
+    });
     console.error("IMAGE_PIPELINE_ERROR:", JSON.stringify({
       message: String(error.message || error),
       stack: String(error.stack || ""),
@@ -1620,7 +1787,16 @@ async function processImageQueueJob(env, job) {
       await sendWoztellTextMessage(env, {
         channelId: woztellPayload.channel,
         recipientId: woztellPayload.from,
+        traceId: job.traceId || "",
+        turnId: job.turnId || "",
+        doName: job.doName || "",
         text: USER_MESSAGES.imageFailed
+      });
+      logEvent("USER_FALLBACK_SENT", {
+        traceId: job.traceId || "",
+        turnId: job.turnId || "",
+        doName: job.doName || "",
+        reason: "image_pipeline_error"
       });
     }
 
@@ -1792,12 +1968,20 @@ function isAudioEmptyError(error) {
 
 async function callOrchestratorPlan(env, params) {
   const provider = String(env.ORCHESTRATOR_PROVIDER || "claude").toLowerCase();
+  const traceId = params && params.userTurn && params.userTurn.trace_id || "";
 
   console.log("ORCHESTRATOR_PROVIDER_SELECTED:", JSON.stringify({
     provider: provider,
     model: env.ORCHESTRATOR_MODEL || "",
     doName: params.doName || ""
   }));
+  logEvent("ORCHESTRATOR_PROVIDER_SELECTED", {
+    traceId: traceId,
+    turnId: params && params.userTurn && params.userTurn.turn_id || "",
+    doName: params.doName || "",
+    provider: provider,
+    model: env.ORCHESTRATOR_MODEL || ""
+  });
 
   if (provider === "openai") {
     return await openaiOrchestratorProvider(env, params);
@@ -1837,7 +2021,10 @@ async function callClaudeOrchestratorPlan(env, params) {
   const compactInput = buildOrchestratorInput({
     messages: params.messages || [],
     campaignState: params.campaignState || {},
-    userTurn: userTurn
+    userTurn: userTurn,
+    conversationSummary: params.conversationSummary || null,
+    userStyleProfile: params.userStyleProfile || null,
+    customerMemory: params.customerMemory || null
   });
   const orchestratorInputSummary = buildOrchestratorInputSummary({
     messages: params.messages || [],
@@ -1864,6 +2051,17 @@ async function callClaudeOrchestratorPlan(env, params) {
     currentTurnTextLength: compactInput.current_turn_text.length,
     previousStateMode: compactInput.relevant_previous_state && compactInput.relevant_previous_state.note ? "omitted" : "included"
   }));
+  logEvent("ORCHESTRATOR_INPUT_COMPACTED", {
+    traceId: userTurn.trace_id || "",
+    turnId: userTurn.turn_id,
+    doName: params.doName || "",
+    keys: Object.keys(compactInput),
+    currentTurnTextLength: compactInput.current_turn_text.length,
+    previousStateMode: compactInput.relevant_previous_state && compactInput.relevant_previous_state.note ? "omitted" : "included",
+    hasConversationSummary: Boolean(compactInput.conversation_summary),
+    hasUserStyleProfile: Boolean(compactInput.user_style_profile),
+    hasCustomerMemory: Boolean(compactInput.customer_memory)
+  });
 
   const payload = {
     instruction: "Return valid JSON only. Do not answer the user directly.",
@@ -1877,6 +2075,9 @@ async function callClaudeOrchestratorPlan(env, params) {
     relevant_previous_state: compactInput.relevant_previous_state,
     campaign_assets: mediaBatch.assets,
     media_batch_summary: mediaBatchSummary,
+    conversation_summary: compactInput.conversation_summary,
+    user_style_profile: compactInput.user_style_profile,
+    customer_memory: compactInput.customer_memory,
     uploaded_image_analysis: mediaBatchSummary,
     current_asset_source: compactInput.campaign_state_brief.current_asset_source || "",
     asset_count: mediaBatch.assets.length,
@@ -1942,6 +2143,12 @@ async function callClaudeOrchestratorPlan(env, params) {
     doName: params.doName || "",
     actions: mapOrchestratorActions(plan).map(function (action) { return action.type; })
   }));
+  logEvent("ORCHESTRATOR_ACTIONS_SELECTED", {
+    traceId: userTurn.trace_id || "",
+    turnId: userTurn.turn_id,
+    doName: params.doName || "",
+    actions: mapOrchestratorActions(plan).map(function (action) { return action.type; })
+  });
 
   return plan;
 }
@@ -2212,6 +2419,11 @@ function parseJsonFromText(text) {
     return balancedPlans[balancedPlans.length - 1];
   }
 
+  logEvent("ORCHESTRATOR_JSON_INVALID", {
+    textPreview: clean.slice(0, 1000)
+  }, {
+    level: "error"
+  });
   throw new Error("ORCHESTRATOR_PLAN_NOT_JSON: " + clean.slice(0, 1000));
 }
 
@@ -3075,6 +3287,12 @@ async function enqueueAudioJob(env, ctx, job) {
 }
 
 async function processAudioQueueJob(env, job) {
+  logEvent("AUDIO_JOB_RECEIVED", {
+    traceId: job.traceId || "",
+    doName: job.doName || "",
+    messageId: job.messageId || "",
+    fileId: job.fileId || ""
+  });
   console.log("AUDIO_JOB_RECEIVED:", JSON.stringify({
     doName: job.doName || "",
     messageId: job.messageId || "",
@@ -3110,13 +3328,21 @@ async function processAudioQueueJob(env, job) {
 
     const audio = await downloadAudioWithRetries(fileInfo.url, {
       fileType: fileInfo.fileType || parsedMessage.mimeType || "",
-      size: fileInfo.size || 0
+      size: fileInfo.size || 0,
+      traceId: job.traceId || "",
+      doName: job.doName || "",
+      messageId: job.messageId || "",
+      fileId: job.fileId || ""
     }, 3);
 
     const transcript = await transcribeAudioBytesWithRetries(env, audio.bytes, {
       contentType: audio.contentType,
       fileName: parsedMessage.fileName || "audio.ogg",
-      size: fileInfo.size || audio.bytes.byteLength || 0
+      size: fileInfo.size || audio.bytes.byteLength || 0,
+      traceId: job.traceId || "",
+      doName: job.doName || "",
+      messageId: job.messageId || "",
+      fileId: job.fileId || ""
     }, 2);
 
     if (!transcript || transcript.trim().length < 2) {
@@ -3157,6 +3383,13 @@ async function processAudioQueueJob(env, job) {
       failedCount: 0
     }));
   } catch (error) {
+    captureError(error, {
+      stage: "processAudioQueueJob",
+      traceId: job.traceId || "",
+      doName: job.doName || "",
+      messageId: job.messageId || "",
+      fileId: job.fileId || ""
+    });
     console.error("AUDIO_PIPELINE_FAILED:", JSON.stringify({
       message: String(error.message || error),
       stack: String(error.stack || ""),
@@ -3189,6 +3422,15 @@ async function downloadAudioWithRetries(audioUrl, metadata, maxAttempts) {
         fileType: metadata && metadata.fileType || "",
         size: metadata && metadata.size || 0
       }));
+      logEvent("AUDIO_DOWNLOAD_START", {
+        traceId: metadata && metadata.traceId || "",
+        doName: metadata && metadata.doName || "",
+        messageId: metadata && metadata.messageId || "",
+        fileId: metadata && metadata.fileId || "",
+        attempt: attempt,
+        fileType: metadata && metadata.fileType || "",
+        size: metadata && metadata.size || 0
+      });
 
       const audioRes = await fetchWithTimeout(audioUrl, {}, 45000, "AUDIO_DOWNLOAD_TIMEOUT");
 
@@ -3204,6 +3446,15 @@ async function downloadAudioWithRetries(audioUrl, metadata, maxAttempts) {
         contentType: contentType,
         byteLength: bytes.byteLength
       }));
+      logEvent("AUDIO_DOWNLOAD_OK", {
+        traceId: metadata && metadata.traceId || "",
+        doName: metadata && metadata.doName || "",
+        messageId: metadata && metadata.messageId || "",
+        fileId: metadata && metadata.fileId || "",
+        attempt: attempt,
+        contentType: contentType,
+        byteLength: bytes.byteLength
+      });
 
       return {
         bytes: bytes,
@@ -3213,6 +3464,19 @@ async function downloadAudioWithRetries(audioUrl, metadata, maxAttempts) {
       lastError = error;
 
       if (String(error.message || error).includes("AUDIO_DOWNLOAD_TIMEOUT")) {
+        logEvent("AUDIO_TRANSCRIPTION_FAILED", {
+          traceId: metadata && metadata.traceId || "",
+          doName: metadata && metadata.doName || "",
+          messageId: metadata && metadata.messageId || "",
+          fileId: metadata && metadata.fileId || "",
+          stage: "download",
+          attempt: attempt,
+          maxAttempts: attempts,
+          message: String(error.message || error)
+        }, {
+          level: "error",
+          traceId: metadata && metadata.traceId || ""
+        });
         console.error("AUDIO_DOWNLOAD_TIMEOUT:", JSON.stringify({
           attempt: attempt,
           maxAttempts: attempts,
@@ -3259,6 +3523,17 @@ async function transcribeAudioBytesWithRetries(env, bytes, metadata, maxAttempts
     attempts: attempts,
     message: String(lastError && lastError.message || lastError || "AUDIO_TRANSCRIPTION_FAILED")
   }));
+  logEvent("AUDIO_TRANSCRIPTION_FAILED", {
+    traceId: metadata && metadata.traceId || "",
+    doName: metadata && metadata.doName || "",
+    messageId: metadata && metadata.messageId || "",
+    fileId: metadata && metadata.fileId || "",
+    attempts: attempts,
+    message: String(lastError && lastError.message || lastError || "AUDIO_TRANSCRIPTION_FAILED")
+  }, {
+    level: "error",
+    traceId: metadata && metadata.traceId || ""
+  });
   throw lastError || new Error("AUDIO_TRANSCRIPTION_FAILED");
 }
 
@@ -3276,6 +3551,16 @@ async function transcribeAudioBytesOnce(env, bytes, metadata, attempt) {
     contentType: contentType,
     byteLength: bytes.byteLength
   }));
+  logEvent("AUDIO_TRANSCRIPTION_START", {
+    traceId: metadata && metadata.traceId || "",
+    doName: metadata && metadata.doName || "",
+    messageId: metadata && metadata.messageId || "",
+    fileId: metadata && metadata.fileId || "",
+    attempt: attempt || 1,
+    model: model,
+    contentType: contentType,
+    byteLength: bytes.byteLength
+  });
   console.log("AUDIO_TRANSCRIPTION_MODEL:", model);
 
   const formData = new FormData();
@@ -3312,6 +3597,14 @@ async function transcribeAudioBytesOnce(env, bytes, metadata, attempt) {
     attempt: attempt || 1,
     length: transcript.length
   }));
+  logEvent("AUDIO_TRANSCRIPTION_OK", {
+    traceId: metadata && metadata.traceId || "",
+    doName: metadata && metadata.doName || "",
+    messageId: metadata && metadata.messageId || "",
+    fileId: metadata && metadata.fileId || "",
+    attempt: attempt || 1,
+    length: transcript.length
+  });
 
   return transcript;
 }
@@ -3779,6 +4072,17 @@ async function sendWoztellResponse(env, params) {
       return item.type || "";
     })
   }));
+  logEvent("USER_RESPONSE_SENT", {
+    traceId: params.traceId || activeLogContext.traceId || "",
+    turnId: params.turnId || activeLogContext.turnId || "",
+    doName: params.doName || activeLogContext.doName || "",
+    channelId: params.channelId || "",
+    recipientId: params.recipientId || "",
+    responseCount: Array.isArray(params.response) ? params.response.length : 0,
+    responseTypes: (Array.isArray(params.response) ? params.response : []).map(function (item) {
+      return item.type || "";
+    })
+  });
 
   return parsed;
 }
@@ -3816,6 +4120,7 @@ function normalizeCoordinatorData(data) {
     phone: String(clean.phone || ""),
     pendingMessages: Array.isArray(clean.pendingMessages) ? clean.pendingMessages : [],
     currentTurnId: String(clean.currentTurnId || ""),
+    currentTraceId: String(clean.currentTraceId || ""),
     processedMessageIds: Array.isArray(clean.processedMessageIds) ? clean.processedMessageIds.slice(-80) : [],
     firstMessageAt: Number(clean.firstMessageAt || 0),
     lastMessageAt: Number(clean.lastMessageAt || 0),
@@ -3826,6 +4131,10 @@ function normalizeCoordinatorData(data) {
     updatedAt: String(clean.updatedAt || new Date().toISOString()),
     clientProfile: clientProfile,
     campaignState: campaignState,
+    conversationLog: Array.isArray(clean.conversationLog || clean.conversation_log) ? (clean.conversationLog || clean.conversation_log).slice(-30) : [],
+    conversationSummary: clean.conversationSummary || clean.conversation_summary || null,
+    userStyleProfile: clean.userStyleProfile || clean.user_style_profile || null,
+    customerMemory: clean.customerMemory || clean.customer_memory || null,
     archivedCampaigns: Array.isArray(clean.archivedCampaigns) ? clean.archivedCampaigns.slice(-5) : []
   };
 }
@@ -4715,6 +5024,7 @@ function normalizeIncomingMessage(parsedMessage, woztellPayload, options) {
 
   return {
     messageId: String(options && options.messageId || parsed.messageId || payload.messageId || randomId(12)),
+    traceId: String(options && options.traceId || parsed.traceId || payload.traceId || ""),
     type: type,
     text: String(parsed.text || fallbackText).trim(),
     fileId: fileId,
@@ -4956,6 +5266,7 @@ function buildTurnSummary(userTurn) {
 
   return {
     turn_id: turn.turn_id || "",
+    trace_id: turn.trace_id || "",
     input_types: turn.input_types || [],
     text_count: turn.text_count || 0,
     audio_count: turn.audio_count || 0,
@@ -5037,6 +5348,9 @@ function buildOrchestratorInput(params) {
     audio_transcripts: userTurn.audio_transcripts || [],
     video_metadata: userTurn.video_metadata || [],
     file_metadata: userTurn.file_metadata || [],
+    conversation_summary: params.conversationSummary || null,
+    user_style_profile: params.userStyleProfile || null,
+    customer_memory: params.customerMemory || null,
     relevant_previous_state: buildRelevantPreviousState(state, userTurn),
     allowed_actions: getAllowedOrchestratorActions(),
     campaign_state_brief: {
@@ -5143,6 +5457,14 @@ async function analyzeMediaBatch(env, params) {
       fileId: asset.file_id,
       assetCount: mediaBatch.assets.length
     }));
+    logEvent("MEDIA_ASSET_ANALYSIS_START", {
+      traceId: params.traceId || "",
+      turnId: params.turnId || "",
+      doName: params.doName || "",
+      assetId: asset.asset_id,
+      fileId: asset.file_id,
+      assetCount: mediaBatch.assets.length
+    });
 
     try {
       const analysis = await analyzeSingleMediaAsset(env, {
@@ -5160,6 +5482,14 @@ async function analyzeMediaBatch(env, params) {
         fileId: asset.file_id,
         confidence: analysis && analysis.confidence || 0
       }));
+      logEvent("MEDIA_ASSET_ANALYSIS_OK", {
+        traceId: params.traceId || "",
+        turnId: params.turnId || "",
+        doName: params.doName || "",
+        assetId: asset.asset_id,
+        fileId: asset.file_id,
+        confidence: analysis && analysis.confidence || 0
+      });
     } catch (error) {
       assetForAnalysis.status = "analysis_failed";
       assetForAnalysis.analysis_error = String(error.message || error);
@@ -5171,6 +5501,18 @@ async function analyzeMediaBatch(env, params) {
         message: String(error.message || error),
         usedFallback: true
       }));
+      logEvent("MEDIA_ASSET_ANALYSIS_FAILED", {
+        traceId: params.traceId || "",
+        turnId: params.turnId || "",
+        doName: params.doName || "",
+        assetId: asset.asset_id,
+        fileId: asset.file_id,
+        message: String(error.message || error),
+        usedFallback: true
+      }, {
+        level: "error",
+        traceId: params.traceId || ""
+      });
     }
 
     analyzedAssets.push(assetForAnalysis);

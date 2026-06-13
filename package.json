@@ -4,6 +4,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test": "node --test test/**/*.test.js",
-    "test:inputs": "node scripts/test-all-input-cases.js"
+    "test:inputs": "node scripts/test-all-input-cases.js",
+    "logs:latest": "node scripts/read-latest-logs.js",
+    "logs:analyze": "node scripts/analyze-logs.js"
   }
 }
