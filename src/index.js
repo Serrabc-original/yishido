@@ -1,5 +1,5 @@
-﻿// VERSION: v2.2-durable - Content calendar + bulk campaign planning
-// DATE: 2026-06-09
+﻿// VERSION: whatsapp-ai-agent-core-v3
+// DATE: 2026-06-13
 //
 // REQUIRED BINDINGS:
 // - Durable Object: CONVERSATION_DO -> ConversationCoordinator
@@ -35,8 +35,8 @@ let activeLogContext = {};
 
 const USER_MESSAGES = {
   draftReady: "Te preparé esta propuesta. ¿La apruebas o quieres que haga cambios?",
-  approvedAskPublish: "Perfecto, quedó aprobado ✅\n¿Quieres dejarlo listo para publicar ahora o prefieres seguir haciendo cambios?",
-  readyToPublish: "Listo, lo dejé marcado como listo para publicar ✅\nAún no se publica automáticamente; ese será el siguiente paso cuando conectemos Meta.",
+  approvedAskPublish: "Perfecto, quedó aprobado ?\n¿Quieres dejarlo listo para publicar ahora o prefieres seguir haciendo cambios?",
+  readyToPublish: "Listo, lo dejé marcado como listo para publicar ?\nAún no se publica automáticamente; ese será el siguiente paso cuando conectemos Meta.",
   imageReady: "Listo, te generé esta imagen.\n\n¿Quieres que haga otra versión o ajustamos el texto?",
   audioFailed: "Tuve un problema procesando tu audio. ¿Me lo puedes reenviar o escribirlo en texto?",
   resetOk: "Contexto reiniciado.",
@@ -54,19 +54,20 @@ const USER_MESSAGES = {
   assetsCollected: "Ya recibí {count} imágenes. ¿Quieres que las use directamente para posts o que las tome como referencia para nuevos diseños?",
   calendarReady: "Te preparé un calendario de contenido. ¿Lo apruebas completo o quieres cambiar algún post?",
   bulkPostsReady: "Listo, generé los posts del calendario. Puedes aprobar todos, cambiar un número específico o dejarlos listos para publicar.",
-  bulkApproved: "Perfecto, aprobé los posts seleccionados ✅\n¿Quieres dejarlos listos para publicar?",
-  bulkReadyToPublish: "Listo, los posts seleccionados quedaron como ready_to_publish y scheduled_pending_meta ✅"
+  bulkApproved: "Perfecto, aprobé los posts seleccionados ?\n¿Quieres dejarlos listos para publicar?",
+  bulkReadyToPublish: "Listo, los posts seleccionados quedaron como ready_to_publish y scheduled_pending_meta ?"
 };
 
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
     if (request.method === "GET") {
-      return jsonResponse({
-        status: "ok",
-        service: "Yishido Agent Gateway",
-        version: "v2.2-durable",
-        architecture: "Worker -> Durable Object -> Claude Orchestrator -> Tools"
-      });
+      if (url.pathname === "/version") {
+        return jsonResponse(buildVersionDiagnostic(env));
+      }
+
+      return jsonResponse(buildVersionDiagnostic(env));
     }
 
     if (request.method !== "POST") {
@@ -472,6 +473,8 @@ export class ConversationCoordinator {
     data.doName = body.doName || data.doName || buildConversationName(woztellPayload);
     data.channel = woztellPayload.channel || data.channel || "";
     data.phone = woztellPayload.from || data.phone || "";
+    data.member = woztellPayload.member || data.member || "";
+    data.app = woztellPayload.app || data.app || "";
 
     console.log("CLIENT_PROFILE_LOADED:", JSON.stringify({
       doName: data.doName,
@@ -500,6 +503,24 @@ export class ConversationCoordinator {
       messageId: messageId,
       receivedAt: new Date(now).toISOString()
     });
+
+    if (normalizeTextForIntent(normalized.text) === "/version") {
+      const versionDiagnostic = buildVersionDiagnostic(this.env);
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: formatVersionDiagnosticForWhatsApp(versionDiagnostic)
+      });
+
+      return jsonResponse({
+        status: "version_sent",
+        version: versionDiagnostic
+      });
+    }
 
     if (normalizeTextForIntent(normalized.text) === "/reset") {
       data.pendingMessages = [];
@@ -935,7 +956,9 @@ export class ConversationCoordinator {
       activeLogContext = {
         traceId: userTurn.trace_id,
         turnId: userTurn.turn_id,
-        doName: data.doName
+        doName: data.doName,
+        memberId: data.member || "",
+        appId: data.app || ""
       };
       data = updateConversationMemory(data, userTurn, {
         flags: coreFlags,
@@ -1114,8 +1137,18 @@ export class ConversationCoordinator {
       data.updatedAt = new Date().toISOString();
       success = true;
     } catch (error) {
+      const fallbackReason = summarizeErrorForLog(error);
       captureError(error, { stage: "processBuffer", doName: data.doName, traceId: data.currentTraceId || "" });
-      console.error("DO_PROCESS_BUFFER_ERROR:", String(error.message || error));
+      logEvent("FALLBACK_REASON", {
+        traceId: data.currentTraceId || "",
+        doName: data.doName,
+        stage: "processBuffer",
+        reason: fallbackReason
+      }, {
+        level: "error",
+        traceId: data.currentTraceId || ""
+      });
+      console.error("DO_PROCESS_BUFFER_ERROR:", fallbackReason);
 
       data = await this.getData();
       data.updatedAt = new Date().toISOString();
@@ -1158,7 +1191,8 @@ export class ConversationCoordinator {
       logEvent("USER_FALLBACK_SENT", {
         traceId: data.currentTraceId || "",
         doName: data.doName,
-        reason: "process_buffer_error"
+        reason: "process_buffer_error",
+        fallbackReason: "See FALLBACK_REASON for this traceId"
       });
 
       data.pendingMessages = data.pendingMessages.filter(function (pending) {
@@ -2059,10 +2093,24 @@ function isAudioEmptyError(error) {
   return String(error && error.message || error).includes("AUDIO_TRANSCRIPTION_EMPTY");
 }
 
+function summarizeErrorForLog(error) {
+  return summarizeTextForLog(error && error.message || error);
+}
+
+function summarizeTextForLog(value) {
+  return String(value || "")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/(OPENAI_API_KEY|ANTHROPIC_API_KEY|WOZTELL_ACCESS_TOKEN|WOZTELL_OPEN_API_TOKEN|GOOGLE_SHEETS_SECRET)=\S+/gi, "$1=[REDACTED]")
+    .replace(/"Authorization"\s*:\s*"[^"]+"/gi, "\"Authorization\":\"[REDACTED]\"")
+    .replace(/\b\d{8,15}\b/g, "[PHONE_REDACTED]")
+    .slice(0, 500);
+}
+
 async function callOrchestratorPlan(env, params) {
   const provider = String(env.ORCHESTRATOR_PROVIDER || "openai").toLowerCase();
   const model = env.ORCHESTRATOR_MODEL || (provider === "openai" ? "gpt-5.4-mini" : "");
   const traceId = params && params.userTurn && params.userTurn.trace_id || "";
+  const turnId = params && params.userTurn && params.userTurn.turn_id || "";
 
   console.log("ORCHESTRATOR_PROVIDER_SELECTED:", JSON.stringify({
     provider: provider,
@@ -2071,17 +2119,28 @@ async function callOrchestratorPlan(env, params) {
   }));
   logEvent("ORCHESTRATOR_PROVIDER_SELECTED", {
     traceId: traceId,
-    turnId: params && params.userTurn && params.userTurn.turn_id || "",
+    turnId: turnId,
     doName: params.doName || "",
     provider: provider,
     model: model
   });
   logEvent("ORCHESTRATOR_MODEL_SELECTED", {
     traceId: traceId,
-    turnId: params && params.userTurn && params.userTurn.turn_id || "",
+    turnId: turnId,
     doName: params.doName || "",
     provider: provider,
     model: model
+  });
+  logEvent("ORCHESTRATOR_ENV_CHECK", {
+    traceId: traceId,
+    turnId: turnId,
+    doName: params.doName || "",
+    provider: provider,
+    fallbackProvider: String(env.ORCHESTRATOR_FALLBACK_PROVIDER || "").toLowerCase(),
+    hasOpenAiApiKey: Boolean(env.OPENAI_API_KEY),
+    hasAnthropicApiKey: Boolean(env.ANTHROPIC_API_KEY),
+    hasWoztellAccessToken: Boolean(env.WOZTELL_ACCESS_TOKEN),
+    hasWoztellOpenApiToken: Boolean(env.WOZTELL_OPEN_API_TOKEN)
   });
 
   try {
@@ -2096,11 +2155,11 @@ async function callOrchestratorPlan(env, params) {
     if (provider !== "claude" && fallbackProvider === "claude") {
       logEvent("ORCHESTRATOR_FALLBACK_USED", {
         traceId: traceId,
-        turnId: params && params.userTurn && params.userTurn.turn_id || "",
+        turnId: turnId,
         doName: params.doName || "",
         fromProvider: provider,
         fallbackProvider: "claude",
-        reason: String(error.message || error)
+        reason: summarizeErrorForLog(error)
       }, {
         level: "error",
         traceId: traceId
@@ -2117,12 +2176,25 @@ async function claudeOrchestratorProvider(env, params) {
 }
 
 async function openaiOrchestratorProvider(env, params) {
+  const context = buildOrchestratorRequestContext(env, params);
+  const traceId = context.userTurn.trace_id || "";
+  const turnId = context.userTurn.turn_id || "";
+  const model = env.ORCHESTRATOR_MODEL || "gpt-5.4-mini";
+
   if (!env.OPENAI_API_KEY) {
+    logEvent("OPENAI_API_KEY_MISSING", {
+      traceId: traceId,
+      turnId: turnId,
+      doName: params.doName || "",
+      provider: "openai",
+      model: model
+    }, {
+      level: "error",
+      traceId: traceId
+    });
     throw new Error("Missing OPENAI_API_KEY");
   }
 
-  const context = buildOrchestratorRequestContext(env, params);
-  const model = env.ORCHESTRATOR_MODEL || "gpt-5.4-mini";
   const payload = buildNeutralOrchestratorPayload(env, params, context);
 
   console.log("ORCHESTRATOR_INPUT_COMPACTED:", JSON.stringify({
@@ -2139,6 +2211,19 @@ async function openaiOrchestratorProvider(env, params) {
     provider: "openai",
     keys: Object.keys(context.compactInput),
     currentTurnTextLength: context.compactInput.current_turn_text.length
+  });
+
+  logEvent("OPENAI_REQUEST_START", {
+    traceId: traceId,
+    turnId: turnId,
+    doName: params.doName || "",
+    endpoint: "https://api.openai.com/v1/responses",
+    model: model,
+    inputShape: {
+      compactKeys: Object.keys(context.compactInput),
+      currentTurnTextLength: context.compactInput.current_turn_text.length,
+      actionCount: getAllowedOrchestratorActions().length
+    }
   });
 
   const res = await fetchWithTimeout("https://api.openai.com/v1/responses", {
@@ -2168,13 +2253,69 @@ async function openaiOrchestratorProvider(env, params) {
   const responseText = await res.text();
 
   if (!res.ok) {
+    logEvent("OPENAI_REQUEST_FAILED", {
+      traceId: traceId,
+      turnId: turnId,
+      doName: params.doName || "",
+      model: model,
+      status: res.status,
+      errorSummary: summarizeTextForLog(responseText)
+    }, {
+      level: "error",
+      traceId: traceId
+    });
     throw new Error("OPENAI_ORCHESTRATOR_ERROR " + res.status + ": " + responseText);
   }
 
-  const text = extractOpenAIResponseText(parseMaybeJson(responseText));
-  console.log("ORCHESTRATOR_RAW_TEXT:", String(text || "").slice(0, 3000));
+  logEvent("OPENAI_RESPONSE_RECEIVED", {
+    traceId: traceId,
+    turnId: turnId,
+    doName: params.doName || "",
+    model: model,
+    status: res.status,
+    responseLength: responseText.length
+  });
 
-  const plan = normalizePlan(parseJsonFromText(text));
+  const responseJson = parseMaybeJson(responseText);
+  const text = extractOpenAIResponseText(responseJson);
+  logEvent("ORCHESTRATOR_RAW_RESPONSE_SHAPE", {
+    traceId: traceId,
+    turnId: turnId,
+    doName: params.doName || "",
+    provider: "openai",
+    model: model,
+    hasOutputText: Boolean(responseJson && responseJson.output_text),
+    outputCount: Array.isArray(responseJson && responseJson.output) ? responseJson.output.length : 0,
+    extractedTextLength: String(text || "").length
+  });
+  console.log("ORCHESTRATOR_RAW_RESPONSE_SHAPE:", JSON.stringify({
+    provider: "openai",
+    model: model,
+    hasOutputText: Boolean(responseJson && responseJson.output_text),
+    outputCount: Array.isArray(responseJson && responseJson.output) ? responseJson.output.length : 0,
+    extractedTextLength: String(text || "").length
+  }));
+
+  let parsedPlan;
+  try {
+    parsedPlan = parseJsonFromText(text);
+  } catch (error) {
+    logEvent("OPENAI_JSON_PARSE_FAILED", {
+      traceId: traceId,
+      turnId: turnId,
+      doName: params.doName || "",
+      provider: "openai",
+      model: model,
+      extractedTextLength: String(text || "").length,
+      errorSummary: summarizeErrorForLog(error)
+    }, {
+      level: "error",
+      traceId: traceId
+    });
+    throw error;
+  }
+
+  const plan = normalizePlan(parsedPlan);
 
   logOrchestratorPlanSelected(plan, context.userTurn, params, "openai");
   return plan;
@@ -2296,7 +2437,7 @@ async function callClaudeOrchestratorPlan(env, params) {
   }
 
   if (!env.CLAUDE_ORCHESTRATOR_AGENT_ID || !env.CLAUDE_ORCHESTRATOR_ENVIRONMENT_ID) {
-    throw new Error("Missing Claude Orchestrator configuration");
+    throw new Error("Missing Claude fallback configuration");
   }
 
   const sessionId = await createClaudeOrchestratorSession(env);
@@ -2713,7 +2854,9 @@ function parseJsonFromText(text) {
   }
 
   logEvent("ORCHESTRATOR_JSON_INVALID", {
-    textPreview: clean.slice(0, 1000)
+    textLength: clean.length,
+    startsWithJsonObject: clean.startsWith("{"),
+    startsWithJsonFence: clean.startsWith("```")
   }, {
     level: "error"
   });
@@ -4274,6 +4417,9 @@ async function sendWoztellTextMessage(env, params) {
   return await sendWoztellResponse(env, {
     channelId: params.channelId,
     recipientId: params.recipientId,
+    memberId: params.memberId,
+    appId: params.appId,
+    swallowErrors: params.swallowErrors,
     response: [
       {
         type: "TEXT",
@@ -4301,8 +4447,8 @@ function fixMojibake(text) {
     .replaceAll("\u00c3\u0192\u00e2\u20ac\u02dc", "Ñ")
     .replaceAll("\u00c3\u201a\u00c2\u00bf", "¿")
     .replaceAll("\u00c3\u201a\u00c2\u00a1", "¡")
-    .replaceAll("\u00c3\u00a2\u00c5\u201c\u00e2\u20ac\u00a6", "✅")
-    .replaceAll("\u00c3\u00a2\u00c5\u201c\u00e2\u20ac\u009d", "✔")
+    .replaceAll("\u00c3\u00a2\u00c5\u201c\u00e2\u20ac\u00a6", "?")
+    .replaceAll("\u00c3\u00a2\u00c5\u201c\u00e2\u20ac\u009d", "?")
     .replaceAll("\u00c3\u00a2\u00e2\u201a\u00ac\u00e2\u20ac\u0153", "–")
     .replaceAll("\u00c3\u00a2\u00e2\u201a\u00ac\u00e2\u20ac\u009d", "—")
     .replaceAll("\u00c3\u00a2\u00e2\u201a\u00ac\u00e2\u201e\u00a2", "’")
@@ -4316,6 +4462,9 @@ async function sendWoztellImageMessage(env, params) {
   return await sendWoztellResponse(env, {
     channelId: params.channelId,
     recipientId: params.recipientId,
+    memberId: params.memberId,
+    appId: params.appId,
+    swallowErrors: params.swallowErrors,
     logPrefix: "WOZTELL_IMAGE_SEND",
     response: [
       {
@@ -4327,56 +4476,103 @@ async function sendWoztellImageMessage(env, params) {
 }
 
 async function sendWoztellResponse(env, params) {
-  if (!env.WOZTELL_ACCESS_TOKEN) {
-    throw new Error("Missing WOZTELL_ACCESS_TOKEN");
+  const tokenInfo = selectWoztellSendToken(env);
+
+  if (!tokenInfo.token) {
+    const missingResult = {
+      ok: false,
+      failed: true,
+      status: 0,
+      body: "Missing WOZTELL_ACCESS_TOKEN or WOZTELL_OPEN_API_TOKEN"
+    };
+    console.error("WOZTELL_SEND_FAILED:", JSON.stringify(missingResult));
+    if (params.swallowErrors) return missingResult;
+    return missingResult;
   }
 
-  const url = "https://bot.api.woztell.com/sendResponses?accessToken=" + encodeURIComponent(env.WOZTELL_ACCESS_TOKEN);
-  const payload = {
-    channelId: params.channelId,
-    recipientId: params.recipientId,
-    response: params.response
-  };
+  const url = "https://bot.api.woztell.com/sendResponses?accessToken=" + encodeURIComponent(tokenInfo.token);
+  const baseParams = Object.assign({}, params, {
+    memberId: params.memberId || activeLogContext.memberId || "",
+    appId: params.appId || activeLogContext.appId || ""
+  });
+  const attempts = buildWoztellSendAttempts(baseParams);
+  let parsed = null;
+  let lastFailure = null;
 
-  if (params.logPrefix === "WOZTELL_IMAGE_SEND") {
-    console.log("WOZTELL_IMAGE_SEND_PAYLOAD:", JSON.stringify(payload));
-  }
+  console.log("WOZTELL_SEND_ENDPOINT:", JSON.stringify({
+    endpoint: "https://bot.api.woztell.com/sendResponses",
+    hasAccessTokenQuery: true
+  }));
+  console.log("WOZTELL_SEND_AUTH_MODE:", JSON.stringify({
+    tokenType: tokenInfo.mode,
+    hasWoztellAccessToken: Boolean(env.WOZTELL_ACCESS_TOKEN),
+    hasWoztellOpenApiToken: Boolean(env.WOZTELL_OPEN_API_TOKEN)
+  }));
 
-  let res;
+  for (const attempt of attempts) {
+    const payload = attempt.payload;
 
-  try {
-    res = await fetchWithTimeout(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json; charset=utf-8"
-      },
-      body: JSON.stringify(payload)
-    }, 30000, "WOZTELL_SEND_TIMEOUT");
-  } catch (error) {
+    logWoztellSendShape(payload, attempt.mode);
+
     if (params.logPrefix === "WOZTELL_IMAGE_SEND") {
-      console.error("WOZTELL_IMAGE_SEND_ERROR:", JSON.stringify({
-        message: String(error.message || error),
-        stack: String(error.stack || "")
-      }));
+      console.log("WOZTELL_IMAGE_SEND_PAYLOAD:", JSON.stringify(redactWoztellPayloadForLog(payload)));
     }
 
-    throw error;
-  }
+    let res;
 
-  const responseText = await res.text();
+    try {
+      res = await fetchWithTimeout(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        body: JSON.stringify(payload)
+      }, 30000, "WOZTELL_SEND_TIMEOUT");
+    } catch (error) {
+      lastFailure = {
+        ok: false,
+        failed: true,
+        mode: attempt.mode,
+        status: 0,
+        body: String(error.message || error).slice(0, 1000)
+      };
+      console.error("WOZTELL_SEND_FAILED:", JSON.stringify(lastFailure));
+      continue;
+    }
 
-  if (!res.ok) {
-    if (params.logPrefix === "WOZTELL_IMAGE_SEND") {
-      console.error("WOZTELL_IMAGE_SEND_ERROR:", JSON.stringify({
+    const responseText = await res.text();
+
+    if (!res.ok) {
+      lastFailure = {
+        ok: false,
+        failed: true,
+        mode: attempt.mode,
         status: res.status,
-        body: responseText.slice(0, 2000)
-      }));
+        body: responseText.slice(0, 1000)
+      };
+      console.error("WOZTELL_SEND_FAILED:", JSON.stringify(lastFailure));
+
+      if (params.logPrefix === "WOZTELL_IMAGE_SEND") {
+        console.error("WOZTELL_IMAGE_SEND_ERROR:", JSON.stringify({
+          status: res.status,
+          body: responseText.slice(0, 2000)
+        }));
+      }
+
+      if (!(attempt.mode === "recipientId" && shouldRetryWoztellWithMember(responseText, baseParams.memberId))) {
+        continue;
+      }
+
+      continue;
     }
 
-    throw new Error("WOZTELL_SEND_ERROR " + res.status + ": " + responseText);
+    parsed = parseMaybeJson(responseText);
+    break;
   }
 
-  const parsed = parseMaybeJson(responseText);
+  if (!parsed) {
+    return lastFailure || { ok: false, failed: true, status: 0, body: "WOZTELL_SEND_FAILED" };
+  }
 
   if (params.logPrefix === "WOZTELL_IMAGE_SEND") {
     console.log("WOZTELL_IMAGE_SEND_OK:", JSON.stringify({
@@ -4406,6 +4602,108 @@ async function sendWoztellResponse(env, params) {
   });
 
   return parsed;
+}
+
+function selectWoztellSendToken(env) {
+  if (env.WOZTELL_ACCESS_TOKEN) {
+    return {
+      token: env.WOZTELL_ACCESS_TOKEN,
+      mode: "WOZTELL_ACCESS_TOKEN"
+    };
+  }
+
+  if (env.WOZTELL_OPEN_API_TOKEN) {
+    return {
+      token: env.WOZTELL_OPEN_API_TOKEN,
+      mode: "WOZTELL_OPEN_API_TOKEN"
+    };
+  }
+
+  return {
+    token: "",
+    mode: "none"
+  };
+}
+
+function buildWoztellSendAttempts(params) {
+  const memberId = String(params.memberId || "");
+  const recipientId = String(params.recipientId || "");
+
+  if (memberId) {
+    return [{
+      mode: "memberId",
+      payload: buildWoztellSendPayload(params, "memberId")
+    }];
+  }
+
+  if (recipientId) {
+    return [{
+      mode: "recipientId",
+      payload: buildWoztellSendPayload(params, "recipientId")
+    }];
+  }
+
+  return [{
+    mode: "empty_recipient",
+    payload: buildWoztellSendPayload(params, "recipientId")
+  }];
+}
+
+function buildWoztellSendPayload(params, mode) {
+  const payload = {
+    channelId: params.channelId,
+    response: params.response
+  };
+
+  if (params.appId) payload.appId = params.appId;
+  if (mode === "memberId" && params.memberId) {
+    payload.memberId = params.memberId;
+  } else {
+    payload.recipientId = params.recipientId;
+  }
+
+  return payload;
+}
+
+function logWoztellSendShape(payload, mode) {
+  console.log("WOZTELL_SEND_BODY_SHAPE:", JSON.stringify({
+    mode: mode,
+    keys: Object.keys(payload),
+    responseCount: Array.isArray(payload.response) ? payload.response.length : 0,
+    responseTypes: (Array.isArray(payload.response) ? payload.response : []).map(function (item) {
+      return item.type || "";
+    })
+  }));
+  console.log("WOZTELL_SEND_CHANNEL_ID:", JSON.stringify({
+    present: Boolean(payload.channelId),
+    valuePreview: String(payload.channelId || "").slice(0, 8)
+  }));
+  console.log("WOZTELL_SEND_MEMBER_ID_PRESENT:", JSON.stringify({
+    present: Boolean(payload.memberId)
+  }));
+  console.log("WOZTELL_SEND_RECIPIENT_ID_PRESENT:", JSON.stringify({
+    present: Boolean(payload.recipientId)
+  }));
+  console.log("WOZTELL_SEND_APP_ID_PRESENT:", JSON.stringify({
+    present: Boolean(payload.appId)
+  }));
+}
+
+function shouldRetryWoztellWithMember(responseText, memberId) {
+  return Boolean(memberId && String(responseText || "").toLowerCase().includes("app could not be found"));
+}
+
+function redactWoztellPayloadForLog(payload) {
+  return {
+    channelId: payload.channelId || "",
+    hasMemberId: Boolean(payload.memberId),
+    hasRecipientId: Boolean(payload.recipientId),
+    hasAppId: Boolean(payload.appId),
+    responseCount: Array.isArray(payload.response) ? payload.response.length : 0,
+    responseTypes: (Array.isArray(payload.response) ? payload.response : []).map(function (item) {
+      return item.type || "";
+    })
+  };
 }
 
 async function downloadImageBytes(url) {
@@ -4439,6 +4737,8 @@ function normalizeCoordinatorData(data) {
     doName: String(clean.doName || ""),
     channel: String(clean.channel || ""),
     phone: String(clean.phone || ""),
+    member: String(clean.member || ""),
+    app: String(clean.app || ""),
     pendingMessages: Array.isArray(clean.pendingMessages) ? clean.pendingMessages : [],
     currentTurnId: String(clean.currentTurnId || ""),
     currentTraceId: String(clean.currentTraceId || ""),
@@ -5388,6 +5688,7 @@ function normalizeIncomingMessage(parsedMessage, woztellPayload, options) {
     audioTranscript: parsed.audioTranscript || "",
     awaitingTranscription: Boolean(audio.length && !parsed.audioTranscript && parsed.audioStatus !== "failed"),
     app: String(payload.app || ""),
+    member: String(payload.member || ""),
     channel: String(payload.channel || ""),
     from: String(payload.from || ""),
     to: String(payload.to || ""),
@@ -6014,7 +6315,8 @@ function buildWoztellPayloadFromData(data, messages) {
     to: first.to || "",
     from: data.phone || first.from || "",
     channel: data.channel || first.channel || "",
-    app: first.app || "",
+    app: data.app || first.app || "",
+    member: data.member || first.member || "",
     messageId: messages.map(function (msg) { return msg.messageId; }).join(",")
   };
 }
@@ -6179,6 +6481,39 @@ function jsonResponse(data, status) {
   });
 }
 
+function buildVersionDiagnostic(env) {
+  const now = new Date().toISOString();
+
+  return {
+    version: "whatsapp-ai-agent-core-v3",
+    build_label: String(env && env.BUILD_LABEL || "local-dev"),
+    ORCHESTRATOR_PROVIDER: String(env && env.ORCHESTRATOR_PROVIDER || "openai"),
+    ORCHESTRATOR_MODEL: String(env && env.ORCHESTRATOR_MODEL || "gpt-5.4-mini"),
+    ENABLE_LISTS: String(env && env.ENABLE_LISTS || "false"),
+    ENABLE_REMINDERS: String(env && env.ENABLE_REMINDERS || "false"),
+    ENABLE_WHATSAPP_INTERACTIVE: String(env && env.ENABLE_WHATSAPP_INTERACTIVE || "false"),
+    DEBUG_LOGS: String(env && env.DEBUG_LOGS || "false"),
+    timestamp: now
+  };
+}
+
+function formatVersionDiagnosticForWhatsApp(diagnostic) {
+  const data = diagnostic || {};
+
+  return [
+    "WhatsApp AI Agent Core",
+    "version: " + (data.version || ""),
+    "build_label: " + (data.build_label || ""),
+    "ORCHESTRATOR_PROVIDER: " + (data.ORCHESTRATOR_PROVIDER || ""),
+    "ORCHESTRATOR_MODEL: " + (data.ORCHESTRATOR_MODEL || ""),
+    "ENABLE_LISTS: " + (data.ENABLE_LISTS || ""),
+    "ENABLE_REMINDERS: " + (data.ENABLE_REMINDERS || ""),
+    "ENABLE_WHATSAPP_INTERACTIVE: " + (data.ENABLE_WHATSAPP_INTERACTIVE || ""),
+    "DEBUG_LOGS: " + (data.DEBUG_LOGS || ""),
+    "timestamp: " + (data.timestamp || "")
+  ].join("\n");
+}
+
 function getNumberEnv(value, fallback) {
   const num = Number(value);
   return Number.isFinite(num) && num > 0 ? num : fallback;
@@ -6238,6 +6573,8 @@ export {
   mapOrchestratorActions,
   analyzeMediaBatch,
   buildMediaBatchSummary,
+  buildVersionDiagnostic,
+  formatVersionDiagnosticForWhatsApp,
   consolidatedMessagesText
 };
 
