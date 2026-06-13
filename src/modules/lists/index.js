@@ -12,7 +12,7 @@ export function parseListCommand(text) {
   let action = "unknown";
 
   if (normalized.startsWith("crea una lista") || normalized.startsWith("crear lista")) action = "create";
-  else if (/\b(hazme|hacer|prepara|preparame|creame)\b.*\blista\b/.test(normalized)) action = "add";
+  else if (/\b(hazme|hacer|prepara|preparame|creame|crear|generar|genera|ayudar a generar|ayudame a generar)\b.*\blista\b/.test(normalized)) action = "add";
   else if (normalized.startsWith("agrega") || normalized.startsWith("anota")) action = "add";
   else if (normalized.startsWith("quita") || normalized.startsWith("elimina")) action = "remove";
   else if (normalized.startsWith("marca como hecho") || normalized.startsWith("marcar como hecho") || /\bmarca\b.*\b(comprado|hecho)\b/.test(normalized)) action = "mark_done";
@@ -31,6 +31,14 @@ export function parseListCommand(text) {
   if (["add", "remove", "mark_done"].includes(action) && !items.length) parsed.missingFields.push("items");
   if (!parsed.listName) parsed.missingFields.push("listName");
 
+  if (action === "unknown" || parsed.missingFields.length) {
+    logEvent("LIST_PARSER_FALLBACK_USED", {
+      action: action,
+      listName: parsed.listName,
+      missingFields: parsed.missingFields,
+      textPreview: raw.slice(0, 240)
+    });
+  }
   logEvent("LIST_COMMAND_PARSED", parsed);
   return parsed;
 }
@@ -185,10 +193,14 @@ function getList(state, name) {
 
 function extractListName(raw, normalized, action) {
   const lowerRaw = String(raw || "");
-  const match = lowerRaw.match(/\b(?:lista|listado)\s+(?:de\s+|del\s+|llamada\s+|para\s+)?([^.,;:]+?)(?:\s+con\b|$)/i);
+  const match = lowerRaw.match(/\b(?:lista|listado)\s+(?:del\s+|llamada\s+|para\s+)?([^.,;:]+?)(?:\s+con\b|$)/i);
 
   if (action === "create") {
     return lowerRaw.replace(/^\s*(crea una lista llamada|crea una lista|crear lista)\s*/i, "").trim();
+  }
+
+  if (/\blista\s+de\s+([^,.;:]+(?:\s*,|\s+y\s+).+)/i.test(lowerRaw)) {
+    return normalized.includes("compras") || includesGroceryItems(normalized) ? "compras" : "pendientes";
   }
 
   if (match) {
@@ -206,14 +218,19 @@ function extractListName(raw, normalized, action) {
 function extractItems(raw, normalized, action, listName) {
   if (action === "list" || action === "create" || action === "unknown") return [];
 
-  const afterCon = String(raw || "").match(/\bcon\s+(.+)$/i);
+  const source = String(raw || "");
+  const afterListDe = source.match(/\blista\s+de\s+(.+)$/i);
+  const afterCon = source.match(/\bcon\s+(.+)$/i);
   let clean = afterCon && /\blista\b/i.test(raw)
     ? afterCon[1]
-    : String(raw || "")
+    : afterListDe && /[,;]|\s+y\s+/i.test(afterListDe[1])
+    ? afterListDe[1]
+    : source
       .replace(/^\s*(anota|agrega|quita|elimina|marca como hecho|marcar como hecho)\s*/i, "")
       .replace(/^\s*marca\s+/i, "")
       .replace(/\s+como\s+(comprado|hecho).*$/i, "")
-      .replace(/^\s*(hazme|hacer|prepara|preparame|creame)\s+(una\s+)?lista\s+(de\s+|del\s+)?[^,.;:]+?\s+con\s+/i, "")
+      .replace(/^\s*(me puedes ayudar a\s+)?(hazme|hacer|prepara|preparame|creame|crear|generar|genera|ayudame a generar)\s+(una\s+)?lista\s+(de\s+|del\s+)?[^,.;:]+?\s+con\s+/i, "")
+      .replace(/^\s*(me puedes ayudar a\s+)?(hazme|hacer|prepara|preparame|creame|crear|generar|genera|ayudame a generar)\s+(una\s+)?lista\s+(de\s+)?/i, "")
       .replace(/\s+(en|a|de)\s+(mi\s+)?lista\s+.*$/i, "")
       .trim();
 
@@ -232,8 +249,13 @@ function normalizeItems(items) {
     .filter(Boolean);
 }
 
+function includesGroceryItems(text) {
+  return /\b(huevo|huevos|pan|leche|carne|pollo|arroz|queso|fruta|verdura|super|mercado)\b/.test(text);
+}
+
 function stripInputPrefixes(text) {
   return String(text || "")
+    .replace(/^\s*\[\d+\]\s+\w+:\s*/i, "")
     .replace(/^\s*\[Audio transcrito\]:\s*/i, "")
     .replace(/^\s*\[Texto adicional\]:\s*/i, "")
     .trim();

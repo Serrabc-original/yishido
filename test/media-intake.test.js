@@ -230,7 +230,7 @@ test("context policy separates new media from previous post unless explicitly re
 
 test("buildOrchestratorInput compacts previous state for current-turn-only requests", () => {
   const messages = [
-    normalizeIncomingMessage({ type: "TEXT", text: "Hazme algo con estas" }, basePayload, { messageId: "text" }),
+    normalizeIncomingMessage({ type: "TEXT", text: "Que tal este parlante?" }, basePayload, { messageId: "text" }),
     normalizeIncomingMessage({ type: "IMAGE", fileId: "img_1" }, basePayload, { messageId: "img" })
   ];
   const campaignState = {
@@ -243,6 +243,7 @@ test("buildOrchestratorInput compacts previous state for current-turn-only reque
 
   assert.equal(input.current_turn_summary.image_count, 1);
   assert.equal(input.relevant_previous_state.note, "Previous campaign content intentionally omitted for current turn.");
+  assert.equal(input.campaign_state_brief.ignored, true);
   assert.equal(Array.isArray(input.allowed_actions), true);
 });
 
@@ -265,6 +266,37 @@ test("text after previous images does not drag stale media into current turn", (
   assert.equal(turn.current_turn_media.asset_count, 0);
   assert.equal(turn.previous_relevant_media.asset_count, 0);
   assert.equal(turn.stale_media.asset_count, 2);
+
+  const input = buildOrchestratorInput({ messages, campaignState, userTurn: turn });
+  assert.equal(input.stale_media.asset_count, 0);
+  assert.equal(input.previous_relevant_media.asset_count, 0);
+});
+
+test("previous image plus audio list keeps stale media out of orchestrator input", () => {
+  const messages = [
+    normalizeIncomingMessage({
+      type: "TEXT",
+      text: "[Audio transcrito]: Me puedes ayudar a generar una lista de huevos, pan, leche y carne."
+    }, basePayload, { messageId: "audio_as_text" })
+  ];
+  messages[0].originalType = "AUDIO";
+  messages[0].audioTranscript = "Me puedes ayudar a generar una lista de huevos, pan, leche y carne.";
+  const campaignState = {
+    workflow_status: "collecting_assets",
+    campaign_type: "bulk_from_assets",
+    campaign_assets: [
+      { asset_id: "asset_1", asset_index: 1, file_id: "old_1", url: "https://cdn/old_1.jpg", media_type: "IMAGE", turn_id: "old_turn" },
+      { asset_id: "asset_2", asset_index: 2, file_id: "old_2", url: "https://cdn/old_2.jpg", media_type: "IMAGE", turn_id: "old_turn" }
+    ]
+  };
+
+  const turn = buildUserTurn(messages, campaignState, { turnId: "audio_turn" });
+  const input = buildOrchestratorInput({ messages, campaignState, userTurn: turn });
+
+  assert.equal(turn.audio_count, 1);
+  assert.equal(turn.stale_media.asset_count, 2);
+  assert.equal(input.stale_media.asset_count, 0);
+  assert.equal(input.campaign_state_brief.ignored, true);
 });
 
 test("explicit previous image reference selects previous relevant media", () => {

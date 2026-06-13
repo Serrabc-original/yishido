@@ -1,16 +1,16 @@
-{
-  "type": "module",
-  "scripts": {
-    "dev": "wrangler dev",
-    "dev:log": "node scripts/dev-log.js",
-    "deploy": "wrangler deploy",
-    "deploy:dev": "wrangler deploy",
-    "deploy:check": "wrangler deploy --dry-run",
-    "tail": "wrangler tail",
-    "test": "node --test test/**/*.test.js",
-    "test:inputs": "node scripts/test-all-input-cases.js",
-    "logs:latest": "node scripts/read-latest-logs.js",
-    "logs:analyze": "node scripts/analyze-logs.js",
-    "bug:report": "node scripts/export-bug-report.js"
-  }
+﻿{
+    "type":  "module",
+    "scripts":  {
+                    "dev":  "wrangler dev",
+                    "dev:log":  "node scripts/dev-log.js",
+                    "deploy":  "wrangler deploy",
+                    "deploy:dev":  "npx.cmd wrangler deploy",
+                    "deploy:check":  "npx.cmd wrangler deploy --dry-run",
+                    "tail":  "npx.cmd wrangler tail",
+                    "test":  "node --test test/**/*.test.js",
+                    "test:inputs":  "node scripts/test-all-input-cases.js",
+                    "logs:latest":  "node scripts/read-latest-logs.js",
+                    "logs:analyze":  "node scripts/analyze-logs.js",
+                    "bug:report":  "node scripts/export-bug-report.js"
+                }
 }

@@ -1150,6 +1150,34 @@ export class ConversationCoordinator {
         previousRelevantMedia: userTurn.previousRelevantMedia && userTurn.previousRelevantMedia.asset_count || 0,
         staleMedia: userTurn.staleMedia && userTurn.staleMedia.asset_count || 0
       });
+      if (userTurn.image_count > 0 && extractPlainTurnText(userTurn.current_turn_text || "")) {
+        console.log("IMAGE_CAPTION_MERGED:", JSON.stringify({
+          doName: data.doName,
+          turnId: userTurn.turn_id,
+          imageCount: userTurn.image_count,
+          textPreview: extractPlainTurnText(userTurn.current_turn_text || "").slice(0, 240)
+        }));
+        logEvent("IMAGE_CAPTION_MERGED", {
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName,
+          imageCount: userTurn.image_count
+        });
+      }
+      if (userTurn.audio_count > 0 && userTurn.audio_transcripts && userTurn.audio_transcripts.length) {
+        logEvent("AUDIO_TRANSCRIPT_ROUTED_AS_TEXT", {
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName,
+          transcriptPreview: userTurn.audio_transcripts.join(" ").slice(0, 240)
+        });
+        logEvent("AUDIO_TRANSCRIPT_NORMALIZED", {
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName,
+          textPreview: extractPlainTurnText(userTurn.current_turn_text || "").slice(0, 240)
+        });
+      }
       if (userTurn.context_policy !== "use_previous_context") {
         console.log("TURN_CONTEXT_RESET_REASON:", JSON.stringify({
           doName: data.doName,
@@ -1271,6 +1299,21 @@ export class ConversationCoordinator {
         flags: coreFlags,
         timezone: this.env.USER_TIMEZONE || "America/Bogota"
       });
+      if (isMarketingRoute(utilityRoute, userTurn)) {
+        logEvent("CAMPAIGN_STATE_USED_FOR_MARKETING_INTENT", {
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName,
+          intent: utilityRoute.intent
+        });
+      } else {
+        data.campaignState = clearCampaignStateForGeneralIntent(data.campaignState, {
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName,
+          intent: utilityRoute.intent
+        });
+      }
       data.activeContext = updateConversationContext(data.activeContext, {
         userTurn: userTurn,
         route: utilityRoute,
@@ -1409,6 +1452,14 @@ export class ConversationCoordinator {
     const mode = String(env.INTERACTIVE_DELIVERY_MODE || "safe").toLowerCase();
     const fallbackText = clean.fallbackText || clean.text || "";
 
+    if (clean.requiresPrimaryResponse && !clean.primaryResponseSent) {
+      logEvent("INTERACTIVE_SKIPPED_NO_PRIMARY_RESPONSE", {
+        traceId: clean.traceId || data.currentTraceId || "",
+        doName: data.doName || ""
+      });
+      return { mode: "skipped_no_primary_response" };
+    }
+
     if (mode === "disabled" || mode === "text") {
       await sendWoztellTextMessage(env, {
         channelId: data.channel,
@@ -1504,12 +1555,38 @@ export class ConversationCoordinator {
     data.campaignState.uploaded_image_analysis = analysisResult.summary;
     data.campaignState.current_asset_source = "uploaded_image";
 
-    const text = formatVisionUtilityResponse(route.intent, analysisResult.summary, userTurn);
-    await sendLongTextByWoztell(this.env, {
-      channelId: data.channel,
-      recipientId: data.phone,
-      text: text
+    logEvent("VISION_FINAL_RESPONSE_START", {
+      traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+      turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+      doName: data.doName,
+      intent: route.intent
     });
+    const text = formatVisionUtilityResponse(route.intent, analysisResult.summary, userTurn);
+    try {
+      await sendLongTextByWoztell(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        text: text
+      });
+      logEvent("VISION_FINAL_RESPONSE_SENT", {
+        traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+        turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+        doName: data.doName,
+        intent: route.intent
+      });
+    } catch (error) {
+      logEvent("VISION_FINAL_RESPONSE_FAILED", {
+        traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+        turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+        doName: data.doName,
+        message: String(error.message || error)
+      }, { level: "error" });
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        text: USER_MESSAGES.imageAnalysisFailed
+      });
+    }
 
     data.activeContext = updateConversationContext(data.activeContext, {
       userTurn: userTurn,
@@ -1594,10 +1671,26 @@ export class ConversationCoordinator {
         pendingClarification: ""
       });
 
+      const reminderText = formatReminderCreatedForWhatsApp(reminder, this.env);
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        text: reminderText
+      });
+      logEvent("PRIMARY_TEXT_RESPONSE_SENT_BEFORE_INTERACTIVE", {
+        traceId: userTurn && userTurn.trace_id || "",
+        turnId: userTurn && userTurn.turn_id || "",
+        doName: data.doName,
+        intent: "reminder"
+      });
       await this.sendInteractiveOrText(data, {
         traceId: userTurn && userTurn.trace_id || "",
-        text: formatReminderCreatedForWhatsApp(reminder, this.env),
-        fallbackText: formatReminderCreatedForWhatsApp(reminder, this.env) + "\nOpciones: Confirmar, Cambiar hora, Cancelar.",
+        text: "Opciones para este recordatorio:",
+        fallbackText: "Opciones: Confirmar, Cambiar hora, Cancelar.",
+        requiresPrimaryResponse: true,
+        primaryResponseSent: true,
         buttons: [
           { id: "reminder_confirm", title: "Confirmar" },
           { id: "reminder_change_time", title: "Cambiar hora" },
@@ -1641,10 +1734,35 @@ export class ConversationCoordinator {
         pendingClarification: ""
       });
 
+      const listText = formatListConfirmationForWhatsApp(parsed, list, userTurn);
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        text: listText
+      });
+      logEvent("PRIMARY_TEXT_RESPONSE_SENT_BEFORE_INTERACTIVE", {
+        traceId: userTurn && userTurn.trace_id || "",
+        turnId: userTurn && userTurn.turn_id || "",
+        doName: data.doName,
+        intent: "list"
+      });
+      if (userTurn && userTurn.audio_count > 0) {
+        logEvent("LIST_FROM_AUDIO_CREATED", {
+          traceId: userTurn && userTurn.trace_id || "",
+          turnId: userTurn && userTurn.turn_id || "",
+          doName: data.doName,
+          listName: list.name,
+          itemCount: Array.isArray(list.items) ? list.items.length : 0
+        });
+      }
       await this.sendInteractiveOrText(data, {
         traceId: userTurn && userTurn.trace_id || "",
-        text: formatListForWhatsApp(list),
-        fallbackText: formatListForWhatsApp(list) + "\nOpciones: Ver lista, Agregar más, Marcar comprado.",
+        text: "Opciones para esta lista:",
+        fallbackText: "Opciones: Ver lista, Agregar más, Marcar comprado.",
+        requiresPrimaryResponse: true,
+        primaryResponseSent: true,
         buttons: [
           { id: "list_view", title: "Ver lista" },
           { id: "list_add_more", title: "Agregar mas" },
@@ -1748,12 +1866,38 @@ export class ConversationCoordinator {
       console.log("CURRENT_ASSET_SOURCE:", data.campaignState.current_asset_source);
 
       if (plan.intent === "image_question" || plan.intent === "image_ocr") {
-        const text = formatVisionUtilityResponse(plan.intent, analysisResult.summary, userTurn);
-        await sendLongTextByWoztell(this.env, {
-          channelId: data.channel,
-          recipientId: data.phone,
-          text: text
+        logEvent("VISION_FINAL_RESPONSE_START", {
+          traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+          turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+          doName: data.doName,
+          intent: plan.intent
         });
+        const text = formatVisionUtilityResponse(plan.intent, analysisResult.summary, userTurn);
+        try {
+          await sendLongTextByWoztell(this.env, {
+            channelId: data.channel,
+            recipientId: data.phone,
+            text: text
+          });
+          logEvent("VISION_FINAL_RESPONSE_SENT", {
+            traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+            turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+            doName: data.doName,
+            intent: plan.intent
+          });
+        } catch (error) {
+          logEvent("VISION_FINAL_RESPONSE_FAILED", {
+            traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+            turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+            doName: data.doName,
+            message: String(error.message || error)
+          }, { level: "error" });
+          await sendWoztellTextMessage(this.env, {
+            channelId: data.channel,
+            recipientId: data.phone,
+            text: USER_MESSAGES.imageAnalysisFailed
+          });
+        }
         data.activeContext = updateConversationContext(data.activeContext, {
           userTurn: userTurn,
           route: { intent: plan.intent, module: "vision" },
@@ -2371,9 +2515,13 @@ async function convertAudioMessageToText(env, woztellPayload, parsedMessage) {
 
   const text = parts.join("\n");
 
-  console.log("AUDIO_AS_TEXT_BUFFERED:", JSON.stringify({
-    textPreview: text.slice(0, 500)
-  }));
+    console.log("AUDIO_AS_TEXT_BUFFERED:", JSON.stringify({
+      textPreview: text.slice(0, 500)
+    }));
+    logEvent("AUDIO_TRANSCRIPT_NORMALIZED", {
+      textPreview: transcript.trim().slice(0, 240),
+      source: "direct_audio_conversion"
+    });
 
   return Object.assign({}, parsedMessage, {
     type: "TEXT",
@@ -4420,6 +4568,13 @@ async function processAudioQueueJob(env, job) {
       messageId: job.messageId || "",
       textPreview: text.slice(0, 500)
     }));
+    logEvent("AUDIO_TRANSCRIPT_NORMALIZED", {
+      traceId: job.traceId || "",
+      doName: job.doName || "",
+      messageId: job.messageId || "",
+      textPreview: transcript.trim().slice(0, 240),
+      source: "audio_queue"
+    });
 
     await notifyConversationDO(env, job.doName || buildConversationName(woztellPayload), {
       type: "audio_transcribed",
@@ -5563,6 +5718,59 @@ function isExplicitMarketingRequest(text) {
   return /\b(post|posts|copy|caption|instagram|facebook|tiktok|redes sociales|campana|campanas|anuncio|ads|publicidad|publicacion|publicaciones|hashtag|calendario editorial|calendario de contenido|contenido para redes)\b/.test(normalized);
 }
 
+function isMarketingRoute(route, userTurn) {
+  return Boolean(route && route.intent === "marketing") || isExplicitMarketingRequest(extractPlainTurnText(userTurn && userTurn.current_turn_text || ""));
+}
+
+function hasActiveMarketingWorkflow(campaignState) {
+  const state = normalizeCampaignState(campaignState || {});
+  return Boolean(
+    state.collecting_assets ||
+    ["collecting_assets", "waiting_asset_usage_decision", "copy_ready", "calendar_pending_approval", "draft_pending_review"].includes(state.workflow_status) ||
+    ["bulk_from_assets", "weekly_content_plan", "monthly_content_plan"].includes(state.campaign_type)
+  );
+}
+
+function clearCampaignStateForGeneralIntent(campaignState, meta) {
+  const state = normalizeCampaignState(campaignState || {});
+  if (!hasActiveMarketingWorkflow(state)) return state;
+
+  logEvent("CAMPAIGN_STATE_IGNORED_FOR_GENERAL_INTENT", {
+    traceId: meta && meta.traceId || "",
+    turnId: meta && meta.turnId || "",
+    doName: meta && meta.doName || "",
+    intent: meta && meta.intent || "",
+    previousWorkflowStatus: state.workflow_status,
+    previousCampaignType: state.campaign_type
+  });
+  logEvent("CAMPAIGN_STATE_CLEARED_FOR_CONTEXT_SWITCH", {
+    traceId: meta && meta.traceId || "",
+    turnId: meta && meta.turnId || "",
+    doName: meta && meta.doName || "",
+    intent: meta && meta.intent || ""
+  });
+
+  return Object.assign({}, state, {
+    active_topic: "",
+    campaign_type: "single_post",
+    workflow_status: "idle",
+    expected_next_target: "unknown",
+    collecting_assets: false,
+    content_calendar: [],
+    bulk_posts: [],
+    current_asset_source: "",
+    campaign_summary: "",
+    product: "",
+    objective: "",
+    platforms: [],
+    draft_status: "",
+    approval_status: "",
+    publish_status: "",
+    ready_to_publish: false,
+    updated_at: new Date().toISOString()
+  });
+}
+
 function resolveReminderReferences(parsed, activeContext) {
   const clean = Object.assign({}, parsed || {});
   const context = normalizeConversationContext(activeContext || {});
@@ -5593,6 +5801,8 @@ function formatListGoal(list) {
 function formatVisionUtilityResponse(intent, summary, userTurn) {
   const data = summary || {};
   const assets = Array.isArray(data.assets) ? data.assets : [];
+  const question = extractPlainTurnText(userTurn && userTurn.current_turn_text || "");
+  const normalizedQuestion = normalizeTextForIntent(question);
   const visibleTexts = assets.map(function (asset) {
     return asset.analysis && asset.analysis.visible_text || "";
   }).filter(Boolean);
@@ -5614,8 +5824,24 @@ function formatVisionUtilityResponse(intent, summary, userTurn) {
     })).join("\n");
   }
 
+  if (intent === "image_question" && /\b(que tal|como lo ves|vale la pena|conviene|recomiendas|bueno|buena)\b/.test(normalizedQuestion)) {
+    const subject = subjects[0] || "el producto";
+    const visible = visibleTexts.length ? " En la imagen se alcanza a ver: " + visibleTexts.join(" | ") + "." : "";
+    const brand = assets.map(function (asset) {
+      return asset.analysis && asset.analysis.brand_or_labels || "";
+    }).filter(Boolean)[0] || "";
+    const brandText = brand ? " " + brand : "";
+
+    return [
+      "Se ve bien como " + subject + brandText + ", con la cautela de que solo puedo evaluar lo visible en la foto." + visible,
+      "Antes de comprarlo revisaria el modelo exacto, potencia/watts, bateria, resistencia al agua, garantia y si es original.",
+      visibleTexts.join(" ").includes("$") ? "Por el precio visible podria estar bien si es original y cumple esas especificaciones." : "",
+      data.failed_asset_count ? "Nota: " + data.failed_asset_count + " imagen(es) no se pudieron analizar." : ""
+    ].filter(Boolean).join("\n");
+  }
+
   return [
-    "Analisis visual",
+    question ? "Sobre tu pregunta: " + question : "Analisis visual",
     subjects.length ? "Parece mostrar: " + subjects.join(" | ") : "",
     objects.length ? "Objetos detectados: " + objects.join(", ") : "",
     visibleTexts.length ? "Texto visible: " + visibleTexts.join(" | ") : "",
@@ -5635,6 +5861,27 @@ function formatListForWhatsApp(list) {
   return ["Lista: " + clean.name].concat(items.map(function (item, index) {
     return (index + 1) + ". " + (item.done ? "[hecho] " : "") + item.text;
   })).join("\n");
+}
+
+function formatListConfirmationForWhatsApp(parsed, list, userTurn) {
+  const clean = list || { name: "pendientes", items: [] };
+  const items = Array.isArray(clean.items) ? clean.items : [];
+  const itemTexts = items.map(function (item) { return item.text; }).filter(Boolean);
+  const action = parsed && parsed.action || "list";
+  const fromAudio = userTurn && userTurn.audio_count > 0;
+
+  if (!items.length) return "La lista " + clean.name + " está vacía.";
+  if (action === "add" || action === "create") {
+    return "Listo, " + (fromAudio ? "creé" : "actualicé") + " tu lista de " + clean.name + " con: " + itemTexts.join(", ") + ".";
+  }
+  if (action === "remove") {
+    return "Listo, actualicé tu lista de " + clean.name + ".\n" + formatListForWhatsApp(clean);
+  }
+  if (action === "mark_done") {
+    return "Listo, marqué el item en tu lista de " + clean.name + ".\n" + formatListForWhatsApp(clean);
+  }
+
+  return formatListForWhatsApp(clean);
 }
 
 function formatListsIndexForWhatsApp(coreUtilityState) {
@@ -6606,6 +6853,23 @@ function normalizeTextForIntent(text) {
     .trim();
 }
 
+function extractPlainTurnText(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const clean = [];
+
+  for (const line of lines) {
+    let value = String(line || "").trim();
+    value = value.replace(/^\[\d+\]\s+\w+:\s*/i, "");
+    value = value.replace(/^fileId=[^:]+:\s*/i, "");
+    value = value.replace(/^\[Audio transcrito\]:\s*/i, "");
+    value = value.replace(/^\[Texto adicional\]:\s*/i, "");
+    if (!value || /\[IMAGE uploaded/i.test(value)) continue;
+    clean.push(value);
+  }
+
+  return clean.join("\n").trim();
+}
+
 function getLastCopyFromState(state) {
   return String(state && (state.last_copy || state.lastCopy) || "");
 }
@@ -6951,11 +7215,12 @@ function compactConversationHistory(history) {
 
 function buildRelevantPreviousState(campaignState, userTurn) {
   const state = normalizeCampaignState(campaignState || {});
+  const useCampaignState = isExplicitMarketingRequest(extractPlainTurnText(userTurn && userTurn.current_turn_text || ""));
 
-  if (userTurn && userTurn.context_policy !== "use_previous_context") {
+  if (!useCampaignState || userTurn && userTurn.context_policy !== "use_previous_context") {
     return {
-      workflow_status: state.workflow_status,
-      expected_next_target: state.expected_next_target,
+      workflow_status: useCampaignState ? state.workflow_status : "ignored",
+      expected_next_target: useCampaignState ? state.expected_next_target : "ignored",
       note: "Previous campaign content intentionally omitted for current turn."
     };
   }
@@ -6975,14 +7240,17 @@ function buildRelevantPreviousState(campaignState, userTurn) {
 function buildOrchestratorInput(params) {
   const userTurn = params.userTurn || buildUserTurn(params.messages || [], params.campaignState || {});
   const state = normalizeCampaignState(params.campaignState || {});
+  const plainText = extractPlainTurnText(userTurn.current_turn_text || "");
+  const allowPreviousContext = userTurn.context_policy === "use_previous_context";
+  const useCampaignState = isExplicitMarketingRequest(plainText);
 
   return {
     current_turn_summary: buildTurnSummary(userTurn),
     current_turn_text: userTurn.current_turn_text || "",
     media_batch_summary: userTurn.media_batch_summary || null,
     current_turn_media: userTurn.current_turn_media || userTurn.currentTurnMedia || emptyMediaContext(),
-    previous_relevant_media: userTurn.previous_relevant_media || userTurn.previousRelevantMedia || emptyMediaContext(),
-    stale_media: userTurn.stale_media || userTurn.staleMedia || emptyMediaContext(),
+    previous_relevant_media: allowPreviousContext ? userTurn.previous_relevant_media || userTurn.previousRelevantMedia || emptyMediaContext() : emptyMediaContext(),
+    stale_media: allowPreviousContext ? userTurn.stale_media || userTurn.staleMedia || emptyMediaContext() : emptyMediaContext(),
     audio_transcripts: userTurn.audio_transcripts || [],
     video_metadata: userTurn.video_metadata || [],
     file_metadata: userTurn.file_metadata || [],
@@ -6993,12 +7261,15 @@ function buildOrchestratorInput(params) {
     relevant_previous_state: buildRelevantPreviousState(state, userTurn),
     allowed_actions: getAllowedOrchestratorActions(),
     active_context: normalizeConversationContext(params.activeContext || params.active_context || {}),
-    campaign_state_brief: {
+    campaign_state_brief: useCampaignState ? {
       campaign_id: state.campaign_id,
       campaign_type: state.campaign_type,
       workflow_status: state.workflow_status,
       expected_next_target: state.expected_next_target,
       current_asset_source: state.current_asset_source || ""
+    } : {
+      ignored: true,
+      reason: "non_marketing_current_turn"
     }
   };
 }
@@ -7623,6 +7894,7 @@ export {
   clearMediaState,
   createEmptyConversationContext,
   formatContextForWhatsApp,
+  formatVisionUtilityResponse,
   formatListsIndexForWhatsApp,
   formatRemindersForWhatsApp,
   updateConversationContext,

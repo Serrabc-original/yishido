@@ -636,6 +636,39 @@ test("control commands expose interactive, lists and reminders safely", async ()
   }
 });
 
+test("core list response sends primary text before optional interactive buttons", async () => {
+  const sentBodies = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    sentBodies.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({ ok: 1 }), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json"
+      }
+    });
+  };
+
+  const coordinator = new ConversationCoordinator(createMemoryState(), {
+    WOZTELL_ACCESS_TOKEN: "test-token",
+    ENABLE_LISTS: "true",
+    ENABLE_WHATSAPP_INTERACTIVE: "true",
+    INTERACTIVE_DELIVERY_MODE: "safe"
+  });
+
+  try {
+    await coordinator.receiveMessage(buildTextWebhookBody("[Audio transcrito]: Me puedes ayudar a generar una lista de huevos, pan, leche y carne."));
+    await coordinator.processBuffer();
+
+    assert.equal(sentBodies.length >= 2, true);
+    assert.equal(sentBodies[0].response[0].type, "TEXT");
+    assert.match(sentBodies[0].response[0].text, /Listo, actualicé tu lista de compras con: huevos, pan, leche, carne\./);
+    assert.equal(sentBodies[1].response[0].type, "QUICK_REPLY");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 function createMemoryState() {
   const storage = new Map();
 

@@ -170,8 +170,19 @@ function parseDueDate(normalized, now, timezone) {
   const due = new Date(now);
   let hasDate = false;
   let hasTime = false;
+  const relativeMatch = normalized.match(/\ben\s+(\d+)\s*(minuto|minutos|hora|horas|dia|dias)\b/);
 
-  if (normalized.includes("manana")) {
+  if (relativeMatch) {
+    const value = Number(relativeMatch[1]);
+    const unit = relativeMatch[2];
+    if (unit.startsWith("minuto")) due.setMinutes(due.getMinutes() + value);
+    else if (unit.startsWith("hora")) due.setHours(due.getHours() + value);
+    else due.setDate(due.getDate() + value);
+    hasDate = true;
+    hasTime = true;
+  }
+
+  if (!hasDate && normalized.includes("manana")) {
     due.setDate(due.getDate() + 1);
     hasDate = true;
   }
@@ -264,6 +275,7 @@ function extractReminderTitle(text) {
   return String(text || "")
     .replace(/^\s*(hazme acuerdo|av[ií]same|avisame)\s*/i, "")
     .replace(/^\s*(recu[eé]rdame|recordarme|anota un recordatorio para|anota recordatorio para|recuerdame)\s*/i, "")
+    .replace(/\ben\s+\d+\s*(minuto|minutos|hora|horas|d[ií]a|dias|días)\b/gi, "")
     .replace(/\b(ma[nñ]ana|el viernes|el lunes|el martes|el miercoles|el miércoles|el jueves|el sabado|el sábado|el domingo)\b/gi, "")
     .replace(/\b(a las|a la)\s+\d{1,2}(:\d{2})?\s*(am|pm)?\b/gi, "")
     .replace(/\b\d+\s*(d[ií]a|dias|días|hora|horas|minuto|minutos)\s+antes\b/gi, "")

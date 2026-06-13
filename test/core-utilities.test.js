@@ -7,7 +7,7 @@ import { buildWhatsAppInteractiveResponse, sendWhatsAppInteractiveMessage } from
 import { parseReminderRequest, createMemoryReminderStore } from "../src/modules/reminders/index.js";
 import { addListItems, createList, listItems, markListItemDone, parseListCommand, removeListItems } from "../src/modules/lists/index.js";
 import { routeCoreUtilityIntent } from "../src/coreUtilityRouter.js";
-import { formatListsIndexForWhatsApp, formatRemindersForWhatsApp } from "../src/index.js";
+import { formatListsIndexForWhatsApp, formatRemindersForWhatsApp, formatVisionUtilityResponse } from "../src/index.js";
 import { exportBugReport } from "../scripts/export-bug-report.js";
 
 test("interactive messages build quick replies and list fallback for many buttons", () => {
@@ -173,6 +173,14 @@ test("list parser handles natural shopping list requests", () => {
   assert.deepEqual(parsed.items, ["arroz", "pollo", "leche", "huevos"]);
 });
 
+test("audio transcript list request creates shopping list items", () => {
+  const parsed = parseListCommand("[Audio transcrito]: Me puedes ayudar a generar una lista de huevos, pan, leche y carne.");
+
+  assert.equal(parsed.action, "add");
+  assert.equal(parsed.listName, "compras");
+  assert.deepEqual(parsed.items, ["huevos", "pan", "leche", "carne"]);
+});
+
 test("bug report exports trace bundle, redacts secrets and detects missing events", () => {
   const dir = mkdtempSync(join(tmpdir(), "yishido-bug-report-"));
   const logsDir = join(dir, "logs");
@@ -248,4 +256,51 @@ test("core utility router keeps marketing explicit and separates image/OCR inten
   assert.equal(audioList.intent, "list");
   assert.deepEqual(audioList.parsed.items, ["pan", "queso"]);
   assert.equal(marketing.intent, "marketing");
+});
+
+test("router separates list and short relative reminder from audio text", () => {
+  const list = routeCoreUtilityIntent({
+    current_turn_text: "[1] TEXT: [Audio transcrito]: Me puedes ayudar a generar una lista de huevos, pan, leche y carne.",
+    audio_count: 1
+  }, {
+    flags: { enableLists: true, enableReminders: true }
+  });
+  const reminder = routeCoreUtilityIntent({
+    current_turn_text: "[1] TEXT: [Audio transcrito]: Recuerdame en 4 minutos comprar leche",
+    audio_count: 1
+  }, {
+    flags: { enableLists: true, enableReminders: true },
+    now: "2026-06-13T12:00:00.000Z",
+    timezone: "America/Bogota"
+  });
+
+  assert.equal(list.intent, "list");
+  assert.deepEqual(list.parsed.items, ["huevos", "pan", "leche", "carne"]);
+  assert.equal(reminder.intent, "reminder");
+  assert.equal(reminder.parsed.title, "comprar leche");
+  assert.equal(reminder.parsed.missingFields.length, 0);
+  assert.match(reminder.parsed.dueAt, /^2026-06-13T12:04:00/);
+});
+
+test("image question response answers the caption instead of only listing visible fields", () => {
+  const text = formatVisionUtilityResponse("image_question", {
+    analyzed_asset_count: 1,
+    failed_asset_count: 0,
+    assets: [{
+      analysis: {
+        main_subject: "parlante Bluetooth",
+        product_type: "parlante portatil",
+        visible_text: "Precio: $55.99",
+        brand_or_labels: "JBL",
+        objects_detected: ["parlante", "caja"]
+      }
+    }]
+  }, {
+    current_turn_text: "[1] IMAGE: [IMAGE uploaded without caption]\n[2] TEXT: Que tal este parlante?",
+    context_policy: "current_turn_only"
+  });
+
+  assert.match(text, /Se ve bien como parlante Bluetooth JBL/);
+  assert.match(text, /Antes de comprarlo revisaria/);
+  assert.doesNotMatch(text, /^Analisis visual/);
 });

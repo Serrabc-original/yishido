@@ -3,7 +3,7 @@ import { parseReminderRequest } from "./modules/reminders/index.js";
 
 export function routeCoreUtilityIntent(userTurn, options) {
   const cleanOptions = options || {};
-  const text = String(userTurn && (userTurn.current_turn_text || userTurn.text || "") || "");
+  const text = extractRoutableText(String(userTurn && (userTurn.current_turn_text || userTurn.text || "") || ""));
   const normalized = normalizeText(text);
   const flags = cleanOptions.flags || {};
   const media = getTurnMediaCounts(userTurn);
@@ -75,10 +75,12 @@ function intentResult(intent, confidence, module) {
 }
 
 function isReminderIntent(text) {
-  return /\b(recuerdame|recordarme|recordatorio|recordatorios|avisame|hazme acuerdo|acuerdame|cancel(a|ar).*(recordatorio)|muestrame.*recordatorio|mostrar.*recordatorio)\b/.test(text);
+  return /\b(recuerdame|recordarme|recordatorio|recordatorios|avisame|hazme acuerdo|acuerdame|cancel(a|ar).*(recordatorio)|muestrame.*recordatorio|mostrar.*recordatorio)\b/.test(text) ||
+    /\ben\s+\d+\s*(minuto|minutos|hora|horas)\b/.test(text) && /\b(comprar|pagar|llamar|hacer|enviar)\b/.test(text);
 }
 
 function isListIntent(text) {
+  if (isReminderIntent(text) && !/\blista\b/.test(text)) return false;
   return /\b(lista|listado|compras|super|supermercado|anota|agrega|quita|elimina|muestrame|mostrar|marca como hecho|marca .*comprado|comprado|pendientes)\b/.test(text);
 }
 
@@ -89,7 +91,7 @@ function isImageOcrIntent(text, media) {
 function isImageQuestionIntent(text, media) {
   if (media.imageCount <= 0) return false;
   if (isMarketingIntent(text)) return false;
-  return /\b(que ves|que aparece|como funciona|que es|explica|analiza|revisa|esta maquina|esta foto|esta imagen)\b/.test(text);
+  return /\b(que ves|que aparece|como funciona|que es|que tal|como lo ves|vale la pena|explica|analiza|revisa|esta maquina|esta foto|esta imagen)\b/.test(text);
 }
 
 function isMarketingIntent(text) {
@@ -116,6 +118,23 @@ function normalizeText(text) {
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function extractRoutableText(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const clean = [];
+
+  for (const line of lines) {
+    let value = String(line || "").trim();
+    value = value.replace(/^\[\d+\]\s+\w+:\s*/i, "");
+    value = value.replace(/^fileId=[^:]+:\s*/i, "");
+    value = value.replace(/^\[Audio transcrito\]:\s*/i, "");
+    value = value.replace(/^\[Texto adicional\]:\s*/i, "");
+    if (!value || /\[IMAGE uploaded/i.test(value)) continue;
+    clean.push(value);
+  }
+
+  return clean.join("\n").trim() || String(text || "");
 }
 
 function getTurnMediaCounts(userTurn) {
