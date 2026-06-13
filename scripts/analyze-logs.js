@@ -15,7 +15,13 @@ const result = {
     fallbacksSent: 0,
     audioTimeouts: 0,
     failedImages: 0,
-    invalidOrchestratorJson: 0
+    invalidOrchestratorJson: 0,
+    openAiFailures: 0,
+    woztellSendFailures: 0,
+    staleMediaTurns: 0,
+    contextSwitches: 0,
+    reminderIssues: 0,
+    interactiveFailures: 0
   },
   repeatedErrors: [],
   fallbacksSent: [],
@@ -25,6 +31,12 @@ const result = {
   turnsWithPendingAudio: [],
   turnsWithPendingMedia: [],
   invalidOrchestratorJson: [],
+  openAiFailures: [],
+  woztellSendFailures: [],
+  staleMediaTurns: [],
+  contextSwitches: [],
+  reminderIssues: [],
+  interactiveFailures: [],
   errorsByTraceId: {},
   latestProblemConversations: []
 };
@@ -141,6 +153,43 @@ for (const record of records) {
     result.totals.invalidOrchestratorJson += 1;
     result.invalidOrchestratorJson.push(problem(record, "invalid_orchestrator_json", details.textPreview || details.errorMessage || event));
     problems.push(problem(record, "invalid_orchestrator_json", details.textPreview || details.errorMessage || event));
+  }
+
+  if (event === "OPENAI_REQUEST_FAILED" || String(details.message || details.errorMessage || "").toLowerCase().includes("openai")) {
+    result.totals.openAiFailures += 1;
+    result.openAiFailures.push(problem(record, "openai_failure", details.message || details.errorMessage || event));
+    problems.push(problem(record, "openai_failure", details.message || details.errorMessage || event));
+  }
+
+  if (event === "WOZTELL_SEND_FAILED" || event === "WHATSAPP_SEND_FAILED" || event.includes("WOZTELL") && event.includes("FAILED")) {
+    result.totals.woztellSendFailures += 1;
+    result.woztellSendFailures.push(problem(record, "woztell_send_failure", details.message || details.errorMessage || event));
+    problems.push(problem(record, "woztell_send_failure", details.message || details.errorMessage || event));
+  }
+
+  if (event === "WHATSAPP_INTERACTIVE_SEND_FAILED" || event === "WHATSAPP_INTERACTIVE_FALLBACK_SENT") {
+    result.totals.interactiveFailures += 1;
+    result.interactiveFailures.push(problem(record, "interactive_issue", details.reason || details.message || event));
+    problems.push(problem(record, "interactive_issue", details.reason || details.message || event));
+  }
+
+  if (event === "TURN_CONTEXT_POLICY" && Number(details.staleMedia || details.stale_media || 0) > 0) {
+    result.totals.staleMediaTurns += 1;
+    result.staleMediaTurns.push(problem(record, "stale_media", "staleMedia=" + Number(details.staleMedia || details.stale_media || 0)));
+    problems.push(problem(record, "stale_media", "staleMedia=" + Number(details.staleMedia || details.stale_media || 0)));
+  }
+
+  if (event === "TURN_CONTEXT_RESET_REASON" || event === "TURN_CONTEXT_POLICY" && details.policy && details.policy !== "use_previous_context") {
+    result.totals.contextSwitches += 1;
+    result.contextSwitches.push(problem(record, "context_switch", details.reason || details.policy || event));
+  }
+
+  if (event.startsWith("REMINDER_") && (event.includes("FAILED") || event.includes("MISSING") || event.includes("CANCEL"))) {
+    result.totals.reminderIssues += 1;
+    result.reminderIssues.push(problem(record, "reminder_issue", details.message || details.errorMessage || event));
+    if (event.includes("FAILED") || event.includes("MISSING")) {
+      problems.push(problem(record, "reminder_issue", details.message || details.errorMessage || event));
+    }
   }
 }
 

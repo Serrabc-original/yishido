@@ -1,15 +1,17 @@
-# Lists And Notes
+# Lists
 
-`src/modules/lists/` provides a base utility for notes and lists.
+`src/modules/lists/` is an active core utility for WhatsApp lists. State is kept per Durable Object conversation in `coreUtilityState`.
 
 ## Supported Commands
 
-- `Anota leche, pan y huevos en mi lista del súper`
+- `Hazme una lista de compras con arroz, pollo, leche y huevos`
+- `Anota leche, pan y huevos en mi lista del super`
 - `Agrega cargadores tipo C a lista de inventario`
-- `Muéstrame mi lista de pendientes`
-- `Quita huevos de la lista del súper`
-- `Marca como hecho llamar al cliente`
+- `Muestrame mi lista`
+- `Quita huevos de la lista del super`
+- `Marca pollo como comprado`
 - `Crea una lista llamada clientes pendientes`
+- `/lists`
 
 ## API
 
@@ -23,10 +25,11 @@
 ## Activation
 
 ```text
-ENABLE_LISTS=false
+ENABLE_LISTS=true
+CORE_UTILITIES_SANDBOX=true
 ```
 
-When disabled, list requests pass to the orchestrator. When enabled, the core can handle list operations in Durable Object state or local mock storage.
+When enabled, list requests are handled before marketing/orchestrator routing. If the user does not name a list, the active list is used; otherwise the default is `pendientes`.
 
 ## Logs
 

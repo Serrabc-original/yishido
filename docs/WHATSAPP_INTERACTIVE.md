@@ -18,17 +18,18 @@ Use lists when there are more than 3 options or when choices need descriptions. 
 
 ## When To Use Templates
 
-Use templates for outbound, business-initiated WhatsApp messages that require approved template flows. This core does not activate templates yet; use `src/modules/templates/` as the placeholder.
+Use templates for outbound, business-initiated WhatsApp messages that require approved template flows. The template module flag is active locally, but automatic publishing and Meta API remain out of scope.
 
 ## Fallback
 
 Interactive messages are controlled by:
 
 ```text
-ENABLE_WHATSAPP_INTERACTIVE=false
+ENABLE_WHATSAPP_INTERACTIVE=true
+INTERACTIVE_DELIVERY_MODE=safe
 ```
 
-When disabled, unsupported, or failed, the sender falls back to text using `fallbackText`.
+In `safe` mode, unsupported or failed interactive sends fall back to text using `fallbackText`. `/debug-interactive` sends a low-risk test message.
 
 ## Logs
 

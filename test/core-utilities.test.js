@@ -7,6 +7,7 @@ import { buildWhatsAppInteractiveResponse, sendWhatsAppInteractiveMessage } from
 import { parseReminderRequest, createMemoryReminderStore } from "../src/modules/reminders/index.js";
 import { addListItems, createList, listItems, markListItemDone, parseListCommand, removeListItems } from "../src/modules/lists/index.js";
 import { routeCoreUtilityIntent } from "../src/coreUtilityRouter.js";
+import { formatListsIndexForWhatsApp, formatRemindersForWhatsApp } from "../src/index.js";
 import { exportBugReport } from "../scripts/export-bug-report.js";
 
 test("interactive messages build quick replies and list fallback for many buttons", () => {
@@ -53,6 +54,30 @@ test("interactive message falls back to text when disabled", async () => {
   assert.equal(sent[0].response[0].type, "TEXT");
 });
 
+test("interactive message uses memberId/appId when available", async () => {
+  const sent = [];
+  const result = await sendWhatsAppInteractiveMessage({
+    ENABLE_WHATSAPP_INTERACTIVE: "true"
+  }, {
+    channelId: "channel",
+    recipientId: "phone",
+    memberId: "member",
+    appId: "app",
+    text: "Confirma",
+    buttons: [{ id: "confirm", title: "Confirmar" }]
+  }, {
+    transport: async (payload) => {
+      sent.push(payload);
+      return { ok: true };
+    }
+  });
+
+  assert.equal(result.mode, "interactive");
+  assert.equal(sent[0].memberId, "member");
+  assert.equal(sent[0].appId, "app");
+  assert.equal(Object.hasOwn(sent[0], "recipientId"), false);
+});
+
 test("reminder parser handles tomorrow, offsets, missing date and missing time", () => {
   const now = "2026-06-12T12:00:00.000Z";
   const tomorrow = parseReminderRequest("Recuerdame manana a las 9 llamar a Juan", "America/Bogota", { now });
@@ -65,6 +90,20 @@ test("reminder parser handles tomorrow, offsets, missing date and missing time",
   assert.deepEqual(offsets.reminderOffsets, ["1d", "1h"]);
   assert.equal(missingDate.missingFields.includes("date"), true);
   assert.equal(missingTime.missingFields.includes("time"), true);
+});
+
+test("reminder parser handles list and cancel actions", () => {
+  const list = parseReminderRequest("Muestrame mis recordatorios", "America/Bogota", {
+    now: "2026-06-12T12:00:00.000Z"
+  });
+  const cancel = parseReminderRequest("Cancela el recordatorio de comprar leche", "America/Bogota", {
+    now: "2026-06-12T12:00:00.000Z"
+  });
+
+  assert.equal(list.action, "list");
+  assert.equal(list.missingFields.length, 0);
+  assert.equal(cancel.action, "cancel");
+  assert.equal(cancel.title, "comprar leche");
 });
 
 test("reminder memory store creates and lists mock reminders", async () => {
@@ -89,6 +128,33 @@ test("lists create, add, remove, mark done and list items", () => {
 
   assert.deepEqual(list.items.map((item) => item.text), ["leche", "pan"]);
   assert.equal(list.items.find((item) => item.text === "pan").done, true);
+});
+
+test("lists index and reminders formatting expose empty and populated states", () => {
+  let listState = createList({}, "super");
+  listState = addListItems(listState, "super", ["pan", "queso"]);
+  const listsText = formatListsIndexForWhatsApp({
+    listsState: listState,
+    lists: listState.lists,
+    activeList: "super"
+  });
+  const emptyRemindersText = formatRemindersForWhatsApp([], {
+    REMINDERS_DELIVERY_MODE: "mock"
+  });
+  const remindersText = formatRemindersForWhatsApp([{
+    id: "rem_1",
+    title: "comprar leche",
+    dueAt: "2026-06-13T14:00:00.000Z",
+    status: "scheduled_mock"
+  }], {
+    REMINDERS_DELIVERY_MODE: "mock"
+  });
+
+  assert.match(listsText, /super \(activa\)/);
+  assert.match(listsText, /2 item/);
+  assert.match(emptyRemindersText, /No tienes recordatorios pendientes/);
+  assert.match(remindersText, /modo: mock/);
+  assert.match(remindersText, /comprar leche/);
 });
 
 test("list parser extracts action, list name and items", () => {

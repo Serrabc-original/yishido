@@ -1,18 +1,21 @@
 # Reminders
 
-`src/modules/reminders/` provides a base reminder utility for WhatsApp.
+`src/modules/reminders/` is an active core utility for WhatsApp reminders. In local development the default delivery mode is mock, so reminders are saved and shown but are not delivered by a real scheduler.
 
 ## Supported Parsing
 
-Examples:
-
-- `Recuérdame mañana a las 9 llamar a Juan`
-- `Recuérdame 1 día antes y 1 hora antes de la reunión`
-- `Recuérdame el viernes comprar medicina`
-- `Anota un recordatorio para pagar la luz el 30 a las 8am`
+- `Recuerdame manana a las 9 llamar a Juan`
+- `Recuerdame 1 dia antes y 1 hora antes de la reunion`
+- `Recuerdame esta lista manana a las 8`
+- `Hazme acuerdo el viernes pagar la luz`
+- `Cancela el recordatorio de comprar leche`
+- `Muestrame mis recordatorios`
+- `/reminders`
+- `/clear-reminders`
 
 The parser returns:
 
+- `action`
 - `title`
 - `dueAt`
 - `timezone`
@@ -22,24 +25,22 @@ The parser returns:
 - `confidence`
 - `missingFields`
 
-If date or time is missing, the core can ask a short clarification.
+If date, time, or title is missing, the core asks only for the missing field. References like `eso`, `lo anterior` or `esta lista` can use `activeContext.lastUserGoal`.
 
 ## Activation
 
 ```text
-ENABLE_REMINDERS=false
+ENABLE_REMINDERS=true
+REMINDERS_DELIVERY_MODE=mock
+CORE_UTILITIES_SANDBOX=true
 ```
 
-When disabled, reminder requests pass to the orchestrator. When enabled, the core can create/list mock reminders in Durable Object state or local tests.
+Supported modes:
 
-## No Real Scheduler Yet
-
-Production reminder delivery is not active. For production, choose one:
-
-- Durable Object alarms;
-- Cron Triggers;
-- Queue-based scheduler;
-- external scheduler.
+- `mock`: local/safe default. Stores reminders, no automatic delivery.
+- `disabled`: reminder requests can be routed away from the core.
+- `alarm`: reserved for Durable Object Alarms.
+- `cron`: reserved for scheduled delivery.
 
 ## Logs
 

@@ -27,7 +27,10 @@ if (!files.length) {
   process.exit(0);
 }
 
-const latest = files[0];
+const requested = process.argv[3] || "";
+const latest = requested && files.includes(requested)
+  ? requested
+  : files.includes("dev-latest.log") ? "dev-latest.log" : files[0];
 const lines = readFileSync(join(logsDir, latest), "utf8")
   .split(/\r?\n/)
   .filter(Boolean)

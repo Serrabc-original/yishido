@@ -5,14 +5,19 @@ const MAX_KEYWORDS = 12;
 
 export function getCoreFeatureFlags(env) {
   return {
-    debugLogs: parseBooleanEnv(env && env.DEBUG_LOGS, false),
-    saveConversationLogs: parseBooleanEnv(env && env.SAVE_CONVERSATION_LOGS, false),
-    enableUserStyleProfile: parseBooleanEnv(env && env.ENABLE_USER_STYLE_PROFILE, false),
-    enableCustomerMemory: parseBooleanEnv(env && env.ENABLE_CUSTOMER_MEMORY, false),
-    enableReminders: parseBooleanEnv(env && env.ENABLE_REMINDERS, false),
-    enableLists: parseBooleanEnv(env && env.ENABLE_LISTS, false),
-    enableWhatsAppInteractive: parseBooleanEnv(env && env.ENABLE_WHATSAPP_INTERACTIVE, false),
-    enableTemplateModule: parseBooleanEnv(env && env.ENABLE_TEMPLATE_MODULE, false)
+    debugLogs: parseBooleanEnv(env && env.DEBUG_LOGS, true),
+    saveConversationLogs: parseBooleanEnv(env && env.SAVE_CONVERSATION_LOGS, true),
+    enableUserStyleProfile: parseBooleanEnv(env && env.ENABLE_USER_STYLE_PROFILE, true),
+    enableCustomerMemory: parseBooleanEnv(env && env.ENABLE_CUSTOMER_MEMORY, true),
+    enableReminders: parseBooleanEnv(env && env.ENABLE_REMINDERS, true),
+    enableLists: parseBooleanEnv(env && env.ENABLE_LISTS, true),
+    enableWhatsAppInteractive: parseBooleanEnv(env && env.ENABLE_WHATSAPP_INTERACTIVE, true),
+    enableTemplateModule: parseBooleanEnv(env && env.ENABLE_TEMPLATE_MODULE, true),
+    coreUtilitiesSandbox: parseBooleanEnv(env && env.CORE_UTILITIES_SANDBOX, true),
+    remindersDeliveryMode: normalizeMode(env && env.REMINDERS_DELIVERY_MODE, "mock"),
+    interactiveDeliveryMode: normalizeMode(env && env.INTERACTIVE_DELIVERY_MODE, "safe"),
+    memoryRetentionMode: normalizeMode(env && env.MEMORY_RETENTION_MODE, "summarized"),
+    logCaptureMode: normalizeMode(env && env.LOG_CAPTURE_MODE, "console_and_file")
   };
 }
 
@@ -177,6 +182,11 @@ function parseBooleanEnv(value, fallback) {
   if (["true", "1", "yes", "on"].includes(clean)) return true;
   if (["false", "0", "no", "off"].includes(clean)) return false;
   return fallback;
+}
+
+function normalizeMode(value, fallback) {
+  const clean = String(value || "").trim().toLowerCase();
+  return clean || fallback;
 }
 
 function extractKeywords(text) {

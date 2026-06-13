@@ -17,17 +17,23 @@ export function parseReminderRequest(text, userTimezone, options) {
   const timezone = userTimezone || "UTC";
   const raw = stripInputPrefixes(String(text || "").trim());
   const normalized = normalizeText(raw);
+  const action = inferReminderAction(normalized);
   const reminderOffsets = parseReminderOffsets(normalized);
   const recurrence = parseRecurrence(normalized);
   const due = parseDueDate(normalized, now, timezone);
-  const title = extractReminderTitle(raw);
+  const title = action === "cancel" ? extractCancelTitle(raw) : extractReminderTitle(raw);
   const missingFields = [];
 
-  if (!due.hasDate) missingFields.push("date");
-  if (!due.hasTime) missingFields.push("time");
-  if (!title) missingFields.push("title");
+  if (action === "create") {
+    if (!due.hasDate) missingFields.push("date");
+    if (!due.hasTime) missingFields.push("time");
+    if (!title) missingFields.push("title");
+  } else if (action === "cancel" && !title) {
+    missingFields.push("title");
+  }
 
   const parsed = {
+    action: action,
     title: title,
     dueAt: due.dueAt ? due.dueAt.toISOString() : "",
     timezone: timezone,
@@ -66,6 +72,12 @@ export function createMemoryReminderStore(initial) {
       return reminders.slice();
     }
   };
+}
+
+function inferReminderAction(normalized) {
+  if (/\b(cancelar|cancela|elimina|quita)\b.*\brecordatorio\b/.test(normalized)) return "cancel";
+  if (/\b(muestrame|mostrar|lista|ver)\b.*\brecordatorios?\b/.test(normalized)) return "list";
+  return "create";
 }
 
 export function createReminder(reminders, reminder) {
@@ -250,10 +262,18 @@ function parseRecurrence(normalized) {
 
 function extractReminderTitle(text) {
   return String(text || "")
+    .replace(/^\s*(hazme acuerdo|av[ií]same|avisame)\s*/i, "")
     .replace(/^\s*(recu[eé]rdame|recordarme|anota un recordatorio para|anota recordatorio para|recuerdame)\s*/i, "")
     .replace(/\b(ma[nñ]ana|el viernes|el lunes|el martes|el miercoles|el miércoles|el jueves|el sabado|el sábado|el domingo)\b/gi, "")
     .replace(/\b(a las|a la)\s+\d{1,2}(:\d{2})?\s*(am|pm)?\b/gi, "")
     .replace(/\b\d+\s*(d[ií]a|dias|días|hora|horas|minuto|minutos)\s+antes\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractCancelTitle(text) {
+  return String(text || "")
+    .replace(/^\s*(cancelar|cancela|elimina|quita)\s+(el\s+)?recordatorio\s+(de\s+|para\s+)?/i, "")
     .replace(/\s+/g, " ")
     .trim();
 }

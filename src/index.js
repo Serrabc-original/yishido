@@ -28,8 +28,9 @@
 import { captureError, createTraceId, logEvent } from "./logger.js";
 import { getCoreFeatureFlags, updateConversationMemory } from "./conversationMemory.js";
 import { routeCoreUtilityIntent } from "./coreUtilityRouter.js";
-import { createReminder } from "./modules/reminders/index.js";
+import { createReminder, listReminders } from "./modules/reminders/index.js";
 import { addListItems, createList, listItems, markListItemDone, normalizeListState, removeListItems } from "./modules/lists/index.js";
+import { sendWhatsAppInteractiveMessage } from "./whatsapp/sendInteractiveMessage.js";
 
 let activeLogContext = {};
 
@@ -546,6 +547,25 @@ export class ConversationCoordinator {
       });
     }
 
+    if (normalizeTextForIntent(normalized.text) === "/debug-interactive") {
+      const result = await this.sendInteractiveOrText(data, {
+        traceId: incomingTraceId || data.currentTraceId || "",
+        text: "Prueba interactiva segura. Elige una opcion:",
+        fallbackText: "Prueba interactiva segura. Responde: Confirmar, Cambiar hora o Cancelar.",
+        buttons: [
+          { id: "debug_confirm", title: "Confirmar" },
+          { id: "debug_change_time", title: "Cambiar hora" },
+          { id: "debug_cancel", title: "Cancelar" }
+        ],
+        forceInteractive: true
+      });
+
+      return jsonResponse({
+        status: "debug_interactive_sent",
+        mode: result.mode || ""
+      });
+    }
+
     if (normalizeTextForIntent(normalized.text) === "/help") {
       await sendWoztellTextMessage(this.env, {
         channelId: data.channel,
@@ -557,6 +577,58 @@ export class ConversationCoordinator {
       });
 
       return jsonResponse({ status: "help_sent" });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/lists") {
+      data.coreUtilityState = normalizeCoreUtilityState(data.coreUtilityState);
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: formatListsIndexForWhatsApp(data.coreUtilityState)
+      });
+
+      return jsonResponse({ status: "lists_sent" });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/reminders") {
+      data.coreUtilityState = normalizeCoreUtilityState(data.coreUtilityState);
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: formatRemindersForWhatsApp(data.coreUtilityState.reminders, this.env)
+      });
+
+      return jsonResponse({ status: "reminders_sent" });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/clear-reminders") {
+      data.coreUtilityState = normalizeCoreUtilityState(data.coreUtilityState);
+      data.coreUtilityState.reminders = [];
+      data.activeContext = updateConversationContext(data.activeContext, {
+        userTurn: { current_turn_text: "/clear-reminders", context_policy: "current_turn_only" },
+        route: { intent: "reminder" },
+        campaignState: data.campaignState,
+        pendingClarification: ""
+      });
+      data.updatedAt = new Date().toISOString();
+      await this.saveData(data);
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: "Listo, limpié los recordatorios guardados para esta conversación."
+      });
+
+      return jsonResponse({ status: "reminders_cleared" });
     }
 
     if (normalizeTextForIntent(normalized.text) === "/context") {
@@ -1073,7 +1145,10 @@ export class ConversationCoordinator {
         traceId: userTurn.trace_id,
         turnId: userTurn.turn_id,
         doName: data.doName,
-        policy: userTurn.context_policy
+        policy: userTurn.context_policy,
+        currentTurnMedia: userTurn.currentTurnMedia && userTurn.currentTurnMedia.asset_count || 0,
+        previousRelevantMedia: userTurn.previousRelevantMedia && userTurn.previousRelevantMedia.asset_count || 0,
+        staleMedia: userTurn.staleMedia && userTurn.staleMedia.asset_count || 0
       });
       if (userTurn.context_policy !== "use_previous_context") {
         console.log("TURN_CONTEXT_RESET_REASON:", JSON.stringify({
@@ -1139,14 +1214,42 @@ export class ConversationCoordinator {
           transcribedCount: userTurn.audio_batch.transcribedCount,
           failedCount: userTurn.audio_batch.failedCount
         }));
+      } else if (shouldAskHowToUseImageOnlyTurn(userTurn, messages)) {
+        const text = USER_MESSAGES.uploadedImageClarification;
+
+        await this.sendInteractiveOrText(data, {
+          traceId: userTurn.trace_id,
+          text: text,
+          fallbackText: text + "\nOpciones: Analizar imagen, Extraer texto, Usar para contenido.",
+          buttons: [
+            { id: "image_analyze", title: "Analizar imagen" },
+            { id: "image_ocr", title: "Extraer texto" },
+            { id: "image_marketing", title: "Usar contenido" }
+          ]
+        });
+
+        data.activeContext = updateConversationContext(data.activeContext, {
+          userTurn: userTurn,
+          route: { intent: "image_question", targetModule: "vision", shouldHandleInCore: true },
+          campaignState: data.campaignState,
+          pendingClarification: text
+        });
       } else if (shouldAskHowToUseCollectedAssets(data, messages)) {
         const assetCount = data.campaignState.campaign_assets.length;
         const text = USER_MESSAGES.assetsCollected.replace("{count}", String(assetCount));
 
-        await sendWoztellTextMessage(this.env, {
-          channelId: data.channel,
-          recipientId: data.phone,
-          text: text
+        await this.sendInteractiveOrText(data, {
+          traceId: userTurn.trace_id,
+          text: text,
+          fallbackText: text + "\nOpciones: Analizar imagenes, Extraer texto, Crear lista, Usar para marketing.",
+          listRows: [
+            { id: "batch_analyze", title: "Analizar imagenes" },
+            { id: "batch_ocr", title: "Extraer texto" },
+            { id: "batch_list", title: "Crear lista" },
+            { id: "batch_marketing", title: "Usar marketing" }
+          ],
+          buttonText: "Ver opciones",
+          listTitle: "Imagenes"
         });
 
         data.campaignState.workflow_status = "waiting_asset_usage_decision";
@@ -1300,6 +1403,56 @@ export class ConversationCoordinator {
     }
   }
 
+  async sendInteractiveOrText(data, params) {
+    const clean = params || {};
+    const env = this.env || {};
+    const mode = String(env.INTERACTIVE_DELIVERY_MODE || "safe").toLowerCase();
+    const fallbackText = clean.fallbackText || clean.text || "";
+
+    if (mode === "disabled" || mode === "text") {
+      await sendWoztellTextMessage(env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        text: fallbackText || USER_MESSAGES.requestFailed
+      });
+      return { mode: "text_only" };
+    }
+
+    try {
+      return await sendWhatsAppInteractiveMessage(env, {
+        traceId: clean.traceId || data.currentTraceId || "",
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        text: clean.text || fallbackText,
+        fallbackText: fallbackText,
+        buttons: clean.buttons || [],
+        listRows: clean.listRows || [],
+        listTitle: clean.listTitle || "",
+        buttonText: clean.buttonText || ""
+      }, {
+        forceInteractive: Boolean(clean.forceInteractive)
+      });
+    } catch (error) {
+      captureError(error, {
+        stage: "sendInteractiveOrText",
+        traceId: clean.traceId || data.currentTraceId || "",
+        doName: data.doName || ""
+      });
+      await sendWoztellTextMessage(env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        text: fallbackText || USER_MESSAGES.requestFailed
+      });
+      return { mode: "text_fallback_after_error" };
+    }
+  }
+
   async handleVisionUtility(data, utilityRoute, userTurn, messages) {
     const route = utilityRoute || {};
     const mediaBatch = userTurn && userTurn.media_batch || { assets: [] };
@@ -1381,6 +1534,28 @@ export class ConversationCoordinator {
     if (route.intent === "reminder") {
       const parsed = resolveReminderReferences(route.parsed || {}, data.activeContext);
 
+      if (parsed.action === "list") {
+        await sendWoztellTextMessage(this.env, {
+          channelId: data.channel,
+          recipientId: data.phone,
+          text: formatRemindersForWhatsApp(data.coreUtilityState.reminders, this.env)
+        });
+        return data;
+      }
+
+      if (parsed.action === "cancel") {
+        const result = cancelReminderByText(data.coreUtilityState.reminders, parsed.title);
+        data.coreUtilityState.reminders = result.reminders;
+        await sendWoztellTextMessage(this.env, {
+          channelId: data.channel,
+          recipientId: data.phone,
+          text: result.cancelled
+            ? "Listo, cancelé el recordatorio: " + result.cancelled.title
+            : "No encontré un recordatorio pendiente que coincida con: " + (parsed.title || "esa solicitud")
+        });
+        return data;
+      }
+
       if (parsed.missingFields && parsed.missingFields.length) {
         const question = parsed.missingFields.includes("date")
           ? "¿Para qué fecha quieres que te lo recuerde?"
@@ -1419,10 +1594,15 @@ export class ConversationCoordinator {
         pendingClarification: ""
       });
 
-      await sendWoztellTextMessage(this.env, {
-        channelId: data.channel,
-        recipientId: data.phone,
-        text: "Listo, dejé preparado el recordatorio: " + reminder.title + (reminder.dueAt ? "\nFecha: " + reminder.dueAt : "") + "\nNota: todavía no se envía automáticamente en producción."
+      await this.sendInteractiveOrText(data, {
+        traceId: userTurn && userTurn.trace_id || "",
+        text: formatReminderCreatedForWhatsApp(reminder, this.env),
+        fallbackText: formatReminderCreatedForWhatsApp(reminder, this.env) + "\nOpciones: Confirmar, Cambiar hora, Cancelar.",
+        buttons: [
+          { id: "reminder_confirm", title: "Confirmar" },
+          { id: "reminder_change_time", title: "Cambiar hora" },
+          { id: "reminder_cancel", title: "Cancelar" }
+        ]
       });
 
       return data;
@@ -1430,7 +1610,7 @@ export class ConversationCoordinator {
 
     if (route.intent === "list") {
       const parsed = route.parsed || {};
-      const listName = parsed.listName || "pendientes";
+      const listName = resolveActiveListName(parsed, data.coreUtilityState);
       let listState = normalizeListState(data.coreUtilityState.listsState);
       let list;
 
@@ -1452,6 +1632,7 @@ export class ConversationCoordinator {
 
       data.coreUtilityState.listsState = listState;
       data.coreUtilityState.lists = listState.lists;
+      data.coreUtilityState.activeList = listName;
       data.activeContext = updateConversationContext(data.activeContext, {
         userTurn: userTurn,
         route: route,
@@ -1460,10 +1641,15 @@ export class ConversationCoordinator {
         pendingClarification: ""
       });
 
-      await sendWoztellTextMessage(this.env, {
-        channelId: data.channel,
-        recipientId: data.phone,
-        text: formatListForWhatsApp(list)
+      await this.sendInteractiveOrText(data, {
+        traceId: userTurn && userTurn.trace_id || "",
+        text: formatListForWhatsApp(list),
+        fallbackText: formatListForWhatsApp(list) + "\nOpciones: Ver lista, Agregar más, Marcar comprado.",
+        buttons: [
+          { id: "list_view", title: "Ver lista" },
+          { id: "list_add_more", title: "Agregar mas" },
+          { id: "list_mark_done", title: "Marcar comprado" }
+        ]
       });
 
       return data;
@@ -5178,7 +5364,8 @@ function normalizeCoreUtilityState(state) {
   return {
     reminders: Array.isArray(clean.reminders) ? clean.reminders.slice(-100) : [],
     listsState: listsState,
-    lists: listsState.lists
+    lists: listsState.lists,
+    activeList: String(clean.activeList || clean.active_list || "")
   };
 }
 
@@ -5307,6 +5494,8 @@ function buildContextSnapshot(data) {
     contextId: context.contextId,
     lastUserGoal: context.lastUserGoal,
     pendingClarification: context.pendingClarification,
+    activeList: data && data.coreUtilityState && data.coreUtilityState.activeList || "",
+    pendingReminders: countPendingReminders(data && data.coreUtilityState && data.coreUtilityState.reminders || []),
     currentTurnMedia: context.currentTurnMedia.asset_count,
     previousRelevantMedia: context.previousRelevantMedia.asset_count,
     staleMedia: context.staleMedia.asset_count
@@ -5322,6 +5511,8 @@ function formatContextForWhatsApp(data) {
     "contextId: " + snapshot.contextId,
     "lastUserGoal: " + (snapshot.lastUserGoal || "(vacio)"),
     "pendingClarification: " + (snapshot.pendingClarification || "(ninguna)"),
+    "activeList: " + (snapshot.activeList || "(ninguna)"),
+    "pending reminders count: " + snapshot.pendingReminders,
     "currentTurnMedia count: " + snapshot.currentTurnMedia,
     "previousRelevantMedia count: " + snapshot.previousRelevantMedia,
     "staleMedia count: " + snapshot.staleMedia
@@ -5382,6 +5573,14 @@ function resolveReminderReferences(parsed, activeContext) {
     clean.context = [clean.context || "", "Referencia resuelta: " + context.lastUserGoal].filter(Boolean).join("\n");
   }
 
+  if (!clean.title && context.lastUserGoal && Array.isArray(clean.missingFields) && clean.missingFields.includes("title")) {
+    clean.title = context.lastUserGoal;
+    clean.context = [clean.context || "", "Referencia resuelta: " + context.lastUserGoal].filter(Boolean).join("\n");
+    clean.missingFields = clean.missingFields.filter(function (field) {
+      return field !== "title";
+    });
+  }
+
   return clean;
 }
 
@@ -5436,6 +5635,110 @@ function formatListForWhatsApp(list) {
   return ["Lista: " + clean.name].concat(items.map(function (item, index) {
     return (index + 1) + ". " + (item.done ? "[hecho] " : "") + item.text;
   })).join("\n");
+}
+
+function formatListsIndexForWhatsApp(coreUtilityState) {
+  const state = normalizeCoreUtilityState(coreUtilityState || {});
+  const lists = Object.values(state.lists || {});
+
+  if (!lists.length) {
+    return "Todavía no tienes listas guardadas. Puedes decir: Hazme una lista de compras con arroz y pollo.";
+  }
+
+  return ["Listas guardadas"].concat(lists.map(function (list, index) {
+    const count = Array.isArray(list.items) ? list.items.length : 0;
+    const active = state.activeList && normalizeSimpleName(state.activeList) === normalizeSimpleName(list.name) ? " (activa)" : "";
+    return (index + 1) + ". " + list.name + active + " - " + count + " item(s)";
+  })).join("\n");
+}
+
+function formatRemindersForWhatsApp(reminders, env) {
+  const mode = getReminderDeliveryMode(env);
+  const items = listReminders(reminders || []).filter(function (item) {
+    return !["cancelled", "done"].includes(item.status);
+  });
+
+  if (!items.length) {
+    return "No tienes recordatorios pendientes.";
+  }
+
+  return ["Recordatorios pendientes", "modo: " + mode].concat(items.map(function (item, index) {
+    return (index + 1) + ". " + item.title + (item.dueAt ? " - " + item.dueAt : "") + " [" + (item.status || "scheduled_mock") + "]";
+  })).join("\n");
+}
+
+function countPendingReminders(reminders) {
+  return (Array.isArray(reminders) ? reminders : []).filter(function (item) {
+    return !["cancelled", "done"].includes(item.status);
+  }).length;
+}
+
+function resolveActiveListName(parsed, coreUtilityState) {
+  const route = parsed || {};
+  const state = normalizeCoreUtilityState(coreUtilityState || {});
+  const requested = String(route.listName || "").trim();
+
+  if (requested && requested !== "pendientes") return requested;
+  if (state.activeList) return state.activeList;
+  if (requested) return requested;
+  return "pendientes";
+}
+
+function cancelReminderByText(reminders, text) {
+  const list = Array.isArray(reminders) ? reminders : [];
+  const target = normalizeSimpleName(text);
+  let cancelled = null;
+
+  const next = list.map(function (item) {
+    if (cancelled || ["cancelled", "done"].includes(item.status)) return item;
+    const title = normalizeSimpleName(item.title || "");
+    if (!target || !title.includes(target) && !target.includes(title)) return item;
+    cancelled = Object.assign({}, item, {
+      status: "cancelled",
+      updatedAt: new Date().toISOString()
+    });
+    return cancelled;
+  });
+
+  if (cancelled) {
+    logEvent("REMINDER_CANCEL_OK", {
+      reminderId: cancelled.id,
+      title: cancelled.title
+    });
+  }
+
+  return {
+    reminders: next,
+    cancelled: cancelled
+  };
+}
+
+function formatReminderCreatedForWhatsApp(reminder, env) {
+  const mode = getReminderDeliveryMode(env);
+  const deliveryNote = mode === "alarm"
+    ? "Modo entrega: alarmas del Durable Object."
+    : mode === "cron"
+      ? "Modo entrega: scheduler/cron."
+      : mode === "disabled"
+        ? "Modo entrega: desactivado, solo queda guardado."
+        : "Modo prueba: quedó guardado, no se enviará automáticamente hasta activar scheduler real.";
+
+  return [
+    "Listo, guardé el recordatorio.",
+    "Asunto: " + (reminder.title || ""),
+    reminder.dueAt ? "Fecha: " + reminder.dueAt : "",
+    reminder.reminderOffsets && reminder.reminderOffsets.length ? "Avisos: " + reminder.reminderOffsets.join(", ") : "",
+    deliveryNote
+  ].filter(Boolean).join("\n");
+}
+
+function getReminderDeliveryMode(env) {
+  const mode = String(env && env.REMINDERS_DELIVERY_MODE || "mock").toLowerCase();
+  return ["mock", "alarm", "cron", "disabled"].includes(mode) ? mode : "mock";
+}
+
+function normalizeSimpleName(value) {
+  return String(value || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
 }
 
 function normalizeClientProfile(profile) {
@@ -5679,6 +5982,20 @@ function shouldAskHowToUseCollectedAssets(data, messages) {
   });
 
   return onlyMedia && !hasClearInstruction;
+}
+
+function shouldAskHowToUseImageOnlyTurn(userTurn, messages) {
+  const turn = userTurn || {};
+
+  if (Number(turn.image_count || 0) !== 1) return false;
+  if (Number(turn.text_count || 0) > 0) return false;
+
+  const cleanMessages = Array.isArray(messages) ? messages : [];
+  if (!cleanMessages.length) return true;
+
+  return cleanMessages.every(function (message) {
+    return Boolean(message.fileId) && String(message.type || "").toUpperCase() === "IMAGE" && !String(message.text || "").trim();
+  });
 }
 
 function hasClearBulkAssetInstruction(text) {
@@ -7187,16 +7504,32 @@ function jsonResponse(data, status) {
 
 function buildVersionDiagnostic(env) {
   const now = new Date().toISOString();
+  const flags = getCoreFeatureFlags(env || {});
+  const remindersMode = String(flags.remindersDeliveryMode || "mock");
+  const interactiveMode = String(flags.interactiveDeliveryMode || "safe");
 
   return {
     version: "whatsapp-ai-agent-core-v3",
     build_label: String(env && env.BUILD_LABEL || "local-dev"),
     ORCHESTRATOR_PROVIDER: String(env && env.ORCHESTRATOR_PROVIDER || "openai"),
     ORCHESTRATOR_MODEL: String(env && env.ORCHESTRATOR_MODEL || "gpt-5.4-mini"),
-    ENABLE_LISTS: String(env && env.ENABLE_LISTS || "false"),
-    ENABLE_REMINDERS: String(env && env.ENABLE_REMINDERS || "false"),
-    ENABLE_WHATSAPP_INTERACTIVE: String(env && env.ENABLE_WHATSAPP_INTERACTIVE || "false"),
-    DEBUG_LOGS: String(env && env.DEBUG_LOGS || "false"),
+    DEBUG_LOGS: String(flags.debugLogs),
+    ENABLE_LISTS: String(flags.enableLists),
+    ENABLE_REMINDERS: String(flags.enableReminders),
+    ENABLE_WHATSAPP_INTERACTIVE: String(flags.enableWhatsAppInteractive),
+    ENABLE_TEMPLATE_MODULE: String(flags.enableTemplateModule),
+    SAVE_CONVERSATION_LOGS: String(flags.saveConversationLogs),
+    ENABLE_USER_STYLE_PROFILE: String(flags.enableUserStyleProfile),
+    ENABLE_CUSTOMER_MEMORY: String(flags.enableCustomerMemory),
+    CORE_UTILITIES_SANDBOX: String(flags.coreUtilitiesSandbox),
+    REMINDERS_DELIVERY_MODE: remindersMode,
+    INTERACTIVE_DELIVERY_MODE: interactiveMode,
+    MEMORY_RETENTION_MODE: String(flags.memoryRetentionMode || "summarized"),
+    LOG_CAPTURE_MODE: String(flags.logCaptureMode || "console_and_file"),
+    REMINDERS_STATUS: remindersMode === "alarm" ? "production_alarm_requires_worker_alarm" : remindersMode === "cron" ? "production_cron_requires_scheduler" : remindersMode === "disabled" ? "disabled" : "mock_safe_no_real_delivery",
+    INTERACTIVE_STATUS: interactiveMode === "safe" ? "safe_with_text_fallback" : interactiveMode,
+    MEMORY_STATUS: flags.memoryRetentionMode === "summarized" ? "summarized_no_raw_history" : String(flags.memoryRetentionMode || ""),
+    LOGS_STATUS: flags.logCaptureMode === "console_and_file" ? "console_plus_local_wrapper" : String(flags.logCaptureMode || ""),
     timestamp: now
   };
 }
@@ -7210,10 +7543,23 @@ function formatVersionDiagnosticForWhatsApp(diagnostic) {
     "build_label: " + (data.build_label || ""),
     "ORCHESTRATOR_PROVIDER: " + (data.ORCHESTRATOR_PROVIDER || ""),
     "ORCHESTRATOR_MODEL: " + (data.ORCHESTRATOR_MODEL || ""),
+    "DEBUG_LOGS: " + (data.DEBUG_LOGS || ""),
     "ENABLE_LISTS: " + (data.ENABLE_LISTS || ""),
     "ENABLE_REMINDERS: " + (data.ENABLE_REMINDERS || ""),
     "ENABLE_WHATSAPP_INTERACTIVE: " + (data.ENABLE_WHATSAPP_INTERACTIVE || ""),
-    "DEBUG_LOGS: " + (data.DEBUG_LOGS || ""),
+    "ENABLE_TEMPLATE_MODULE: " + (data.ENABLE_TEMPLATE_MODULE || ""),
+    "SAVE_CONVERSATION_LOGS: " + (data.SAVE_CONVERSATION_LOGS || ""),
+    "ENABLE_USER_STYLE_PROFILE: " + (data.ENABLE_USER_STYLE_PROFILE || ""),
+    "ENABLE_CUSTOMER_MEMORY: " + (data.ENABLE_CUSTOMER_MEMORY || ""),
+    "CORE_UTILITIES_SANDBOX: " + (data.CORE_UTILITIES_SANDBOX || ""),
+    "REMINDERS_DELIVERY_MODE: " + (data.REMINDERS_DELIVERY_MODE || ""),
+    "REMINDERS_STATUS: " + (data.REMINDERS_STATUS || ""),
+    "INTERACTIVE_DELIVERY_MODE: " + (data.INTERACTIVE_DELIVERY_MODE || ""),
+    "INTERACTIVE_STATUS: " + (data.INTERACTIVE_STATUS || ""),
+    "MEMORY_RETENTION_MODE: " + (data.MEMORY_RETENTION_MODE || ""),
+    "MEMORY_STATUS: " + (data.MEMORY_STATUS || ""),
+    "LOG_CAPTURE_MODE: " + (data.LOG_CAPTURE_MODE || ""),
+    "LOGS_STATUS: " + (data.LOGS_STATUS || ""),
     "timestamp: " + (data.timestamp || "")
   ].join("\n");
 }
@@ -7277,6 +7623,8 @@ export {
   clearMediaState,
   createEmptyConversationContext,
   formatContextForWhatsApp,
+  formatListsIndexForWhatsApp,
+  formatRemindersForWhatsApp,
   updateConversationContext,
   compactConversationHistory,
   mapOrchestratorActions,

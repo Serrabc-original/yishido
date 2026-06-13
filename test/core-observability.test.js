@@ -28,15 +28,22 @@ test("logger redacts secrets and phone-like fields", () => {
   assert.equal(record.details.nested.GOOGLE_SHEETS_SECRET, "[REDACTED]");
 });
 
-test("core feature flags are safe by default", () => {
+test("core feature flags are active in local safe modes by default", () => {
   const flags = getCoreFeatureFlags({});
 
-  assert.equal(flags.debugLogs, false);
-  assert.equal(flags.saveConversationLogs, false);
-  assert.equal(flags.enableUserStyleProfile, false);
-  assert.equal(flags.enableCustomerMemory, false);
-  assert.equal(flags.enableReminders, false);
-  assert.equal(flags.enableTemplateModule, false);
+  assert.equal(flags.debugLogs, true);
+  assert.equal(flags.saveConversationLogs, true);
+  assert.equal(flags.enableUserStyleProfile, true);
+  assert.equal(flags.enableCustomerMemory, true);
+  assert.equal(flags.enableReminders, true);
+  assert.equal(flags.enableLists, true);
+  assert.equal(flags.enableWhatsAppInteractive, true);
+  assert.equal(flags.enableTemplateModule, true);
+  assert.equal(flags.coreUtilitiesSandbox, true);
+  assert.equal(flags.remindersDeliveryMode, "mock");
+  assert.equal(flags.interactiveDeliveryMode, "safe");
+  assert.equal(flags.memoryRetentionMode, "summarized");
+  assert.equal(flags.logCaptureMode, "console_and_file");
 });
 
 test("conversation memory stores compact sanitized turn data only when enabled", () => {
@@ -57,7 +64,11 @@ test("conversation memory stores compact sanitized turn data only when enabled",
   };
 
   const disabled = updateConversationMemory({}, userTurn, {
-    flags: getCoreFeatureFlags({})
+    flags: getCoreFeatureFlags({
+      SAVE_CONVERSATION_LOGS: "false",
+      ENABLE_USER_STYLE_PROFILE: "false",
+      ENABLE_CUSTOMER_MEMORY: "false"
+    })
   });
   assert.equal(disabled.conversationLog.length, 0);
   assert.equal(disabled.conversationSummary.turn_count, 1);
@@ -111,9 +122,14 @@ test("version diagnostic exposes safe runtime configuration", () => {
     ORCHESTRATOR_PROVIDER: "openai",
     ORCHESTRATOR_MODEL: "gpt-5.4-mini",
     ENABLE_LISTS: "true",
-    ENABLE_REMINDERS: "false",
-    ENABLE_WHATSAPP_INTERACTIVE: "false",
-    DEBUG_LOGS: "true"
+    ENABLE_REMINDERS: "true",
+    ENABLE_WHATSAPP_INTERACTIVE: "true",
+    DEBUG_LOGS: "true",
+    CORE_UTILITIES_SANDBOX: "true",
+    REMINDERS_DELIVERY_MODE: "mock",
+    INTERACTIVE_DELIVERY_MODE: "safe",
+    MEMORY_RETENTION_MODE: "summarized",
+    LOG_CAPTURE_MODE: "console_and_file"
   });
   const text = formatVersionDiagnosticForWhatsApp(diagnostic);
 
@@ -122,9 +138,17 @@ test("version diagnostic exposes safe runtime configuration", () => {
   assert.equal(diagnostic.ORCHESTRATOR_PROVIDER, "openai");
   assert.equal(diagnostic.ORCHESTRATOR_MODEL, "gpt-5.4-mini");
   assert.equal(diagnostic.ENABLE_LISTS, "true");
+  assert.equal(diagnostic.ENABLE_REMINDERS, "true");
+  assert.equal(diagnostic.ENABLE_WHATSAPP_INTERACTIVE, "true");
+  assert.equal(diagnostic.REMINDERS_DELIVERY_MODE, "mock");
+  assert.equal(diagnostic.REMINDERS_STATUS, "mock_safe_no_real_delivery");
+  assert.equal(diagnostic.INTERACTIVE_DELIVERY_MODE, "safe");
+  assert.equal(diagnostic.MEMORY_RETENTION_MODE, "summarized");
+  assert.equal(diagnostic.LOG_CAPTURE_MODE, "console_and_file");
   assert.match(diagnostic.timestamp, /^\d{4}-\d{2}-\d{2}T/);
   assert.match(text, /version: whatsapp-ai-agent-core-v3/);
   assert.match(text, /ORCHESTRATOR_PROVIDER: openai/);
+  assert.match(text, /REMINDERS_STATUS: mock_safe_no_real_delivery/);
 });
 
 test("GET /version returns version diagnostic JSON", async () => {
@@ -537,6 +561,76 @@ test("/debug-openai uses valid reasoning effort and never falls back to Claude",
     assert.equal(openAiBodies[0].reasoning.effort, "low");
     assert.equal(urls.some((url) => url.includes("anthropic") || url.includes("claude")), false);
     assert.equal(sentTexts.some((text) => text.includes("OpenAI debug") && text.includes("status: fail")), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("control commands expose interactive, lists and reminders safely", async () => {
+  const sentBodies = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    sentBodies.push({
+      url: String(url),
+      body: JSON.parse(options.body)
+    });
+    return new Response(JSON.stringify({ ok: 1 }), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json"
+      }
+    });
+  };
+
+  const state = createMemoryState();
+  await state.storage.put("data", {
+    coreUtilityState: {
+      reminders: [{
+        id: "rem_1",
+        title: "comprar leche",
+        dueAt: "2026-06-13T14:00:00.000Z",
+        status: "scheduled_mock"
+      }],
+      listsState: {
+        lists: {
+          super: {
+            name: "super",
+            items: [{ id: "item_1", text: "pan", done: false }]
+          }
+        }
+      },
+      lists: {
+        super: {
+          name: "super",
+          items: [{ id: "item_1", text: "pan", done: false }]
+        }
+      },
+      activeList: "super"
+    }
+  });
+
+  const coordinator = new ConversationCoordinator(state, {
+    WOZTELL_ACCESS_TOKEN: "test-token",
+    ENABLE_WHATSAPP_INTERACTIVE: "true",
+    INTERACTIVE_DELIVERY_MODE: "safe",
+    REMINDERS_DELIVERY_MODE: "mock"
+  });
+
+  try {
+    const debug = await coordinator.receiveMessage(buildTextWebhookBody("/debug-interactive"));
+    const lists = await coordinator.receiveMessage(buildTextWebhookBody("/lists"));
+    const reminders = await coordinator.receiveMessage(buildTextWebhookBody("/reminders"));
+    const clearReminders = await coordinator.receiveMessage(buildTextWebhookBody("/clear-reminders"));
+    const saved = await state.storage.get("data");
+
+    assert.equal((await debug.json()).status, "debug_interactive_sent");
+    assert.equal((await lists.json()).status, "lists_sent");
+    assert.equal((await reminders.json()).status, "reminders_sent");
+    assert.equal((await clearReminders.json()).status, "reminders_cleared");
+    assert.equal(saved.coreUtilityState.reminders.length, 0);
+    assert.equal(sentBodies.some((item) => item.body.response && item.body.response[0].type === "QUICK_REPLY"), true);
+    assert.equal(sentBodies.some((item) => JSON.stringify(item.body).includes("Listas guardadas")), true);
+    assert.equal(sentBodies.some((item) => JSON.stringify(item.body).includes("Recordatorios pendientes")), true);
   } finally {
     globalThis.fetch = originalFetch;
   }

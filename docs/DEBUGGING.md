@@ -17,7 +17,9 @@ La forma mas practica es levantar el Worker local con captura automatica:
 npm run dev:log
 ```
 
-Esto crea o actualiza `logs/agent-YYYY-MM-DD.log` mientras tambien muestra la salida en terminal.
+Esto crea o actualiza `logs/agent-YYYY-MM-DD.log` y `logs/dev-latest.log` mientras tambien muestra la salida en terminal. En Windows el wrapper usa `cmd.exe /c npx wrangler dev` para evitar `spawn EINVAL`.
+
+Si Wrangler pregunta por el tunnel, presiona `t` manualmente en esa misma terminal.
 
 Si prefieres usar `wrangler dev` directo, captura la salida del proceso en un archivo dentro de `logs/`.
 
@@ -51,6 +53,12 @@ El analisis busca:
 - fallbacks enviados al usuario;
 - audios con timeout;
 - imagenes fallidas;
+- fallos de OpenAI;
+- fallos de envio Woztell;
+- fallos o fallback de interactivos;
+- stale media;
+- cambios de contexto;
+- problemas de recordatorios;
 - turns sin respuesta;
 - turns con audio pendiente;
 - turns con media pendiente;

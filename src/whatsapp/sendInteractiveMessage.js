@@ -73,6 +73,8 @@ export async function sendWhatsAppInteractiveMessage(env, params, options) {
     traceId: clean.traceId,
     channelId: clean.channelId,
     recipientId: clean.recipientId,
+    memberId: clean.memberId,
+    appId: clean.appId,
     buttonCount: clean.buttons.length,
     listRowCount: clean.listRows.length,
     hasCta: Boolean(clean.cta && clean.cta.url)
@@ -96,6 +98,11 @@ export async function sendWhatsAppInteractiveMessage(env, params, options) {
       recipientId: clean.recipientId,
       response: response
     };
+    if (clean.memberId) {
+      payload.memberId = clean.memberId;
+      delete payload.recipientId;
+    }
+    if (clean.appId) payload.appId = clean.appId;
     const result = await sendWoztellPayload(env, payload, cleanOptions);
 
     logEvent("WHATSAPP_INTERACTIVE_SEND_OK", {
@@ -145,6 +152,8 @@ export function normalizeInteractiveParams(params) {
   return {
     channelId: String(clean.channelId || ""),
     recipientId: String(clean.recipientId || ""),
+    memberId: String(clean.memberId || ""),
+    appId: String(clean.appId || ""),
     traceId: String(clean.traceId || ""),
     text: String(clean.text || "").trim(),
     footer: String(clean.footer || "").trim(),
@@ -184,6 +193,11 @@ async function sendTextFallback(env, clean, fallbackText, options) {
       text: fallbackText || "Elige una opcion escribiendo tu respuesta."
     }]
   };
+  if (clean.memberId) {
+    payload.memberId = clean.memberId;
+    delete payload.recipientId;
+  }
+  if (clean.appId) payload.appId = clean.appId;
 
   const result = await sendWoztellPayload(env, payload, options || {});
   return {

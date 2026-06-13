@@ -11,7 +11,7 @@ Current architecture:
 - Audio goes through `AUDIO_QUEUE`.
 - Generated or edited images go through `IMAGE_QUEUE`.
 - OpenAI handles copy, image generation/editing, audio transcription, and image vision.
-- Claude remains the JSON orchestrator.
+- OpenAI is the default JSON orchestrator.
 - Google Sheets stores drafts, calendars, posts, and status updates.
 
 Important constraints:
@@ -46,7 +46,31 @@ node scripts/test-text-plus-images.js
 - `/help`: shows general assistant capabilities.
 - `/context`: shows `activeIntent`, `contextId`, `lastUserGoal`, pending clarification, current-turn media count, previous relevant media count, and stale media count.
 - `/clear-media`: clears previous images/files without deleting lists or reminders.
+- `/lists`: shows saved lists for the conversation.
+- `/reminders`: shows pending reminders.
+- `/clear-reminders`: clears mock/local reminders for the conversation.
+- `/debug-interactive`: sends a safe interactive-message test with text fallback.
 - `/reset`: clears conversation context, previous media, campaign state, and pending clarification.
+
+## Local Feature Modes
+
+Local development enables the assistant core by default:
+
+- `DEBUG_LOGS=true`
+- `ENABLE_LISTS=true`
+- `ENABLE_REMINDERS=true`
+- `ENABLE_WHATSAPP_INTERACTIVE=true`
+- `ENABLE_TEMPLATE_MODULE=true`
+- `SAVE_CONVERSATION_LOGS=true`
+- `ENABLE_USER_STYLE_PROFILE=true`
+- `ENABLE_CUSTOMER_MEMORY=true`
+- `CORE_UTILITIES_SANDBOX=true`
+- `REMINDERS_DELIVERY_MODE=mock`
+- `INTERACTIVE_DELIVERY_MODE=safe`
+- `MEMORY_RETENTION_MODE=summarized`
+- `LOG_CAPTURE_MODE=console_and_file`
+
+Run `/version` in WhatsApp to see which capabilities are active and which are mock/sandbox.
 
 ## Local Logs
 
@@ -59,3 +83,4 @@ npm run logs:analyze
 ```
 
 Logs are written under `logs/agent-YYYY-MM-DD.log` and ignored by Git.
+`dev:log` also writes `logs/dev-latest.log`, which `logs:latest` reads first.

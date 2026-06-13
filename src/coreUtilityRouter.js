@@ -75,11 +75,11 @@ function intentResult(intent, confidence, module) {
 }
 
 function isReminderIntent(text) {
-  return /\b(recuerdame|recordarme|recordatorio|avisame)\b/.test(text);
+  return /\b(recuerdame|recordarme|recordatorio|recordatorios|avisame|hazme acuerdo|acuerdame|cancel(a|ar).*(recordatorio)|muestrame.*recordatorio|mostrar.*recordatorio)\b/.test(text);
 }
 
 function isListIntent(text) {
-  return /\b(lista|listado|compras|super|supermercado|anota|agrega|quita|elimina|muestrame|mostrar|marca como hecho|pendientes)\b/.test(text);
+  return /\b(lista|listado|compras|super|supermercado|anota|agrega|quita|elimina|muestrame|mostrar|marca como hecho|marca .*comprado|comprado|pendientes)\b/.test(text);
 }
 
 function isImageOcrIntent(text, media) {
