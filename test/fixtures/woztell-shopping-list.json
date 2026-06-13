@@ -1,0 +1,9 @@
+{
+  "eventType": "INBOUND",
+  "type": "TEXT",
+  "messageId": "msg_shopping_list",
+  "channel": "channel_1",
+  "from": "user_1",
+  "to": "bot_1",
+  "text": "Hazme una lista de compras con arroz, pollo, leche y huevos."
+}

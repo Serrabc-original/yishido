@@ -9,7 +9,17 @@ El proyecto usa logs estructurados en JSON lines. Para pruebas locales, guarda l
 
 `logs/` y `*.log` estan ignorados por Git. No subas logs reales al repositorio.
 
-El Worker emite eventos estructurados con `event`, `traceId`, `turnId`, `doName` y `details`. Si estas usando `wrangler dev`, captura la salida del proceso en un archivo dentro de `logs/`.
+El Worker emite eventos estructurados con `event`, `traceId`, `turnId`, `doName` y `details`.
+
+La forma mas practica es levantar el Worker local con captura automatica:
+
+```powershell
+npm run dev:log
+```
+
+Esto crea o actualiza `logs/agent-YYYY-MM-DD.log` mientras tambien muestra la salida en terminal.
+
+Si prefieres usar `wrangler dev` directo, captura la salida del proceso en un archivo dentro de `logs/`.
 
 Ejemplo:
 

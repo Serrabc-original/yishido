@@ -1,0 +1,9 @@
+{
+  "eventType": "INBOUND",
+  "type": "TEXT",
+  "messageId": "msg_general_not_marketing",
+  "channel": "channel_1",
+  "from": "user_1",
+  "to": "bot_1",
+  "text": "No quiero posts, quiero que seas asistente general."
+}

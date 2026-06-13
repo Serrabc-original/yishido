@@ -1,0 +1,31 @@
+[
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_multi_ocr_1",
+    "channel": "channel_1",
+    "from": "user_1",
+    "to": "bot_1",
+    "fileId": "file_multi_ocr_1",
+    "mimeType": "image/jpeg"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_multi_ocr_2",
+    "channel": "channel_1",
+    "from": "user_1",
+    "to": "bot_1",
+    "fileId": "file_multi_ocr_2",
+    "mimeType": "image/jpeg"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "TEXT",
+    "messageId": "msg_multi_ocr_text",
+    "channel": "channel_1",
+    "from": "user_1",
+    "to": "bot_1",
+    "text": "Anota el texto de estas imagenes"
+  }
+]

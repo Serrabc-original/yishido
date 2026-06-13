@@ -2,6 +2,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:log": "node scripts/dev-log.js",
     "deploy": "wrangler deploy",
     "test": "node --test test/**/*.test.js",
     "test:inputs": "node scripts/test-all-input-cases.js",

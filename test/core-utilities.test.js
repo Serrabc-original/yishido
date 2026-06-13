@@ -55,10 +55,10 @@ test("interactive message falls back to text when disabled", async () => {
 
 test("reminder parser handles tomorrow, offsets, missing date and missing time", () => {
   const now = "2026-06-12T12:00:00.000Z";
-  const tomorrow = parseReminderRequest("Recuérdame mañana a las 9 llamar a Juan", "America/Bogota", { now });
-  const offsets = parseReminderRequest("Recuérdame 1 día antes y 1 hora antes de la reunión", "America/Bogota", { now });
-  const missingDate = parseReminderRequest("Recuérdame a las 9 llamar a Juan", "America/Bogota", { now });
-  const missingTime = parseReminderRequest("Recuérdame el viernes comprar medicina", "America/Bogota", { now });
+  const tomorrow = parseReminderRequest("Recuerdame manana a las 9 llamar a Juan", "America/Bogota", { now });
+  const offsets = parseReminderRequest("Recuerdame 1 dia antes y 1 hora antes de la reunion", "America/Bogota", { now });
+  const missingDate = parseReminderRequest("Recuerdame a las 9 llamar a Juan", "America/Bogota", { now });
+  const missingTime = parseReminderRequest("Recuerdame el viernes comprar medicina", "America/Bogota", { now });
 
   assert.equal(tomorrow.missingFields.length, 0);
   assert.match(tomorrow.dueAt, /^2026-06-13T14:00:00/);
@@ -92,11 +92,19 @@ test("lists create, add, remove, mark done and list items", () => {
 });
 
 test("list parser extracts action, list name and items", () => {
-  const parsed = parseListCommand("Anota leche, pan y huevos en mi lista del súper");
+  const parsed = parseListCommand("Anota leche, pan y huevos en mi lista del super");
 
   assert.equal(parsed.action, "add");
-  assert.equal(parsed.listName.toLowerCase().includes("súper") || parsed.listName.toLowerCase().includes("super"), true);
+  assert.equal(parsed.listName.toLowerCase().includes("super"), true);
   assert.deepEqual(parsed.items, ["leche", "pan", "huevos"]);
+});
+
+test("list parser handles natural shopping list requests", () => {
+  const parsed = parseListCommand("Hazme una lista de compras con arroz, pollo, leche y huevos.");
+
+  assert.equal(parsed.action, "add");
+  assert.equal(parsed.listName, "compras");
+  assert.deepEqual(parsed.items, ["arroz", "pollo", "leche", "huevos"]);
 });
 
 test("bug report exports trace bundle, redacts secrets and detects missing events", () => {
@@ -130,7 +138,7 @@ test("bug report exports trace bundle, redacts secrets and detects missing event
 });
 
 test("core utility router classifies reminder, list, marketing and general", () => {
-  const reminder = routeCoreUtilityIntent({ current_turn_text: "Recuérdame mañana a las 9 llamar a Juan" }, {
+  const reminder = routeCoreUtilityIntent({ current_turn_text: "Recuerdame manana a las 9 llamar a Juan" }, {
     flags: { enableReminders: true },
     now: "2026-06-12T12:00:00.000Z"
   });
@@ -138,11 +146,40 @@ test("core utility router classifies reminder, list, marketing and general", () 
     flags: { enableLists: true }
   });
   const marketing = routeCoreUtilityIntent({ current_turn_text: "Hazme un post para Instagram" });
-  const general = routeCoreUtilityIntent({ current_turn_text: "Qué significa este mensaje?" });
+  const general = routeCoreUtilityIntent({ current_turn_text: "Hola, que puedes hacer?" });
 
   assert.equal(reminder.intent, "reminder");
   assert.equal(reminder.shouldHandleInCore, true);
   assert.equal(list.intent, "list");
   assert.equal(marketing.intent, "marketing");
   assert.equal(general.intent, "general");
+});
+
+test("core utility router keeps marketing explicit and separates image/OCR intents", () => {
+  const shopping = routeCoreUtilityIntent({ current_turn_text: "Hazme una lista de compras con arroz y pollo" }, {
+    flags: { enableLists: true }
+  });
+  const noMarketing = routeCoreUtilityIntent({ current_turn_text: "No quiero posts, quiero que seas asistente general" });
+  const imageQuestion = routeCoreUtilityIntent({
+    current_turn_text: "Como funciona esta maquina?",
+    image_count: 1,
+    current_turn_media: { asset_count: 1, image_count: 1 }
+  });
+  const ocr = routeCoreUtilityIntent({
+    current_turn_text: "Saca el texto de esta imagen",
+    image_count: 1,
+    current_turn_media: { asset_count: 1, image_count: 1 }
+  });
+  const audioList = routeCoreUtilityIntent({ current_turn_text: "[Audio transcrito]: anota pan y queso en mi lista del super" }, {
+    flags: { enableLists: true }
+  });
+  const marketing = routeCoreUtilityIntent({ current_turn_text: "Hazme un post con esta foto para Instagram" });
+
+  assert.equal(shopping.intent, "list");
+  assert.equal(noMarketing.intent, "general");
+  assert.equal(imageQuestion.intent, "image_question");
+  assert.equal(ocr.intent, "image_ocr");
+  assert.equal(audioList.intent, "list");
+  assert.deepEqual(audioList.parsed.items, ["pan", "queso"]);
+  assert.equal(marketing.intent, "marketing");
 });

@@ -1,0 +1,20 @@
+[
+  {
+    "eventType": "INBOUND",
+    "type": "TEXT",
+    "messageId": "msg_list_before_reminder",
+    "channel": "channel_1",
+    "from": "user_1",
+    "to": "bot_1",
+    "text": "Anota pan y queso en mi lista del super"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "TEXT",
+    "messageId": "msg_reminder_after_list",
+    "channel": "channel_1",
+    "from": "user_1",
+    "to": "bot_1",
+    "text": "Recuerdame manana a las 9 comprar eso"
+  }
+]

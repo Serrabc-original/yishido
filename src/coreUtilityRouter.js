@@ -6,6 +6,7 @@ export function routeCoreUtilityIntent(userTurn, options) {
   const text = String(userTurn && (userTurn.current_turn_text || userTurn.text || "") || "");
   const normalized = normalizeText(text);
   const flags = cleanOptions.flags || {};
+  const media = getTurnMediaCounts(userTurn);
 
   if (isReminderIntent(normalized)) {
     const parsed = parseReminderRequest(text, cleanOptions.timezone || "UTC", {
@@ -33,6 +34,14 @@ export function routeCoreUtilityIntent(userTurn, options) {
       shouldPassToAgent: !flags.enableLists,
       parsed: parsed
     };
+  }
+
+  if (isImageOcrIntent(normalized, media)) {
+    return intentResult("image_ocr", 0.82, "vision");
+  }
+
+  if (isImageQuestionIntent(normalized, media)) {
+    return intentResult("image_question", 0.78, "vision");
   }
 
   if (isMarketingIntent(normalized)) {
@@ -66,15 +75,26 @@ function intentResult(intent, confidence, module) {
 }
 
 function isReminderIntent(text) {
-  return /\b(recuerdame|recordarme|recordatorio|recuérdame|avisame|avísame)\b/.test(text);
+  return /\b(recuerdame|recordarme|recordatorio|avisame)\b/.test(text);
 }
 
 function isListIntent(text) {
-  return /\b(lista|anota|agrega|quita|elimina|muestrame|muéstrame|marca como hecho|pendientes)\b/.test(text);
+  return /\b(lista|listado|compras|super|supermercado|anota|agrega|quita|elimina|muestrame|mostrar|marca como hecho|pendientes)\b/.test(text);
+}
+
+function isImageOcrIntent(text, media) {
+  return media.imageCount > 0 && (/\b(saca|extrae|extraer|lee|leer|transcribe|transcribir|anota)\b.*\b(texto|letras|contenido)\b/.test(text) || /\bocr\b/.test(text));
+}
+
+function isImageQuestionIntent(text, media) {
+  if (media.imageCount <= 0) return false;
+  if (isMarketingIntent(text)) return false;
+  return /\b(que ves|que aparece|como funciona|que es|explica|analiza|revisa|esta maquina|esta foto|esta imagen)\b/.test(text);
 }
 
 function isMarketingIntent(text) {
-  return /\b(post|copy|instagram|facebook|campana|campaña|contenido|calendario|publicacion|publicación|hashtag)\b/.test(text);
+  if (/\b(no quiero|sin)\s+(post|posts|marketing|campana|campanas|contenido)\b/.test(text)) return false;
+  return /\b(post|posts|copy|caption|instagram|facebook|tiktok|redes sociales|campana|campanas|anuncio|ads|publicidad|publicacion|publicaciones|hashtag|calendario editorial|calendario de contenido|contenido para redes)\b/.test(text);
 }
 
 function isSupportIntent(text) {
@@ -82,7 +102,7 @@ function isSupportIntent(text) {
 }
 
 function isOrdersIntent(text) {
-  return /\b(pedido|orden|comprar|compra|cotizacion|cotización|precio|envio|envío)\b/.test(text);
+  return /\b(pedido|orden|comprar|compra|cotizacion|precio|envio)\b/.test(text);
 }
 
 function isCrmIntent(text) {
@@ -96,4 +116,14 @@ function normalizeText(text) {
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function getTurnMediaCounts(userTurn) {
+  const turn = userTurn || {};
+  const current = turn.currentTurnMedia || turn.current_turn_media || {};
+  const imageCount = Number(turn.image_count || current.image_count || current.asset_count || 0);
+
+  return {
+    imageCount: Number.isFinite(imageCount) ? imageCount : 0
+  };
 }

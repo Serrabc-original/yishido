@@ -1,0 +1,9 @@
+{
+  "eventType": "INBOUND",
+  "type": "TEXT",
+  "messageId": "msg_hello_neutral",
+  "channel": "channel_1",
+  "from": "user_1",
+  "to": "bot_1",
+  "text": "Hola, que puedes hacer?"
+}

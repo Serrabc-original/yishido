@@ -7,15 +7,16 @@ export const LISTS_MODULE = {
 };
 
 export function parseListCommand(text) {
-  const raw = String(text || "").trim();
+  const raw = stripInputPrefixes(String(text || "").trim());
   const normalized = normalizeText(raw);
   let action = "unknown";
 
   if (normalized.startsWith("crea una lista") || normalized.startsWith("crear lista")) action = "create";
+  else if (/\b(hazme|hacer|prepara|preparame|creame)\b.*\blista\b/.test(normalized)) action = "add";
   else if (normalized.startsWith("agrega") || normalized.startsWith("anota")) action = "add";
   else if (normalized.startsWith("quita") || normalized.startsWith("elimina")) action = "remove";
   else if (normalized.startsWith("marca como hecho") || normalized.startsWith("marcar como hecho")) action = "mark_done";
-  else if (normalized.startsWith("muestrame") || normalized.startsWith("muéstrame") || normalized.startsWith("mostrar")) action = "list";
+  else if (normalized.startsWith("muestrame") || normalized.startsWith("mostrar")) action = "list";
 
   const listName = extractListName(raw, normalized, action);
   const items = extractItems(raw, normalized, action, listName);
@@ -107,8 +108,9 @@ export function addListItems(state, name, items) {
   const existing = new Set(next.lists[key].items.map(function (item) {
     return normalizeText(item.text);
   }));
+  const normalizedItems = normalizeItems(items);
 
-  for (const item of normalizeItems(items)) {
+  for (const item of normalizedItems) {
     if (existing.has(normalizeText(item))) continue;
     next.lists[key].items.push({
       id: "item_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
@@ -121,7 +123,7 @@ export function addListItems(state, name, items) {
 
   logEvent("LIST_ITEMS_ADDED", {
     listName: next.lists[key].name,
-    count: normalizeItems(items).length
+    count: normalizedItems.length
   });
   return next;
 }
@@ -183,7 +185,7 @@ function getList(state, name) {
 
 function extractListName(raw, normalized, action) {
   const lowerRaw = String(raw || "");
-  const match = lowerRaw.match(/\b(?:lista|listado)\s+(?:de\s+|del\s+|llamada\s+)?(.+)$/i);
+  const match = lowerRaw.match(/\b(?:lista|listado)\s+(?:de\s+|del\s+|llamada\s+)?([^.,;:]+?)(?:\s+con\b|$)/i);
 
   if (action === "create") {
     return lowerRaw.replace(/^\s*(crea una lista llamada|crea una lista|crear lista)\s*/i, "").trim();
@@ -194,6 +196,7 @@ function extractListName(raw, normalized, action) {
   }
 
   if (normalized.includes("super") || normalized.includes("supermercado")) return "super";
+  if (normalized.includes("compras")) return "compras";
   if (normalized.includes("inventario")) return "inventario";
   if (normalized.includes("pendientes")) return "pendientes";
   return "";
@@ -202,10 +205,14 @@ function extractListName(raw, normalized, action) {
 function extractItems(raw, normalized, action, listName) {
   if (action === "list" || action === "create" || action === "unknown") return [];
 
-  let clean = String(raw || "")
-    .replace(/^\s*(anota|agrega|quita|elimina|marca como hecho|marcar como hecho)\s*/i, "")
-    .replace(/\s+(en|a|de)\s+(mi\s+)?lista\s+.*$/i, "")
-    .trim();
+  const afterCon = String(raw || "").match(/\bcon\s+(.+)$/i);
+  let clean = afterCon && /\blista\b/i.test(raw)
+    ? afterCon[1]
+    : String(raw || "")
+      .replace(/^\s*(anota|agrega|quita|elimina|marca como hecho|marcar como hecho)\s*/i, "")
+      .replace(/^\s*(hazme|hacer|prepara|preparame|creame)\s+(una\s+)?lista\s+(de\s+|del\s+)?[^,.;:]+?\s+con\s+/i, "")
+      .replace(/\s+(en|a|de)\s+(mi\s+)?lista\s+.*$/i, "")
+      .trim();
 
   if (listName) {
     clean = clean.replace(new RegExp("\\b" + escapeRegExp(listName) + "\\b", "i"), "").trim();
@@ -217,9 +224,16 @@ function extractItems(raw, normalized, action, listName) {
 function normalizeItems(items) {
   return (Array.isArray(items) ? items : [items])
     .map(function (item) {
-      return String(item || "").trim();
+      return String(item || "").replace(/[.。]+$/g, "").trim();
     })
     .filter(Boolean);
+}
+
+function stripInputPrefixes(text) {
+  return String(text || "")
+    .replace(/^\s*\[Audio transcrito\]:\s*/i, "")
+    .replace(/^\s*\[Texto adicional\]:\s*/i, "")
+    .trim();
 }
 
 function normalizeListName(name) {

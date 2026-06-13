@@ -40,3 +40,22 @@ node scripts/test-text-plus-images.js
 ## Deploy
 
 `wrangler.toml` points to `src/index.js`, which is the real Worker entrypoint.
+
+## WhatsApp Control Commands
+
+- `/help`: shows general assistant capabilities.
+- `/context`: shows `activeIntent`, `contextId`, `lastUserGoal`, pending clarification, current-turn media count, previous relevant media count, and stale media count.
+- `/clear-media`: clears previous images/files without deleting lists or reminders.
+- `/reset`: clears conversation context, previous media, campaign state, and pending clarification.
+
+## Local Logs
+
+Capture local Worker logs without copying terminal output manually:
+
+```powershell
+npm run dev:log
+npm run logs:latest
+npm run logs:analyze
+```
+
+Logs are written under `logs/agent-YYYY-MM-DD.log` and ignored by Git.

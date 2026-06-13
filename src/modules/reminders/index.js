@@ -15,7 +15,7 @@ export function parseReminderRequest(text, userTimezone, options) {
 
   const now = options && options.now ? new Date(options.now) : new Date();
   const timezone = userTimezone || "UTC";
-  const raw = String(text || "").trim();
+  const raw = stripInputPrefixes(String(text || "").trim());
   const normalized = normalizeText(raw);
   const reminderOffsets = parseReminderOffsets(normalized);
   const recurrence = parseRecurrence(normalized);
@@ -291,5 +291,12 @@ function normalizeText(text) {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripInputPrefixes(text) {
+  return String(text || "")
+    .replace(/^\s*\[Audio transcrito\]:\s*/i, "")
+    .replace(/^\s*\[Texto adicional\]:\s*/i, "")
     .trim();
 }

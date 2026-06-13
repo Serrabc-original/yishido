@@ -1,0 +1,21 @@
+[
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_ocr_image",
+    "channel": "channel_1",
+    "from": "user_1",
+    "to": "bot_1",
+    "fileId": "file_ocr_1",
+    "mimeType": "image/jpeg"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "TEXT",
+    "messageId": "msg_ocr_text",
+    "channel": "channel_1",
+    "from": "user_1",
+    "to": "bot_1",
+    "text": "Saca el texto de esta imagen"
+  }
+]

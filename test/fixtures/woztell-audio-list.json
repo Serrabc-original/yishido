@@ -1,0 +1,12 @@
+{
+  "eventType": "INBOUND",
+  "type": "AUDIO",
+  "messageId": "msg_audio_list",
+  "channel": "channel_1",
+  "from": "user_1",
+  "to": "bot_1",
+  "fileId": "file_audio_list",
+  "mimeType": "audio/ogg",
+  "audioStatus": "transcribed",
+  "audioTranscript": "Hazme una lista de compras con arroz y pollo"
+}

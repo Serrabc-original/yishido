@@ -1,0 +1,21 @@
+[
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_machine_image",
+    "channel": "channel_1",
+    "from": "user_1",
+    "to": "bot_1",
+    "fileId": "file_machine_1",
+    "mimeType": "image/jpeg"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "TEXT",
+    "messageId": "msg_machine_question",
+    "channel": "channel_1",
+    "from": "user_1",
+    "to": "bot_1",
+    "text": "Como funciona esta maquina?"
+  }
+]

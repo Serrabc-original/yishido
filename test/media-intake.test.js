@@ -13,6 +13,11 @@ import {
   shouldUsePreviousContext,
   buildUserTurn,
   buildOrchestratorInput,
+  buildContextSnapshot,
+  clearMediaState,
+  createEmptyConversationContext,
+  formatContextForWhatsApp,
+  updateConversationContext,
   compactConversationHistory,
   mapOrchestratorActions,
   analyzeMediaBatch,
@@ -239,6 +244,75 @@ test("buildOrchestratorInput compacts previous state for current-turn-only reque
   assert.equal(input.current_turn_summary.image_count, 1);
   assert.equal(input.relevant_previous_state.note, "Previous campaign content intentionally omitted for current turn.");
   assert.equal(Array.isArray(input.allowed_actions), true);
+});
+
+test("text after previous images does not drag stale media into current turn", () => {
+  const messages = [
+    normalizeIncomingMessage({ type: "TEXT", text: "Hazme una lista de compras" }, basePayload, { messageId: "text_after_images" })
+  ];
+  const campaignState = {
+    workflow_status: "media_received",
+    campaign_assets: [
+      { asset_id: "asset_1", asset_index: 1, file_id: "old_1", url: "https://cdn/old_1.jpg", media_type: "IMAGE", turn_id: "old_turn" },
+      { asset_id: "asset_2", asset_index: 2, file_id: "old_2", url: "https://cdn/old_2.jpg", media_type: "IMAGE", turn_id: "old_turn" }
+    ],
+    last_uploaded_image: { fileId: "old_2", url: "https://cdn/old_2.jpg", type: "IMAGE" }
+  };
+
+  const turn = buildUserTurn(messages, campaignState, { turnId: "new_turn" });
+
+  assert.equal(turn.image_count, 0);
+  assert.equal(turn.current_turn_media.asset_count, 0);
+  assert.equal(turn.previous_relevant_media.asset_count, 0);
+  assert.equal(turn.stale_media.asset_count, 2);
+});
+
+test("explicit previous image reference selects previous relevant media", () => {
+  const messages = [
+    normalizeIncomingMessage({ type: "TEXT", text: "Usa la segunda imagen" }, basePayload, { messageId: "use_second" })
+  ];
+  const campaignState = {
+    workflow_status: "media_received",
+    campaign_assets: [
+      { asset_id: "asset_1", asset_index: 1, file_id: "old_1", url: "https://cdn/old_1.jpg", media_type: "IMAGE", turn_id: "old_turn" },
+      { asset_id: "asset_2", asset_index: 2, file_id: "old_2", url: "https://cdn/old_2.jpg", media_type: "IMAGE", turn_id: "old_turn" }
+    ]
+  };
+
+  const turn = buildUserTurn(messages, campaignState, { turnId: "new_turn" });
+
+  assert.equal(turn.context_policy, "use_previous_context");
+  assert.equal(turn.image_count, 1);
+  assert.deepEqual(turn.media_batch.fileIds, ["old_2"]);
+  assert.equal(turn.previous_relevant_media.asset_count, 1);
+});
+
+test("conversation context snapshot and clear media command state", () => {
+  const context = updateConversationContext(createEmptyConversationContext("test"), {
+    userTurn: {
+      current_turn_text: "Hazme una lista de compras",
+      context_policy: "current_turn_only",
+      current_turn_media: { asset_count: 0, image_count: 0, video_count: 0, file_count: 0, file_ids: [] },
+      previous_relevant_media: { asset_count: 0, image_count: 0, video_count: 0, file_count: 0, file_ids: [] },
+      stale_media: { asset_count: 2, image_count: 2, video_count: 0, file_count: 0, file_ids: ["old_1", "old_2"] }
+    },
+    route: { intent: "list" },
+    lastUserGoal: "lista compras: arroz, pollo"
+  });
+  const data = {
+    activeContext: context,
+    campaignState: {
+      campaign_assets: [{ asset_id: "asset_1", file_id: "old_1", url: "https://cdn/old_1.jpg" }],
+      workflow_status: "media_received"
+    }
+  };
+
+  assert.equal(buildContextSnapshot(data).activeIntent, "list");
+  assert.match(formatContextForWhatsApp(data), /activeIntent: list/);
+
+  const cleared = clearMediaState(data, "test_clear");
+  assert.equal(cleared.campaignState.campaign_assets.length, 0);
+  assert.equal(buildContextSnapshot(cleared).staleMedia, 0);
 });
 
 test("compactConversationHistory keeps only small recent history", () => {

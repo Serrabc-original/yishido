@@ -1,0 +1,31 @@
+[
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_old_img_1",
+    "channel": "channel_1",
+    "from": "user_1",
+    "to": "bot_1",
+    "fileId": "file_old_img_1",
+    "mimeType": "image/jpeg"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_old_img_2",
+    "channel": "channel_1",
+    "from": "user_1",
+    "to": "bot_1",
+    "fileId": "file_old_img_2",
+    "mimeType": "image/jpeg"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "TEXT",
+    "messageId": "msg_text_after_old_images_list",
+    "channel": "channel_1",
+    "from": "user_1",
+    "to": "bot_1",
+    "text": "Hazme una lista de compras"
+  }
+]
