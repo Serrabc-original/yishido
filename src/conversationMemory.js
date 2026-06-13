@@ -10,6 +10,8 @@ export function getCoreFeatureFlags(env) {
     enableUserStyleProfile: parseBooleanEnv(env && env.ENABLE_USER_STYLE_PROFILE, false),
     enableCustomerMemory: parseBooleanEnv(env && env.ENABLE_CUSTOMER_MEMORY, false),
     enableReminders: parseBooleanEnv(env && env.ENABLE_REMINDERS, false),
+    enableLists: parseBooleanEnv(env && env.ENABLE_LISTS, false),
+    enableWhatsAppInteractive: parseBooleanEnv(env && env.ENABLE_WHATSAPP_INTERACTIVE, false),
     enableTemplateModule: parseBooleanEnv(env && env.ENABLE_TEMPLATE_MODULE, false)
   };
 }
@@ -29,6 +31,7 @@ export function updateConversationMemory(data, userTurn, options) {
   next.conversationSummary = buildConversationSummary(
     flags.saveConversationLogs ? next.conversationLog : previousLog.concat([safeTurn]).slice(-6)
   );
+  next.utilityMemory = buildUtilityMemory(options && options.utilityState || next.coreUtilityState || {});
 
   if (flags.enableUserStyleProfile) {
     next.userStyleProfile = buildUserStyleProfile(
@@ -139,6 +142,22 @@ export function buildCustomerMemory(conversationLog, previousMemory) {
     preferences: previousMemory && previousMemory.preferences || {},
     open_questions: inferOpenQuestions(text),
     source: "safe_optional_memory_v1",
+    updated_at: new Date().toISOString()
+  };
+}
+
+export function buildUtilityMemory(utilityState) {
+  const clean = utilityState && typeof utilityState === "object" ? utilityState : {};
+  const reminders = Array.isArray(clean.reminders) ? clean.reminders : [];
+  const lists = clean.lists && typeof clean.lists === "object" ? clean.lists : {};
+
+  return {
+    reminder_count: reminders.filter(function (item) {
+      return !["cancelled", "done"].includes(item.status);
+    }).length,
+    list_names: Object.values(lists).map(function (list) {
+      return list.name || "";
+    }).filter(Boolean).slice(0, 20),
     updated_at: new Date().toISOString()
   };
 }

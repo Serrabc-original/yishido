@@ -50,6 +50,12 @@ El analisis busca:
 
 ## Como pedirle a Codex que investigue un bug
 
+Primero genera un bundle:
+
+```powershell
+npm run bug:report -- --traceId trace_...
+```
+
 Pasa el `traceId` y pega el resultado de:
 
 ```powershell

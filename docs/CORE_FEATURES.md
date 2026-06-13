@@ -16,6 +16,10 @@ Este proyecto debe funcionar como un core universal de agentes inteligentes por 
 - Google Sheets como integracion existente.
 - Logging estructurado con `traceId`.
 - Memoria compacta y segura, apagada para datos sensibles por defecto.
+- Router ligero de utilidades core.
+- Recordatorios y listas como modulos base apagados por defecto.
+- Mensajes interactivos WhatsApp/Woztell con fallback a texto.
+- Bug report bundle por `traceId`.
 
 ## Configuracion
 
@@ -26,6 +30,8 @@ Variables nuevas:
 - `ENABLE_USER_STYLE_PROFILE=false`
 - `ENABLE_CUSTOMER_MEMORY=false`
 - `ENABLE_REMINDERS=false`
+- `ENABLE_LISTS=false`
+- `ENABLE_WHATSAPP_INTERACTIVE=false`
 - `ENABLE_TEMPLATE_MODULE=false`
 
 Las features sensibles no se activan por defecto.

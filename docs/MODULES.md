@@ -1,37 +1,41 @@
 # Modules
 
-Los modulos opcionales quedan preparados como stubs seguros. No se activan por defecto y no cambian el flujo principal.
+Modules are optional building blocks for a universal WhatsApp AI Agent Core. The core should stay useful for many agent types without becoming a specialized product too early.
 
-## Core ahora
+## Core Ahora
 
-- `src/logger.js`: logger estructurado con redaccion de secretos.
-- `src/conversationMemory.js`: resumen compacto, perfil de estilo opcional y customer memory opcional.
+- `src/logger.js`: structured logging with secret redaction.
+- `src/conversationMemory.js`: compact conversation summary, optional style profile, optional customer memory, utility memory.
+- `src/coreUtilityRouter.js`: lightweight intent router for reminders, lists, general, marketing, support, orders, CRM and future elderly flows.
+- `src/whatsapp/sendInteractiveMessage.js`: WhatsApp/Woztell interactive message builder and sender with text fallback.
+- `scripts/export-bug-report.js`: redacted bug report bundle by `traceId`.
 
-## Modulo opcional
+## Modulo Opcional
 
-- `src/modules/templates/`: borrador para WhatsApp templates. Variable: `ENABLE_TEMPLATE_MODULE=false`.
-- `src/modules/reminders/`: borrador para recordatorios. Variable: `ENABLE_REMINDERS=false`.
-- `src/modules/customerMemory/`: read model de memoria de cliente. Variable: `ENABLE_CUSTOMER_MEMORY=false`.
-- `src/modules/crmLite/`: propuesta de CRM-lite sin activacion.
-- `src/modules/orders/`: propuesta de intake de ordenes.
-- `src/modules/support/`: propuesta de tickets de soporte.
+- `src/modules/reminders/`: parser and mock/local reminder storage. Variable: `ENABLE_REMINDERS=false`.
+- `src/modules/lists/`: notes/lists parser and mock/local list storage. Variable: `ENABLE_LISTS=false`.
+- `src/modules/templates/`: WhatsApp templates stub. Variable: `ENABLE_TEMPLATE_MODULE=false`.
+- `src/modules/customerMemory/`: customer memory read model. Variable: `ENABLE_CUSTOMER_MEMORY=false`.
+- `src/modules/crmLite/`: CRM-lite proposal.
+- `src/modules/orders/`: orders intake proposal.
+- `src/modules/support/`: support ticketing proposal.
 
 ## Backlog
 
-- Motor real de recordatorios con zona horaria, consentimiento y reintentos.
-- Templates aprobados por WhatsApp con catalogo y estados.
-- CRM-lite con tags, pipeline y handoff humano.
-- Orders agent con catalogo, precio, disponibilidad y confirmacion.
-- Support agent con SLA, prioridades y destino de tickets.
-- Sales follow-up assistant con ventanas de contacto y reglas anti-spam.
-- Elderly assistant con reglas reforzadas de seguridad, contacto de emergencia y consentimiento.
+- Production reminder scheduler with Durable Object alarms, Cron Triggers, Queues or another reliable scheduler.
+- WhatsApp template catalog with approval states.
+- CRM-lite with contact tags, pipeline and handoff.
+- Orders agent with catalog, pricing and availability.
+- Support ticketing with SLA and destination system.
+- Sales follow-up assistant with anti-spam rules.
+- Elderly assistant with safety, consent and emergency-contact rules.
 
-## Regla de activacion
+## Activation Rule
 
-Antes de activar cualquier modulo grande:
+Before activating any large module:
 
-1. definir datos minimos;
-2. definir retencion;
-3. definir consentimiento;
-4. agregar pruebas;
-5. mantener intacto el core.
+1. define minimum data;
+2. define retention;
+3. define consent;
+4. add tests;
+5. keep `/reset`, audio queue, image queue, Google Sheets and `campaign_assets` intact.

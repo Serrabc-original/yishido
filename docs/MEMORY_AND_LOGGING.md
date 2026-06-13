@@ -34,6 +34,7 @@ No debe guardar secretos, tokens, headers de autorizacion ni datos sensibles inn
 - tipos de input vistos;
 - keywords;
 - ultima politica de contexto.
+- memoria de utilidades (`utilityMemory`) con conteos de recordatorios y nombres de listas, sin payloads crudos.
 
 Este resumen puede enviarse al orquestador porque es compacto.
 

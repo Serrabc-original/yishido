@@ -27,6 +27,9 @@
 // - BUFFER_MAX_WAIT_SECONDS = 15
 import { captureError, createTraceId, logEvent } from "./logger.js";
 import { getCoreFeatureFlags, updateConversationMemory } from "./conversationMemory.js";
+import { routeCoreUtilityIntent } from "./coreUtilityRouter.js";
+import { createReminder } from "./modules/reminders/index.js";
+import { addListItems, createList, listItems, markListItemDone, normalizeListState, removeListItems } from "./modules/lists/index.js";
 
 let activeLogContext = {};
 
@@ -928,13 +931,15 @@ export class ConversationCoordinator {
 
       const userTurn = buildUserTurn(messages, data.campaignState, { turnId: data.currentTurnId || "" });
       userTurn.trace_id = data.currentTraceId || (messages[0] && messages[0].traceId) || createTraceId([data.doName, userTurn.turn_id]);
+      const coreFlags = getCoreFeatureFlags(this.env);
       activeLogContext = {
         traceId: userTurn.trace_id,
         turnId: userTurn.turn_id,
         doName: data.doName
       };
       data = updateConversationMemory(data, userTurn, {
-        flags: getCoreFeatureFlags(this.env)
+        flags: coreFlags,
+        utilityState: data.coreUtilityState
       });
       data.campaignState.current_turn = buildTurnSummary(userTurn);
       data.campaignState.active_turn = userTurn;
@@ -1058,6 +1063,14 @@ export class ConversationCoordinator {
           assetCount: assetCount
         }));
       } else {
+      const utilityRoute = routeCoreUtilityIntent(userTurn, {
+        flags: coreFlags,
+        timezone: this.env.USER_TIMEZONE || "America/Bogota"
+      });
+
+      if (utilityRoute.shouldHandleInCore) {
+        data = await this.handleCoreUtility(data, utilityRoute, userTurn);
+      } else {
       const plan = await callOrchestratorPlan(this.env, {
         doName: data.doName,
         channel: data.channel,
@@ -1068,12 +1081,14 @@ export class ConversationCoordinator {
         conversationSummary: data.conversationSummary,
         userStyleProfile: data.userStyleProfile,
         customerMemory: data.customerMemory,
+        utilityMemory: data.utilityMemory,
         userTurn: userTurn
       });
 
       console.log("ORCHESTRATOR_PLAN:", JSON.stringify(plan));
 
       data = await this.executePlan(data, messages, plan, userTurn);
+      }
       }
 
       for (const msg of messages) {
@@ -1162,6 +1177,84 @@ export class ConversationCoordinator {
       data.updatedAt = new Date().toISOString();
       await this.saveData(data);
     }
+  }
+
+  async handleCoreUtility(data, utilityRoute, userTurn) {
+    const route = utilityRoute || {};
+    data.coreUtilityState = normalizeCoreUtilityState(data.coreUtilityState);
+
+    if (route.intent === "reminder") {
+      const parsed = route.parsed || {};
+
+      if (parsed.missingFields && parsed.missingFields.length) {
+        const question = parsed.missingFields.includes("date")
+          ? "¿Para qué fecha quieres que te lo recuerde?"
+          : parsed.missingFields.includes("time")
+            ? "¿A qué hora quieres que te lo recuerde?"
+            : "¿Qué quieres que te recuerde?";
+
+        await sendWoztellTextMessage(this.env, {
+          channelId: data.channel,
+          recipientId: data.phone,
+          text: question
+        });
+
+        data.campaignState.history = appendHistory(data.campaignState.history, {
+          role: "assistant",
+          type: "TEXT",
+          text: question,
+          at: new Date().toISOString()
+        });
+        return data;
+      }
+
+      const reminder = createReminder(data.coreUtilityState.reminders, parsed);
+      data.coreUtilityState.reminders = data.coreUtilityState.reminders.concat([reminder]);
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        text: "Listo, dejé preparado el recordatorio: " + reminder.title + (reminder.dueAt ? "\nFecha: " + reminder.dueAt : "") + "\nNota: todavía no se envía automáticamente en producción."
+      });
+
+      return data;
+    }
+
+    if (route.intent === "list") {
+      const parsed = route.parsed || {};
+      const listName = parsed.listName || "pendientes";
+      let listState = normalizeListState(data.coreUtilityState.listsState);
+      let list;
+
+      if (parsed.action === "create") {
+        listState = createList(listState, listName);
+        list = listItems(listState, listName);
+      } else if (parsed.action === "add") {
+        listState = addListItems(listState, listName, parsed.items || []);
+        list = listItems(listState, listName);
+      } else if (parsed.action === "remove") {
+        listState = removeListItems(listState, listName, parsed.items || []);
+        list = listItems(listState, listName);
+      } else if (parsed.action === "mark_done") {
+        listState = markListItemDone(listState, listName, parsed.items || []);
+        list = listItems(listState, listName);
+      } else {
+        list = listItems(listState, listName);
+      }
+
+      data.coreUtilityState.listsState = listState;
+      data.coreUtilityState.lists = listState.lists;
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        text: formatListForWhatsApp(list)
+      });
+
+      return data;
+    }
+
+    return data;
   }
 
   async executePlan(data, messages, plan, userTurn) {
@@ -1967,12 +2060,13 @@ function isAudioEmptyError(error) {
 }
 
 async function callOrchestratorPlan(env, params) {
-  const provider = String(env.ORCHESTRATOR_PROVIDER || "claude").toLowerCase();
+  const provider = String(env.ORCHESTRATOR_PROVIDER || "openai").toLowerCase();
+  const model = env.ORCHESTRATOR_MODEL || (provider === "openai" ? "gpt-5.4-mini" : "");
   const traceId = params && params.userTurn && params.userTurn.trace_id || "";
 
   console.log("ORCHESTRATOR_PROVIDER_SELECTED:", JSON.stringify({
     provider: provider,
-    model: env.ORCHESTRATOR_MODEL || "",
+    model: model,
     doName: params.doName || ""
   }));
   logEvent("ORCHESTRATOR_PROVIDER_SELECTED", {
@@ -1980,14 +2074,42 @@ async function callOrchestratorPlan(env, params) {
     turnId: params && params.userTurn && params.userTurn.turn_id || "",
     doName: params.doName || "",
     provider: provider,
-    model: env.ORCHESTRATOR_MODEL || ""
+    model: model
+  });
+  logEvent("ORCHESTRATOR_MODEL_SELECTED", {
+    traceId: traceId,
+    turnId: params && params.userTurn && params.userTurn.turn_id || "",
+    doName: params.doName || "",
+    provider: provider,
+    model: model
   });
 
-  if (provider === "openai") {
-    return await openaiOrchestratorProvider(env, params);
-  }
+  try {
+    if (provider === "openai") {
+      return await openaiOrchestratorProvider(env, params);
+    }
 
-  return await claudeOrchestratorProvider(env, params);
+    return await claudeOrchestratorProvider(env, params);
+  } catch (error) {
+    const fallbackProvider = String(env.ORCHESTRATOR_FALLBACK_PROVIDER || "").toLowerCase();
+
+    if (provider !== "claude" && fallbackProvider === "claude") {
+      logEvent("ORCHESTRATOR_FALLBACK_USED", {
+        traceId: traceId,
+        turnId: params && params.userTurn && params.userTurn.turn_id || "",
+        doName: params.doName || "",
+        fromProvider: provider,
+        fallbackProvider: "claude",
+        reason: String(error.message || error)
+      }, {
+        level: "error",
+        traceId: traceId
+      });
+      return await claudeOrchestratorProvider(env, params);
+    }
+
+    throw error;
+  }
 }
 
 async function claudeOrchestratorProvider(env, params) {
@@ -1995,14 +2117,177 @@ async function claudeOrchestratorProvider(env, params) {
 }
 
 async function openaiOrchestratorProvider(env, params) {
-  console.log("ORCHESTRATOR_PROVIDER_OPENAI_STUB:", JSON.stringify({
-    reason: "openai_provider_not_enabled_for_production_flow",
-    doName: params.doName || ""
-  }));
+  if (!env.OPENAI_API_KEY) {
+    throw new Error("Missing OPENAI_API_KEY");
+  }
 
-  return await callClaudeOrchestratorPlan(Object.assign({}, env, {
-    ORCHESTRATOR_PROVIDER: "claude"
-  }), params);
+  const context = buildOrchestratorRequestContext(env, params);
+  const model = env.ORCHESTRATOR_MODEL || "gpt-5.4-mini";
+  const payload = buildNeutralOrchestratorPayload(env, params, context);
+
+  console.log("ORCHESTRATOR_INPUT_COMPACTED:", JSON.stringify({
+    doName: params.doName || "",
+    turnId: context.userTurn.turn_id,
+    keys: Object.keys(context.compactInput),
+    currentTurnTextLength: context.compactInput.current_turn_text.length,
+    previousStateMode: context.compactInput.relevant_previous_state && context.compactInput.relevant_previous_state.note ? "omitted" : "included"
+  }));
+  logEvent("ORCHESTRATOR_INPUT_COMPACTED", {
+    traceId: context.userTurn.trace_id || "",
+    turnId: context.userTurn.turn_id,
+    doName: params.doName || "",
+    provider: "openai",
+    keys: Object.keys(context.compactInput),
+    currentTurnTextLength: context.compactInput.current_turn_text.length
+  });
+
+  const res = await fetchWithTimeout("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + env.OPENAI_API_KEY,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: model,
+      input: [
+        {
+          role: "user",
+          content: JSON.stringify(payload)
+        }
+      ],
+      reasoning: {
+        effort: "minimal"
+      },
+      text: {
+        verbosity: "low"
+      },
+      max_output_tokens: 1800
+    })
+  }, 45000, "OPENAI_ORCHESTRATOR_TIMEOUT");
+
+  const responseText = await res.text();
+
+  if (!res.ok) {
+    throw new Error("OPENAI_ORCHESTRATOR_ERROR " + res.status + ": " + responseText);
+  }
+
+  const text = extractOpenAIResponseText(parseMaybeJson(responseText));
+  console.log("ORCHESTRATOR_RAW_TEXT:", String(text || "").slice(0, 3000));
+
+  const plan = normalizePlan(parseJsonFromText(text));
+
+  logOrchestratorPlanSelected(plan, context.userTurn, params, "openai");
+  return plan;
+}
+
+function buildOrchestratorRequestContext(env, params) {
+  const userTurn = params.userTurn || buildUserTurn(params.messages || [], params.campaignState || {});
+  const mediaBatch = userTurn.media_batch || buildMediaBatch(params.campaignState || {}, params.messages || []);
+  const mediaBatchSummary = userTurn.media_batch_summary || buildMediaBatchSummary(mediaBatch);
+  const compactInput = buildOrchestratorInput({
+    messages: params.messages || [],
+    campaignState: params.campaignState || {},
+    userTurn: userTurn,
+    conversationSummary: params.conversationSummary || null,
+    userStyleProfile: params.userStyleProfile || null,
+    customerMemory: params.customerMemory || null,
+    utilityMemory: params.utilityMemory || null
+  });
+  const orchestratorInputSummary = buildOrchestratorInputSummary({
+    messages: params.messages || [],
+    campaignState: params.campaignState || {},
+    mediaBatch: mediaBatch,
+    mediaBatchSummary: mediaBatchSummary
+  });
+
+  return {
+    userTurn: userTurn,
+    mediaBatch: mediaBatch,
+    mediaBatchSummary: mediaBatchSummary,
+    compactInput: compactInput,
+    orchestratorInputSummary: orchestratorInputSummary
+  };
+}
+
+function buildNeutralOrchestratorPayload(env, params, context) {
+  const compactInput = context.compactInput;
+  const mediaBatch = context.mediaBatch;
+  const mediaBatchSummary = context.mediaBatchSummary;
+
+  return {
+    instruction: [
+      "Return valid JSON only. Do not answer the user directly.",
+      "You are a neutral WhatsApp core orchestrator, not a marketing-only agent.",
+      "First classify the user intent. Only use marketing actions when intent is marketing.",
+      "If intent is reminder or list and core utilities are enabled, return should_handle_in_core true and no marketing actions.",
+      "If the request is unclear, ask one brief clarification question.",
+      "Never publish to Meta. Never call unavailable modules as if they were active."
+    ].join(" "),
+    plan_schema: ORCHESTRATOR_PLAN_SCHEMA,
+    available_intents: ["general", "marketing", "reminder", "list", "crm", "orders", "support", "elderly", "unknown"],
+    available_actions: getAllowedOrchestratorActions(),
+    action_policy: {
+      marketing_actions_only_when_intent_is_marketing: true,
+      non_marketing_requests_should_not_generate_copy_or_images_by_default: true,
+      pass_to_agent_when_core_module_is_disabled: true
+    },
+    orchestrator_input: compactInput,
+    current_turn_summary: compactInput.current_turn_summary,
+    current_turn_text: compactInput.current_turn_text,
+    client_profile: params.clientProfile || {},
+    campaign_state: compactInput.campaign_state_brief,
+    relevant_previous_state: compactInput.relevant_previous_state,
+    campaign_assets: mediaBatch.assets,
+    media_batch_summary: mediaBatchSummary,
+    conversation_summary: compactInput.conversation_summary,
+    user_style_profile: compactInput.user_style_profile,
+    customer_memory: compactInput.customer_memory,
+    utility_memory: compactInput.utility_memory,
+    uploaded_image_analysis: mediaBatchSummary,
+    current_asset_source: compactInput.campaign_state_brief.current_asset_source || "",
+    asset_count: mediaBatch.assets.length,
+    analyzed_asset_count: mediaBatch.analyzedAssetCount,
+    failed_asset_count: mediaBatch.failedAssetCount,
+    constraints: {
+      no_meta_publish_yet: true,
+      openai_images_quality: "low",
+      copy_model: env.COPY_MODEL || "gpt-5-nano",
+      image_model: env.OPENAI_IMAGE_MODEL || "gpt-image-2"
+    },
+    module_notes: {
+      reminders: "Core utility. Do not schedule real production reminders unless the runtime module is enabled.",
+      lists: "Core utility. Handle as lists/notes, not marketing.",
+      marketing: "Specialized module. Use existing marketing actions only for marketing intent.",
+      crmLite: "Optional future module.",
+      orders: "Optional future module.",
+      support: "Optional future module.",
+      elderly: "Optional future module."
+    }
+  };
+}
+
+function logOrchestratorPlanSelected(plan, userTurn, params, provider) {
+  console.log("ORCHESTRATOR_ACTIONS_SELECTED:", JSON.stringify({
+    doName: params.doName || "",
+    intent: plan.intent || "",
+    actions: mapOrchestratorActions(plan).map(function (action) { return action.type; })
+  }));
+  logEvent("ORCHESTRATOR_INTENT_DETECTED", {
+    traceId: userTurn.trace_id || "",
+    turnId: userTurn.turn_id,
+    doName: params.doName || "",
+    provider: provider || "",
+    intent: plan.intent || "",
+    confidence: plan.confidence || 0,
+    targetModule: plan.target_module || "",
+    shouldHandleInCore: Boolean(plan.should_handle_in_core)
+  });
+  logEvent("ORCHESTRATOR_ACTIONS_SELECTED", {
+    traceId: userTurn.trace_id || "",
+    turnId: userTurn.turn_id,
+    doName: params.doName || "",
+    actions: mapOrchestratorActions(plan).map(function (action) { return action.type; })
+  });
 }
 
 async function callClaudeOrchestratorPlan(env, params) {
@@ -2024,7 +2309,8 @@ async function callClaudeOrchestratorPlan(env, params) {
     userTurn: userTurn,
     conversationSummary: params.conversationSummary || null,
     userStyleProfile: params.userStyleProfile || null,
-    customerMemory: params.customerMemory || null
+    customerMemory: params.customerMemory || null,
+    utilityMemory: params.utilityMemory || null
   });
   const orchestratorInputSummary = buildOrchestratorInputSummary({
     messages: params.messages || [],
@@ -2064,9 +2350,20 @@ async function callClaudeOrchestratorPlan(env, params) {
   });
 
   const payload = {
-    instruction: "Return valid JSON only. Do not answer the user directly.",
+    instruction: [
+      "Return valid JSON only. Do not answer the user directly.",
+      "You are a neutral WhatsApp core orchestrator, not a marketing-only agent.",
+      "First classify intent as general, marketing, reminder, list, crm, orders, support, elderly, or unknown.",
+      "Only use marketing actions when intent is marketing.",
+      "If intent is unclear, ask one brief clarification question."
+    ].join(" "),
     plan_schema: ORCHESTRATOR_PLAN_SCHEMA,
+    available_intents: ["general", "marketing", "reminder", "list", "crm", "orders", "support", "elderly", "unknown"],
     available_actions: getAllowedOrchestratorActions(),
+    action_policy: {
+      marketing_actions_only_when_intent_is_marketing: true,
+      non_marketing_requests_should_not_generate_copy_or_images_by_default: true
+    },
     orchestrator_input: compactInput,
     current_turn_summary: compactInput.current_turn_summary,
     current_turn_text: compactInput.current_turn_text,
@@ -2078,6 +2375,7 @@ async function callClaudeOrchestratorPlan(env, params) {
     conversation_summary: compactInput.conversation_summary,
     user_style_profile: compactInput.user_style_profile,
     customer_memory: compactInput.customer_memory,
+    utility_memory: compactInput.utility_memory,
     uploaded_image_analysis: mediaBatchSummary,
     current_asset_source: compactInput.campaign_state_brief.current_asset_source || "",
     asset_count: mediaBatch.assets.length,
@@ -2094,7 +2392,7 @@ async function callClaudeOrchestratorPlan(env, params) {
     uploadedImageAnalysis: params.campaignState && params.campaignState.uploaded_image_analysis || mediaBatchSummary,
     currentAssetSource: params.campaignState && params.campaignState.current_asset_source || "",
     uploaded_image_rules: [
-      "Claude is the orchestrator only. Claude must not analyze image pixels directly.",
+      "The orchestrator must not analyze image pixels directly.",
       "Media is always an array. Use campaign_assets and media_batch_summary as the source of truth for uploaded images.",
       "last_uploaded_image exists only for compatibility and may represent the latest item, not the full visual context.",
       "If asset_count is greater than 1, treat uploaded images as a batch and reason from media_batch_summary.",
@@ -2139,21 +2437,16 @@ async function callClaudeOrchestratorPlan(env, params) {
 
   const plan = normalizePlan(parseJsonFromText(text));
 
-  console.log("ORCHESTRATOR_ACTIONS_SELECTED:", JSON.stringify({
-    doName: params.doName || "",
-    actions: mapOrchestratorActions(plan).map(function (action) { return action.type; })
-  }));
-  logEvent("ORCHESTRATOR_ACTIONS_SELECTED", {
-    traceId: userTurn.trace_id || "",
-    turnId: userTurn.turn_id,
-    doName: params.doName || "",
-    actions: mapOrchestratorActions(plan).map(function (action) { return action.type; })
-  });
+  logOrchestratorPlanSelected(plan, userTurn, params, "claude");
 
   return plan;
 }
 
 const ORCHESTRATOR_PLAN_SCHEMA = {
+  intent: "general",
+  confidence: 0,
+  should_handle_in_core: false,
+  target_module: "core",
   needs_clarification: false,
   clarification_question: "",
   user_facing_ack: "",
@@ -2529,12 +2822,15 @@ function isOrchestratorPlanShape(value) {
 
   return Object.prototype.hasOwnProperty.call(value, "needs_clarification") &&
     Object.prototype.hasOwnProperty.call(value, "actions") &&
-    Object.prototype.hasOwnProperty.call(value, "final_response_mode") &&
-    Object.prototype.hasOwnProperty.call(value, "state_updates");
+    Object.prototype.hasOwnProperty.call(value, "state_updates") &&
+    (
+      Object.prototype.hasOwnProperty.call(value, "final_response_mode") ||
+      Object.prototype.hasOwnProperty.call(value, "intent")
+    );
 }
 
 function normalizePlan(plan) {
-  if (!plan || typeof plan !== "object" || !Array.isArray(plan.actions) || !plan.final_response_mode) {
+  if (!plan || typeof plan !== "object" || !Array.isArray(plan.actions)) {
     throw new Error("ORCHESTRATOR_PLAN_INVALID_SHAPE");
   }
 
@@ -2552,9 +2848,12 @@ function normalizePlan(plan) {
     "ask_clarification"
   ];
 
+  const intent = normalizeOrchestratorIntent(plan.intent || "");
   const actions = Array.isArray(plan.actions)
     ? plan.actions.filter(function (action) {
-      return action && allowedActions.includes(action.type);
+      if (!action || !allowedActions.includes(action.type)) return false;
+      if (intent && intent !== "marketing" && action.type !== "ask_clarification") return false;
+      return true;
     }).map(function (action) {
       return {
         type: action.type,
@@ -2576,6 +2875,10 @@ function normalizePlan(plan) {
     : [];
 
   return {
+    intent: intent || "unknown",
+    confidence: clampConfidence(plan.confidence),
+    should_handle_in_core: Boolean(plan.should_handle_in_core),
+    target_module: normalizeTargetModule(plan.target_module || plan.targetModule || ""),
     needs_clarification: Boolean(plan.needs_clarification),
     clarification_question: String(plan.clarification_question || ""),
     user_facing_ack: String(plan.user_facing_ack || ""),
@@ -2583,6 +2886,24 @@ function normalizePlan(plan) {
     final_response_mode: String(plan.final_response_mode || "send_copy_only"),
     state_updates: typeof plan.state_updates === "object" && plan.state_updates ? plan.state_updates : {}
   };
+}
+
+function normalizeOrchestratorIntent(intent) {
+  const clean = String(intent || "").trim();
+  const allowed = ["general", "marketing", "reminder", "list", "crm", "orders", "support", "elderly", "unknown"];
+  return allowed.includes(clean) ? clean : "unknown";
+}
+
+function normalizeTargetModule(moduleName) {
+  const clean = String(moduleName || "").trim();
+  const allowed = ["core", "marketing", "reminders", "lists", "crmLite", "orders", "support", "elderly"];
+  return allowed.includes(clean) ? clean : "core";
+}
+
+function clampConfidence(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  return Math.max(0, Math.min(1, num));
 }
 
 async function generateCopyWithOpenAI(env, params) {
@@ -4135,8 +4456,34 @@ function normalizeCoordinatorData(data) {
     conversationSummary: clean.conversationSummary || clean.conversation_summary || null,
     userStyleProfile: clean.userStyleProfile || clean.user_style_profile || null,
     customerMemory: clean.customerMemory || clean.customer_memory || null,
+    utilityMemory: clean.utilityMemory || clean.utility_memory || null,
+    coreUtilityState: normalizeCoreUtilityState(clean.coreUtilityState || clean.core_utility_state || {}),
     archivedCampaigns: Array.isArray(clean.archivedCampaigns) ? clean.archivedCampaigns.slice(-5) : []
   };
+}
+
+function normalizeCoreUtilityState(state) {
+  const clean = state && typeof state === "object" ? state : {};
+  const listsState = normalizeListState(clean.listsState || { lists: clean.lists || {} });
+
+  return {
+    reminders: Array.isArray(clean.reminders) ? clean.reminders.slice(-100) : [],
+    listsState: listsState,
+    lists: listsState.lists
+  };
+}
+
+function formatListForWhatsApp(list) {
+  const clean = list || { name: "pendientes", items: [] };
+  const items = Array.isArray(clean.items) ? clean.items : [];
+
+  if (!items.length) {
+    return "La lista " + clean.name + " está vacía.";
+  }
+
+  return ["Lista: " + clean.name].concat(items.map(function (item, index) {
+    return (index + 1) + ". " + (item.done ? "[hecho] " : "") + item.text;
+  })).join("\n");
 }
 
 function normalizeClientProfile(profile) {
@@ -5351,6 +5698,7 @@ function buildOrchestratorInput(params) {
     conversation_summary: params.conversationSummary || null,
     user_style_profile: params.userStyleProfile || null,
     customer_memory: params.customerMemory || null,
+    utility_memory: params.utilityMemory || null,
     relevant_previous_state: buildRelevantPreviousState(state, userTurn),
     allowed_actions: getAllowedOrchestratorActions(),
     campaign_state_brief: {
