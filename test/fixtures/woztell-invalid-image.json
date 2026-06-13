@@ -1,0 +1,11 @@
+{
+  "eventType": "INBOUND",
+  "type": "IMAGE",
+  "messageId": "msg_img_invalid",
+  "app": "app_test",
+  "channel": "channel_test",
+  "from": "user_test",
+  "to": "bot_test",
+  "fileId": "invalid_file_id",
+  "caption": "usa esta tambien"
+}

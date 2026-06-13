@@ -1,0 +1,33 @@
+[
+  {
+    "eventType": "INBOUND",
+    "type": "TEXT",
+    "messageId": "msg_mixed_text",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "text": "Usa mi audio y estas imagenes"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "AUDIO",
+    "messageId": "msg_mixed_audio",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "fileId": "file_audio_1",
+    "mimeType": "audio/ogg"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_mixed_img",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "fileId": "file_image_1"
+  }
+]

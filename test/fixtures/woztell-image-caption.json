@@ -1,0 +1,11 @@
+{
+  "eventType": "INBOUND",
+  "type": "IMAGE",
+  "messageId": "msg_img_caption",
+  "app": "app_test",
+  "channel": "channel_test",
+  "from": "user_test",
+  "to": "bot_test",
+  "fileId": "file_image_caption",
+  "caption": "Usa esta foto para el post"
+}

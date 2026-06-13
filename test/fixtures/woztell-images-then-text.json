@@ -1,0 +1,32 @@
+[
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_img_first_1",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "fileId": "file_image_1"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_img_first_2",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "fileId": "file_image_2"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "TEXT",
+    "messageId": "msg_text_after_images",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "text": "Hazme posts con estas imagenes"
+  }
+]

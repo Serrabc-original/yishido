@@ -139,6 +139,27 @@ export default {
 
       const doName = buildConversationName(body);
 
+      if (!env.CONVERSATION_DO) {
+        return jsonResponse({
+          status: "error",
+          message: "CONVERSATION_DO binding is missing"
+        }, 500);
+      }
+
+      const id = env.CONVERSATION_DO.idFromName(doName);
+      const stub = env.CONVERSATION_DO.get(id);
+
+      await stub.fetch("https://conversation.local/message", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: "woztell_message",
+          doName: doName,
+          payload: body,
+          parsedMessage: parsedMessage
+        })
+      });
+
       await enqueueAudioJob(env, ctx, {
         type: "transcribe_audio",
         doName: doName,
@@ -233,9 +254,12 @@ export default {
           const woztellPayload = job.woztellPayload || {};
 
           if (job.type === "transcribe_audio") {
-            await sendAudioUserFallback(env, {
-              channel: woztellPayload.channel || job.channel || "",
-              from: woztellPayload.from || job.phone || ""
+            await notifyConversationDO(env, job.doName || buildConversationName(woztellPayload), {
+              type: "audio_failed",
+              messageId: job.messageId || "",
+              fileId: job.fileId || "",
+              error: String(error.message || error),
+              failedAt: new Date().toISOString()
             });
           } else if (woztellPayload.channel && woztellPayload.from && job.type !== "generate_image" && job.type !== "edit_image") {
             await sendWoztellTextMessage(env, {
@@ -413,19 +437,10 @@ export class ConversationCoordinator {
       return jsonResponse({ status: "duplicate_ignored", messageId: messageId });
     }
 
-    const normalized = {
+    const normalized = normalizeIncomingMessage(parsedMessage, woztellPayload, {
       messageId: messageId,
-      type: parsedMessage.type || "TEXT",
-      text: parsedMessage.text || (parsedMessage.fileId ? "[IMAGE uploaded without caption]" : ""),
-      fileId: parsedMessage.fileId || "",
-      mimeType: parsedMessage.mimeType || "",
-      fileName: parsedMessage.fileName || "",
-      app: woztellPayload.app || "",
-      channel: woztellPayload.channel || "",
-      from: woztellPayload.from || "",
-      to: woztellPayload.to || "",
       receivedAt: new Date(now).toISOString()
-    };
+    });
 
     if (normalizeTextForIntent(normalized.text) === "/reset") {
       data.pendingMessages = [];
@@ -462,70 +477,101 @@ export class ConversationCoordinator {
       data.pendingMessages = [];
       data.hasMedia = false;
       data.firstMessageAt = now;
+      data.currentTurnId = "";
     }
 
     if (!data.pendingMessages.length) {
       data.firstMessageAt = now;
+      data.currentTurnId = "turn_" + now + "_" + randomId(6);
     }
 
     data.lastMessageAt = now;
+    normalized.turnId = data.currentTurnId || "turn_" + now + "_" + randomId(6);
     data.pendingMessages.push(normalized);
 
-    if (normalized.fileId || ["IMAGE", "VIDEO"].includes(normalized.type)) {
+    console.log("TURN_CREATED:", JSON.stringify({
+      doName: data.doName,
+      turnId: normalized.turnId,
+      messageCount: data.pendingMessages.length
+    }));
+
+    if (normalized.media.length || ["IMAGE", "VIDEO"].includes(normalized.type)) {
       data.hasMedia = true;
-      let uploadedImageUrl = "";
+      let latestUploadedImage = null;
+      const resolvedAssets = [];
 
       console.log("UPLOADED_IMAGE_RECEIVED:", JSON.stringify({
         fileId: normalized.fileId,
+        fileIds: normalized.media.map(function (item) { return item.fileId; }),
         type: normalized.type,
         caption: normalized.text.slice(0, 300)
       }));
 
-      if (normalized.fileId) {
+      for (const mediaItem of normalized.media) {
+        let uploadedImageUrl = "";
+
         try {
           const fileInfo = await getWoztellFileInfo(this.env, {
             appId: normalized.app,
-            fileId: normalized.fileId
+            fileId: mediaItem.fileId
           });
           uploadedImageUrl = fileInfo.url || "";
 
           console.log("UPLOADED_IMAGE_URL_RESOLVED:", JSON.stringify({
-            fileId: normalized.fileId,
+            fileId: mediaItem.fileId,
             url: uploadedImageUrl
           }));
         } catch (error) {
-          console.error("UPLOADED_IMAGE_URL_RESOLVE_ERROR:", String(error.message || error));
+          console.error("UPLOADED_IMAGE_URL_RESOLVE_ERROR:", JSON.stringify({
+            fileId: mediaItem.fileId,
+            message: String(error.message || error)
+          }));
         }
+
+        const assetPatch = {
+          file_id: mediaItem.fileId,
+          url: uploadedImageUrl,
+          media_type: mediaItem.type,
+          mime_type: mediaItem.mimeType,
+          turn_id: normalized.turnId,
+          request_id: normalized.turnId,
+          analysis: null,
+          received_at: normalized.receivedAt,
+          status: uploadedImageUrl ? "received" : "url_pending"
+        };
+
+        data.campaignState.campaign_assets = addCampaignAsset(data.campaignState.campaign_assets, assetPatch);
+        resolvedAssets.push(assetPatch);
+        latestUploadedImage = {
+          fileId: mediaItem.fileId,
+          url: uploadedImageUrl,
+          type: mediaItem.type,
+          mimeType: mediaItem.mimeType,
+          app: normalized.app,
+          text: normalized.text,
+          receivedAt: normalized.receivedAt
+        };
       }
 
-      data.campaignState.last_uploaded_image = {
-        fileId: normalized.fileId,
-        url: uploadedImageUrl,
-        type: normalized.type,
-        app: normalized.app,
-        text: normalized.text,
-        receivedAt: normalized.receivedAt
-      };
+      data.campaignState.last_uploaded_image = latestUploadedImage || data.campaignState.last_uploaded_image;
       data.campaignState.current_asset_source = "uploaded_image";
       data.campaignState.uploaded_image_analysis = null;
-      data.campaignState.campaign_assets = addCampaignAsset(data.campaignState.campaign_assets, {
-        file_id: normalized.fileId,
-        url: uploadedImageUrl,
-        analysis: null,
-        received_at: normalized.receivedAt,
-        status: "received"
-      });
       data.campaignState.collecting_assets = true;
       data.campaignState.campaign_type = data.campaignState.campaign_assets.length > 1
         ? "bulk_from_assets"
         : data.campaignState.campaign_type || "single_post";
       data.campaignState.workflow_status = "collecting_assets";
+      data.campaignState.media_batch_summary = buildMediaBatchSummary(buildMediaBatch(data.campaignState, data.pendingMessages, { turnId: data.currentTurnId }));
 
       console.log("CURRENT_ASSET_SOURCE:", data.campaignState.current_asset_source);
-      console.log("CAMPAIGN_ASSET_ADDED:", JSON.stringify({
+      console.log("CAMPAIGN_ASSETS_UPDATED:", JSON.stringify({
+        doName: data.doName,
         campaignId: data.campaignState.campaign_id,
+        messageCount: data.pendingMessages.length,
         assetCount: data.campaignState.campaign_assets.length,
-        latestAsset: data.campaignState.campaign_assets[data.campaignState.campaign_assets.length - 1]
+        fileIds: resolvedAssets.map(function (asset) { return asset.file_id; }),
+        workflow_status: data.campaignState.workflow_status,
+        campaign_type: data.campaignState.campaign_type
       }));
     }
 
@@ -568,6 +614,18 @@ export class ConversationCoordinator {
       processAfterIso: new Date(data.processAfter).toISOString()
     }));
 
+    if (data.hasMedia) {
+      const mediaBatch = buildMediaBatch(data.campaignState, data.pendingMessages, { turnId: data.currentTurnId });
+      console.log("BUFFER_MEDIA_BATCH_READY:", JSON.stringify({
+        doName: data.doName,
+        messageCount: data.pendingMessages.length,
+        assetCount: mediaBatch.assets.length,
+        fileIds: mediaBatch.fileIds,
+        workflow_status: data.campaignState.workflow_status,
+        campaign_type: data.campaignState.campaign_type
+      }));
+    }
+
     console.log("DO_MESSAGE_BUFFERED:", JSON.stringify({
       doName: data.doName,
       pendingCount: data.pendingMessages.length,
@@ -584,6 +642,64 @@ export class ConversationCoordinator {
 
   async receiveToolResult(body) {
     let data = await this.getData();
+
+    if (body.type === "audio_transcribed" || body.type === "audio_failed") {
+      const messageId = body.messageId || "";
+      let updated = false;
+
+      data.pendingMessages = data.pendingMessages.map(function (message) {
+        if (message.messageId !== messageId) return message;
+
+        updated = true;
+        const transcript = String(body.transcript || "").trim();
+        const audioStatus = body.type === "audio_transcribed" && transcript ? "transcribed" : "failed";
+        const text = transcript
+          ? ["[Audio transcrito]: " + transcript, message.text && !message.text.includes("[AUDIO") ? "[Texto adicional]: " + message.text : ""].filter(Boolean).join("\n")
+          : message.text || "[AUDIO no transcrito]";
+
+        return Object.assign({}, message, {
+          type: transcript ? "TEXT" : message.type,
+          text: text,
+          audio: (message.audio || []).map(function (audio) {
+            return Object.assign({}, audio, {
+              status: audioStatus,
+              transcript: transcript,
+              error: body.error || ""
+            });
+          }),
+          audioStatus: audioStatus,
+          audioTranscript: transcript,
+          audioError: body.error || "",
+          awaitingTranscription: false,
+          transcribedAt: body.transcribedAt || new Date().toISOString()
+        });
+      });
+
+      if (updated) {
+        data.updatedAt = new Date().toISOString();
+        await this.saveData(data);
+
+        const pendingAudio = data.pendingMessages.some(function (message) {
+          return message.awaitingTranscription;
+        });
+
+        if (!pendingAudio && data.pendingMessages.length) {
+          data.processAfter = Date.now() + 250;
+          await this.saveData(data);
+          await this.state.storage.setAlarm(data.processAfter);
+        }
+
+        console.log("AUDIO_TURN_UPDATE_OK:", JSON.stringify({
+          doName: data.doName || "",
+          messageId: messageId,
+          status: body.type,
+          pendingCount: data.pendingMessages.length,
+          pendingAudio: pendingAudio
+        }));
+      }
+
+      return jsonResponse({ status: updated ? "audio_turn_updated" : "audio_message_not_pending" });
+    }
 
     if (body.type === "image_ready") {
       if (body.campaignId && body.campaignId !== data.campaignState.campaign_id) {
@@ -648,7 +764,54 @@ export class ConversationCoordinator {
       await this.saveData(data);
     }
 
-    const messages = data.pendingMessages.slice();
+    let messages = data.pendingMessages.slice();
+    const audioWait = getAudioTurnWaitConfig(this.env);
+    const pendingAudioMessages = messages.filter(function (message) {
+      return message.awaitingTranscription;
+    });
+
+    if (pendingAudioMessages.length) {
+      const oldestAudioAt = Math.min.apply(null, pendingAudioMessages.map(function (message) {
+        return Date.parse(message.receivedAt || "") || Date.now();
+      }));
+      const audioWaitAgeMs = Date.now() - oldestAudioAt;
+
+      if (audioWaitAgeMs < audioWait.maxAudioTurnWaitMs) {
+        data.processAfter = Date.now() + audioWait.retryWaitMs;
+        data.updatedAt = new Date().toISOString();
+        await this.saveData(data);
+        await this.state.storage.setAlarm(data.processAfter);
+
+        console.log("TURN_BUFFER_STARTED:", JSON.stringify({
+          doName: data.doName,
+          turnId: data.currentTurnId || "",
+          reason: "waiting_audio_transcription",
+          pendingAudioCount: pendingAudioMessages.length,
+          waitAgeMs: audioWaitAgeMs,
+          retryInMs: audioWait.retryWaitMs
+        }));
+
+        return;
+      }
+
+      data.pendingMessages = data.pendingMessages.map(function (message) {
+        if (!message.awaitingTranscription) return message;
+
+        return Object.assign({}, message, {
+          awaitingTranscription: false,
+          audioStatus: "failed",
+          audioError: "AUDIO_TIMEOUT"
+        });
+      });
+      messages = data.pendingMessages.slice();
+
+      console.log("AUDIO_TIMEOUT:", JSON.stringify({
+        doName: data.doName,
+        turnId: data.currentTurnId || "",
+        pendingAudioCount: pendingAudioMessages.length,
+        waitAgeMs: audioWaitAgeMs
+      }));
+    }
 
     data.processing = true;
     data.processingStartedAt = Date.now();
@@ -666,7 +829,73 @@ export class ConversationCoordinator {
         processingStartedAt: data.processingStartedAt
       }));
 
-      if (shouldAskHowToUseCollectedAssets(data, messages)) {
+      const userTurn = buildUserTurn(messages, data.campaignState, { turnId: data.currentTurnId || "" });
+      data.campaignState.current_turn = buildTurnSummary(userTurn);
+      data.campaignState.active_turn = userTurn;
+      const mediaBatch = userTurn.media_batch;
+      data.campaignState.media_batch_summary = buildMediaBatchSummary(mediaBatch);
+
+      console.log("TURN_BUFFER_READY:", JSON.stringify({
+        doName: data.doName,
+        turnId: userTurn.turn_id,
+        messageCount: messages.length,
+        contextPolicy: userTurn.context_policy
+      }));
+      console.log("TURN_INPUT_TYPES:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, inputTypes: userTurn.input_types }));
+      console.log("TURN_TEXT_COUNT:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, count: userTurn.text_count }));
+      console.log("TURN_AUDIO_COUNT:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, count: userTurn.audio_count }));
+      console.log("TURN_IMAGE_COUNT:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, count: userTurn.image_count }));
+      console.log("TURN_VIDEO_COUNT:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, count: userTurn.video_count }));
+      console.log("TURN_FILE_COUNT:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, count: userTurn.file_count }));
+      console.log("TURN_CAPTIONS_FOUND:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, captions: userTurn.captions }));
+      console.log("TURN_CONTEXT_POLICY:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, policy: userTurn.context_policy }));
+      if (userTurn.context_policy !== "use_previous_context") {
+        console.log("TURN_CONTEXT_RESET_REASON:", JSON.stringify({
+          doName: data.doName,
+          turnId: userTurn.turn_id,
+          reason: userTurn.context_policy
+        }));
+      }
+
+      if (mediaBatch.assets.length) {
+        console.log("MEDIA_BATCH_CREATED:", JSON.stringify({
+          doName: data.doName,
+          messageCount: messages.length,
+          assetCount: mediaBatch.assets.length,
+          fileIds: mediaBatch.fileIds,
+          analyzedAssetCount: mediaBatch.analyzedAssetCount,
+          failedAssetCount: mediaBatch.failedAssetCount,
+          workflow_status: data.campaignState.workflow_status,
+          campaign_type: data.campaignState.campaign_type,
+          usedFallback: false
+        }));
+        console.log("MEDIA_BATCH_ASSET_COUNT:", JSON.stringify({
+          doName: data.doName,
+          assetCount: mediaBatch.assets.length,
+          analyzedAssetCount: mediaBatch.analyzedAssetCount,
+          failedAssetCount: mediaBatch.failedAssetCount
+        }));
+        console.log("MEDIA_BATCH_FILE_IDS:", JSON.stringify({
+          doName: data.doName,
+          fileIds: mediaBatch.fileIds
+        }));
+      }
+
+      if (shouldSendAudioOnlyFallback(userTurn)) {
+        await sendWoztellTextMessage(this.env, {
+          channelId: data.channel,
+          recipientId: data.phone,
+          text: USER_MESSAGES.audioFailed
+        });
+
+        console.log("AUDIO_BATCH_TRANSCRIPTION_DONE:", JSON.stringify({
+          doName: data.doName,
+          turnId: userTurn.turn_id,
+          audioCount: userTurn.audio_batch.count,
+          transcribedCount: userTurn.audio_batch.transcribedCount,
+          failedCount: userTurn.audio_batch.failedCount
+        }));
+      } else if (shouldAskHowToUseCollectedAssets(data, messages)) {
         const assetCount = data.campaignState.campaign_assets.length;
         const text = USER_MESSAGES.assetsCollected.replace("{count}", String(assetCount));
 
@@ -691,18 +920,20 @@ export class ConversationCoordinator {
           assetCount: assetCount
         }));
       } else {
-      const plan = await callClaudeOrchestratorPlan(this.env, {
+      const plan = await callOrchestratorPlan(this.env, {
         doName: data.doName,
         channel: data.channel,
         phone: data.phone,
         messages: messages,
         clientProfile: data.clientProfile,
         campaignState: data.campaignState
+        ,
+        userTurn: userTurn
       });
 
       console.log("ORCHESTRATOR_PLAN:", JSON.stringify(plan));
 
-      data = await this.executePlan(data, messages, plan);
+      data = await this.executePlan(data, messages, plan, userTurn);
       }
 
       for (const msg of messages) {
@@ -778,9 +1009,10 @@ export class ConversationCoordinator {
     }
   }
 
-  async executePlan(data, messages, plan) {
+  async executePlan(data, messages, plan, userTurn) {
     const woztellPayload = buildWoztellPayloadFromData(data, messages);
     const actions = Array.isArray(plan.actions) ? plan.actions : [];
+    const mediaBatch = userTurn && userTurn.media_batch || buildMediaBatch(data.campaignState, messages, { turnId: data.currentTurnId || "" });
     let copyText = "";
     let ackSent = false;
     let draftSaved = false;
@@ -793,13 +1025,21 @@ export class ConversationCoordinator {
     const shouldAnalyzeUploadedImage = actions.some(function (action) {
       return action.type === "analyze_uploaded_image";
     }) || messages.some(function (message) {
-      return Boolean(message.fileId) && ["IMAGE", "VIDEO"].includes(message.type || "");
+      return Boolean(message.fileId) && ["IMAGE"].includes(message.type || "");
     });
 
     if (shouldAnalyzeUploadedImage) {
-      const uploadedImage = getLastUploadedImage(data.campaignState);
+      const uploadedMediaBatch = userTurn && userTurn.media_batch || getUploadedMediaBatch(data.campaignState, messages, { turnId: data.currentTurnId || "" });
+      const imageAnalysisBatch = Object.assign({}, uploadedMediaBatch, {
+        assets: (uploadedMediaBatch.assets || []).filter(function (asset) {
+          return String(asset.media_type || "IMAGE").toUpperCase() === "IMAGE";
+        })
+      });
 
-      if (!uploadedImage.fileId && !uploadedImage.url) {
+      if (!imageAnalysisBatch.assets.length) {
+        if ((uploadedMediaBatch.assets || []).length) {
+          console.log("MEDIA_BATCH_ANALYSIS_DONE:", JSON.stringify(buildMediaLogPayload(data, messages, buildMediaBatchSummary(uploadedMediaBatch), false)));
+        } else {
         console.log("IMAGE_SOURCE_MISSING:", JSON.stringify({
           reason: "analyze_uploaded_image_without_uploaded_image",
           campaignId: data.campaignState.campaign_id
@@ -812,28 +1052,37 @@ export class ConversationCoordinator {
         });
 
         return data;
+        }
+      } else {
+
+      const analysisResult = await analyzeMediaBatch(this.env, {
+        doName: data.doName,
+        campaignState: data.campaignState,
+        mediaBatch: imageAnalysisBatch,
+        caption: consolidatedMessagesText(messages),
+        woztellPayload: woztellPayload
+      });
+
+      data.campaignState = updateCampaignAssetsWithAnalysis(data.campaignState, analysisResult.assets);
+      data.campaignState.media_batch_summary = analysisResult.summary;
+      data.campaignState.uploaded_image_analysis = analysisResult.summary;
+      data.campaignState.current_asset_source = "uploaded_image";
+
+      const firstAnalyzed = analysisResult.assets.find(function (asset) {
+        return asset.analysis && asset.status === "analyzed";
+      });
+
+      if (firstAnalyzed && firstAnalyzed.analysis) {
+        data.campaignState.product = data.campaignState.product || firstAnalyzed.analysis.product_type || firstAnalyzed.analysis.main_subject || "";
+        data.campaignState.campaign_summary = data.campaignState.campaign_summary || firstAnalyzed.analysis.marketing_notes || firstAnalyzed.analysis.recommended_angle || analysisResult.summary.summary || "";
       }
 
-      try {
-        const analysis = await analyzeUploadedImageWithOpenAI(this.env, {
-          uploadedImage: uploadedImage,
-          caption: consolidatedMessagesText(messages),
-          woztellPayload: woztellPayload
-        });
+      if (analysisResult.summary.failed_asset_count && analysisResult.summary.analyzed_asset_count) {
+        console.log("MEDIA_BATCH_PARTIAL_FAILURE:", JSON.stringify(buildMediaLogPayload(data, messages, analysisResult.summary, true)));
+      }
 
-        data.campaignState.uploaded_image_analysis = analysis;
-        data.campaignState.current_asset_source = "uploaded_image";
-        data.campaignState.product = data.campaignState.product || analysis.product_type || analysis.main_subject || "";
-        data.campaignState.campaign_summary = data.campaignState.campaign_summary || analysis.marketing_notes || analysis.recommended_angle || "";
-
-        console.log("IMAGE_ANALYSIS_RESULT:", JSON.stringify(analysis));
-        console.log("CURRENT_ASSET_SOURCE:", data.campaignState.current_asset_source);
-      } catch (error) {
-        console.error("IMAGE_ANALYSIS_ERROR:", JSON.stringify({
-          message: String(error.message || error),
-          stack: String(error.stack || "")
-        }));
-
+      if (!analysisResult.summary.analyzed_asset_count) {
+        console.log("MEDIA_BATCH_ALL_FAILED:", JSON.stringify(buildMediaLogPayload(data, messages, analysisResult.summary, true)));
         await sendWoztellTextMessage(this.env, {
           channelId: data.channel,
           recipientId: data.phone,
@@ -841,6 +1090,11 @@ export class ConversationCoordinator {
         });
 
         return data;
+      }
+
+      console.log("MEDIA_BATCH_ANALYSIS_DONE:", JSON.stringify(buildMediaLogPayload(data, messages, analysisResult.summary, false)));
+      console.log("IMAGE_ANALYSIS_RESULT:", JSON.stringify(analysisResult.summary));
+      console.log("CURRENT_ASSET_SOURCE:", data.campaignState.current_asset_source);
       }
     }
 
@@ -1536,6 +1790,37 @@ function isAudioEmptyError(error) {
   return String(error && error.message || error).includes("AUDIO_TRANSCRIPTION_EMPTY");
 }
 
+async function callOrchestratorPlan(env, params) {
+  const provider = String(env.ORCHESTRATOR_PROVIDER || "claude").toLowerCase();
+
+  console.log("ORCHESTRATOR_PROVIDER_SELECTED:", JSON.stringify({
+    provider: provider,
+    model: env.ORCHESTRATOR_MODEL || "",
+    doName: params.doName || ""
+  }));
+
+  if (provider === "openai") {
+    return await openaiOrchestratorProvider(env, params);
+  }
+
+  return await claudeOrchestratorProvider(env, params);
+}
+
+async function claudeOrchestratorProvider(env, params) {
+  return await callClaudeOrchestratorPlan(env, params);
+}
+
+async function openaiOrchestratorProvider(env, params) {
+  console.log("ORCHESTRATOR_PROVIDER_OPENAI_STUB:", JSON.stringify({
+    reason: "openai_provider_not_enabled_for_production_flow",
+    doName: params.doName || ""
+  }));
+
+  return await callClaudeOrchestratorPlan(Object.assign({}, env, {
+    ORCHESTRATOR_PROVIDER: "claude"
+  }), params);
+}
+
 async function callClaudeOrchestratorPlan(env, params) {
   if (!env.ANTHROPIC_API_KEY) {
     throw new Error("Missing ANTHROPIC_API_KEY");
@@ -1546,41 +1831,78 @@ async function callClaudeOrchestratorPlan(env, params) {
   }
 
   const sessionId = await createClaudeOrchestratorSession(env);
+  const userTurn = params.userTurn || buildUserTurn(params.messages || [], params.campaignState || {});
+  const mediaBatch = userTurn.media_batch || buildMediaBatch(params.campaignState || {}, params.messages || []);
+  const mediaBatchSummary = userTurn.media_batch_summary || buildMediaBatchSummary(mediaBatch);
+  const compactInput = buildOrchestratorInput({
+    messages: params.messages || [],
+    campaignState: params.campaignState || {},
+    userTurn: userTurn
+  });
+  const orchestratorInputSummary = buildOrchestratorInputSummary({
+    messages: params.messages || [],
+    campaignState: params.campaignState || {},
+    mediaBatch: mediaBatch,
+    mediaBatchSummary: mediaBatchSummary
+  });
+
+  console.log("ORCHESTRATOR_INPUT_SUMMARY:", JSON.stringify({
+    doName: params.doName || "",
+    messageCount: orchestratorInputSummary.message_count,
+    assetCount: orchestratorInputSummary.asset_count,
+    fileIds: orchestratorInputSummary.file_ids,
+    analyzedAssetCount: orchestratorInputSummary.analyzed_asset_count,
+    failedAssetCount: orchestratorInputSummary.failed_asset_count,
+    workflow_status: orchestratorInputSummary.workflow_status,
+    campaign_type: orchestratorInputSummary.campaign_type,
+    usedFallback: false
+  }));
+  console.log("ORCHESTRATOR_INPUT_COMPACTED:", JSON.stringify({
+    doName: params.doName || "",
+    turnId: userTurn.turn_id,
+    keys: Object.keys(compactInput),
+    currentTurnTextLength: compactInput.current_turn_text.length,
+    previousStateMode: compactInput.relevant_previous_state && compactInput.relevant_previous_state.note ? "omitted" : "included"
+  }));
+
   const payload = {
     instruction: "Return valid JSON only. Do not answer the user directly.",
     plan_schema: ORCHESTRATOR_PLAN_SCHEMA,
-    available_actions: [
-      "generate_copy",
-      "generate_image",
-      "edit_image",
-      "analyze_uploaded_image",
-      "save_draft_to_sheets",
-      "create_content_calendar",
-      "generate_bulk_posts",
-      "approve_draft",
-      "mark_ready_to_publish",
-      "request_changes",
-      "ask_clarification"
-    ],
-    consolidated_messages: params.messages,
+    available_actions: getAllowedOrchestratorActions(),
+    orchestrator_input: compactInput,
+    current_turn_summary: compactInput.current_turn_summary,
+    current_turn_text: compactInput.current_turn_text,
     client_profile: params.clientProfile || {},
-    campaign_state: params.campaignState || {},
+    campaign_state: compactInput.campaign_state_brief,
+    relevant_previous_state: compactInput.relevant_previous_state,
+    campaign_assets: mediaBatch.assets,
+    media_batch_summary: mediaBatchSummary,
+    uploaded_image_analysis: mediaBatchSummary,
+    current_asset_source: compactInput.campaign_state_brief.current_asset_source || "",
+    asset_count: mediaBatch.assets.length,
+    analyzed_asset_count: mediaBatch.analyzedAssetCount,
+    failed_asset_count: mediaBatch.failedAssetCount,
+    orchestrator_input_summary: orchestratorInputSummary,
     conversation_state: {
       client_profile: params.clientProfile || {},
-      campaign_state: params.campaignState || {}
+      campaign_state: compactInput.campaign_state_brief
     },
-    lastCopy: params.campaignState && params.campaignState.last_copy || "",
-    lastImageUrl: params.campaignState && params.campaignState.last_image_url || "",
+    lastCopy: compactInput.relevant_previous_state.last_copy || "",
+    lastImageUrl: compactInput.relevant_previous_state.last_image_url || "",
     lastUploadedImage: params.campaignState && params.campaignState.last_uploaded_image || null,
-    uploadedImageAnalysis: params.campaignState && params.campaignState.uploaded_image_analysis || null,
+    uploadedImageAnalysis: params.campaignState && params.campaignState.uploaded_image_analysis || mediaBatchSummary,
     currentAssetSource: params.campaignState && params.campaignState.current_asset_source || "",
     uploaded_image_rules: [
       "Claude is the orchestrator only. Claude must not analyze image pixels directly.",
-      "If campaign_state.last_uploaded_image exists, prefer uploaded_image as active source unless the user explicitly asks for last_generated_image.",
-      "If the user asks for copy based on the uploaded image, actions must include analyze_uploaded_image before generate_copy.",
-      "If the user asks to design/edit using the uploaded image, actions must include analyze_uploaded_image before edit_image and edit_image.source must be uploaded_image.",
-      "If the user asks for both copy and design with the uploaded image, include analyze_uploaded_image, edit_image with source uploaded_image, and generate_copy.",
+      "Media is always an array. Use campaign_assets and media_batch_summary as the source of truth for uploaded images.",
+      "last_uploaded_image exists only for compatibility and may represent the latest item, not the full visual context.",
+      "If asset_count is greater than 1, treat uploaded images as a batch and reason from media_batch_summary.",
+      "If the user asks for copy based on uploaded image assets, actions must include analyze_uploaded_image before generate_copy.",
+      "If the user asks to design/edit using uploaded image assets, actions must include analyze_uploaded_image before edit_image and edit_image.source must be uploaded_image.",
+      "If the user asks for both copy and design with uploaded image assets, include analyze_uploaded_image, edit_image with source uploaded_image, and generate_copy.",
       "If the user uploaded an image without clear instructions, ask: ¿Quieres que use esta imagen solo como base para el copy, o también quieres que la convierta en un diseño para Instagram?",
+      "If the user uploaded multiple images without clear instructions, ask if they should be used for posts, a calendar, or visual reference.",
+      "If the user gives a clear instruction with multiple images, use campaign_type bulk_from_assets and choose create_content_calendar or generate_bulk_posts as appropriate.",
       "Use last_generated_image only when the user asks to edit the latest generated image or make another version of the image the assistant created."
     ],
     draft_rules: [
@@ -1614,8 +1936,14 @@ async function callClaudeOrchestratorPlan(env, params) {
 
   console.log("ORCHESTRATOR_RAW_TEXT:", String(text || "").slice(0, 3000));
 
-  const plan = parseJsonFromText(text);
-  return normalizePlan(plan);
+  const plan = normalizePlan(parseJsonFromText(text));
+
+  console.log("ORCHESTRATOR_ACTIONS_SELECTED:", JSON.stringify({
+    doName: params.doName || "",
+    actions: mapOrchestratorActions(plan).map(function (action) { return action.type; })
+  }));
+
+  return plan;
 }
 
 const ORCHESTRATOR_PLAN_SCHEMA = {
@@ -2729,9 +3057,12 @@ async function enqueueAudioJob(env, ctx, job) {
       fileId: queueJob.fileId || ""
     }));
 
-    await sendAudioUserFallback(env, {
-      channel: queueJob.channel || queueJob.woztellPayload && queueJob.woztellPayload.channel || "",
-      from: queueJob.phone || queueJob.woztellPayload && queueJob.woztellPayload.from || ""
+    await notifyConversationDO(env, queueJob.doName || buildConversationName(queueJob.woztellPayload || {}), {
+      type: "audio_failed",
+      messageId: queueJob.messageId || "",
+      fileId: queueJob.fileId || "",
+      error: String(error.message || error),
+      failedAt: new Date().toISOString()
     });
   }));
 
@@ -2744,6 +3075,11 @@ async function enqueueAudioJob(env, ctx, job) {
 }
 
 async function processAudioQueueJob(env, job) {
+  console.log("AUDIO_JOB_RECEIVED:", JSON.stringify({
+    doName: job.doName || "",
+    messageId: job.messageId || "",
+    fileId: job.fileId || ""
+  }));
   console.log("AUDIO_PIPELINE_START:", JSON.stringify({
     doName: job.doName || "",
     messageId: job.messageId || "",
@@ -2801,27 +3137,24 @@ async function processAudioQueueJob(env, job) {
       textPreview: text.slice(0, 500)
     }));
 
-    await sendParsedMessageToConversationDO(env, {
-      doName: job.doName || buildConversationName(woztellPayload),
-      payload: Object.assign({}, woztellPayload, {
-        channel: woztellPayload.channel || job.channel || "",
-        from: woztellPayload.from || job.phone || "",
-        messageId: woztellPayload.messageId || job.messageId || ""
-      }),
-      parsedMessage: Object.assign({}, parsedMessage, {
-        type: "TEXT",
-        text: text,
-        messageId: job.messageId || parsedMessage.messageId || woztellPayload.messageId || "",
-        originalType: parsedMessage.type || "AUDIO",
-        originalFileId: job.fileId,
-        fileId: ""
-      })
+    await notifyConversationDO(env, job.doName || buildConversationName(woztellPayload), {
+      type: "audio_transcribed",
+      messageId: job.messageId || parsedMessage.messageId || woztellPayload.messageId || "",
+      transcript: transcript,
+      transcribedAt: new Date().toISOString()
     });
 
     console.log("AUDIO_PIPELINE_DONE:", JSON.stringify({
       doName: job.doName || "",
       messageId: job.messageId || "",
       transcriptLength: transcript.length
+    }));
+    console.log("AUDIO_BATCH_TRANSCRIPTION_DONE:", JSON.stringify({
+      doName: job.doName || "",
+      messageId: job.messageId || "",
+      audioCount: 1,
+      transcribedCount: 1,
+      failedCount: 0
     }));
   } catch (error) {
     console.error("AUDIO_PIPELINE_FAILED:", JSON.stringify({
@@ -2831,6 +3164,14 @@ async function processAudioQueueJob(env, job) {
       messageId: job.messageId || "",
       fileId: job.fileId || ""
     }));
+
+    await notifyConversationDO(env, job.doName || buildConversationName(job.woztellPayload || {}), {
+      type: "audio_failed",
+      messageId: job.messageId || "",
+      fileId: job.fileId || "",
+      error: String(error.message || error),
+      failedAt: new Date().toISOString()
+    });
 
     throw error;
   }
@@ -2914,6 +3255,10 @@ async function transcribeAudioBytesWithRetries(env, bytes, metadata, maxAttempts
     }
   }
 
+  console.log("AUDIO_TRANSCRIPTION_FAILED:", JSON.stringify({
+    attempts: attempts,
+    message: String(lastError && lastError.message || lastError || "AUDIO_TRANSCRIPTION_FAILED")
+  }));
   throw lastError || new Error("AUDIO_TRANSCRIPTION_FAILED");
 }
 
@@ -2961,6 +3306,10 @@ async function transcribeAudioBytesOnce(env, bytes, metadata, attempt) {
   console.log("AUDIO_TRANSCRIPTION_RESULT:", JSON.stringify({
     attempt: attempt || 1,
     textPreview: transcript.slice(0, 500),
+    length: transcript.length
+  }));
+  console.log("AUDIO_TRANSCRIPTION_OK:", JSON.stringify({
+    attempt: attempt || 1,
     length: transcript.length
   }));
 
@@ -3422,6 +3771,15 @@ async function sendWoztellResponse(env, params) {
     }));
   }
 
+  console.log("USER_RESPONSE_SENT:", JSON.stringify({
+    channelId: params.channelId || "",
+    recipientId: params.recipientId || "",
+    responseCount: Array.isArray(params.response) ? params.response.length : 0,
+    responseTypes: (Array.isArray(params.response) ? params.response : []).map(function (item) {
+      return item.type || "";
+    })
+  }));
+
   return parsed;
 }
 
@@ -3457,6 +3815,7 @@ function normalizeCoordinatorData(data) {
     channel: String(clean.channel || ""),
     phone: String(clean.phone || ""),
     pendingMessages: Array.isArray(clean.pendingMessages) ? clean.pendingMessages : [],
+    currentTurnId: String(clean.currentTurnId || ""),
     processedMessageIds: Array.isArray(clean.processedMessageIds) ? clean.processedMessageIds.slice(-80) : [],
     firstMessageAt: Number(clean.firstMessageAt || 0),
     lastMessageAt: Number(clean.lastMessageAt || 0),
@@ -3495,6 +3854,9 @@ function createEmptyCampaignState(reason) {
     expected_next_target: "unknown",
     collecting_assets: false,
     campaign_assets: [],
+    media_batch_summary: null,
+    current_turn: null,
+    active_turn: null,
     content_calendar: [],
     bulk_posts: [],
     last_copy: "",
@@ -3531,6 +3893,9 @@ function normalizeCampaignState(state) {
     expected_next_target: String(clean.expected_next_target || clean.expectedNextTarget || "unknown"),
     collecting_assets: Boolean(clean.collecting_assets || clean.collectingAssets || false),
     campaign_assets: normalizeCampaignAssets(clean.campaign_assets || clean.campaignAssets || []),
+    media_batch_summary: clean.media_batch_summary || clean.mediaBatchSummary || null,
+    current_turn: clean.current_turn || clean.currentTurn || null,
+    active_turn: clean.active_turn || clean.activeTurn || null,
     content_calendar: normalizeContentCalendar(clean.content_calendar || clean.contentCalendar || []),
     bulk_posts: normalizeBulkPosts(clean.bulk_posts || clean.bulkPosts || []),
     last_copy: String(clean.last_copy || clean.lastCopy || ""),
@@ -3567,6 +3932,9 @@ function normalizeCampaignStateUpdates(updates) {
     normalized.collecting_assets = Boolean(clean.collecting_assets || clean.collectingAssets);
   }
   if (Array.isArray(clean.campaign_assets || clean.campaignAssets)) normalized.campaign_assets = normalizeCampaignAssets(clean.campaign_assets || clean.campaignAssets);
+  if (clean.media_batch_summary || clean.mediaBatchSummary) normalized.media_batch_summary = clean.media_batch_summary || clean.mediaBatchSummary;
+  if (clean.current_turn || clean.currentTurn) normalized.current_turn = clean.current_turn || clean.currentTurn;
+  if (clean.active_turn || clean.activeTurn) normalized.active_turn = clean.active_turn || clean.activeTurn;
   if (Array.isArray(clean.content_calendar || clean.contentCalendar)) normalized.content_calendar = normalizeContentCalendar(clean.content_calendar || clean.contentCalendar);
   if (Array.isArray(clean.bulk_posts || clean.bulkPosts)) normalized.bulk_posts = normalizeBulkPosts(clean.bulk_posts || clean.bulkPosts);
   if (clean.campaign_summary || clean.campaignSummary) normalized.campaign_summary = String(clean.campaign_summary || clean.campaignSummary);
@@ -3599,9 +3967,15 @@ function normalizeCampaignAssets(assets) {
   return (Array.isArray(assets) ? assets : []).map(function (asset, index) {
     return {
       asset_id: String(asset.asset_id || asset.assetId || "asset_" + (index + 1)),
+      asset_index: Number(asset.asset_index || asset.assetIndex || index + 1),
       file_id: String(asset.file_id || asset.fileId || ""),
       url: String(asset.url || ""),
+      media_type: String(asset.media_type || asset.mediaType || "IMAGE"),
+      mime_type: String(asset.mime_type || asset.mimeType || ""),
+      turn_id: String(asset.turn_id || asset.turnId || ""),
+      request_id: String(asset.request_id || asset.requestId || asset.turn_id || asset.turnId || ""),
       analysis: asset.analysis || null,
+      analysis_error: String(asset.analysis_error || asset.analysisError || ""),
       received_at: String(asset.received_at || asset.receivedAt || new Date().toISOString()),
       status: String(asset.status || "received")
     };
@@ -3658,14 +4032,24 @@ function addCampaignAsset(assets, asset) {
   if (existing) {
     existing.url = existing.url || url;
     existing.status = existing.status || "received";
+    existing.turn_id = existing.turn_id || String(asset.turn_id || asset.turnId || "");
+    existing.request_id = existing.request_id || String(asset.request_id || asset.requestId || asset.turn_id || asset.turnId || "");
+    existing.media_type = existing.media_type || String(asset.media_type || asset.mediaType || "IMAGE");
+    existing.mime_type = existing.mime_type || String(asset.mime_type || asset.mimeType || "");
     return list;
   }
 
   list.push({
     asset_id: "asset_" + (list.length + 1),
+    asset_index: list.length + 1,
     file_id: fileId,
     url: url,
+    media_type: String(asset.media_type || asset.mediaType || "IMAGE"),
+    mime_type: String(asset.mime_type || asset.mimeType || ""),
+    turn_id: String(asset.turn_id || asset.turnId || ""),
+    request_id: String(asset.request_id || asset.requestId || asset.turn_id || asset.turnId || ""),
     analysis: asset.analysis || null,
+    analysis_error: String(asset.analysis_error || asset.analysisError || ""),
     received_at: String(asset.received_at || new Date().toISOString()),
     status: String(asset.status || "received")
   });
@@ -4309,6 +4693,595 @@ function getLastUploadedImage(state) {
   return state && (state.last_uploaded_image || state.lastUploadedImage) || {};
 }
 
+function normalizeIncomingMessage(parsedMessage, woztellPayload, options) {
+  const parsed = parsedMessage || {};
+  const payload = woztellPayload || {};
+  const type = String(parsed.type || "TEXT").toUpperCase();
+  const fileId = String(parsed.fileId || "");
+  const media = extractMediaFromPayload(parsed, payload);
+  const audio = isAudioMessage(parsed) && fileId ? [{
+    type: type,
+    fileId: fileId,
+    mimeType: String(parsed.mimeType || ""),
+    fileName: String(parsed.fileName || ""),
+    status: parsed.audioStatus || "pending_transcription"
+  }] : [];
+  const video = buildVideoMetadata(parsed, payload);
+  const files = buildFileMetadata(parsed, payload);
+
+  const fallbackText = fileId && !isAudioMessage(parsed)
+    ? "[" + type + " uploaded without caption]"
+    : isAudioMessage(parsed) ? "[AUDIO pending transcription]" : "";
+
+  return {
+    messageId: String(options && options.messageId || parsed.messageId || payload.messageId || randomId(12)),
+    type: type,
+    text: String(parsed.text || fallbackText).trim(),
+    fileId: fileId,
+    media: media,
+    audio: audio,
+    video: video,
+    files: files,
+    captions: collectCaptions(parsed, payload),
+    mimeType: String(parsed.mimeType || ""),
+    fileName: String(parsed.fileName || ""),
+    originalType: parsed.originalType || "",
+    originalFileId: parsed.originalFileId || "",
+    audioStatus: parsed.audioStatus || (audio.length ? "pending" : ""),
+    audioTranscript: parsed.audioTranscript || "",
+    awaitingTranscription: Boolean(audio.length && !parsed.audioTranscript && parsed.audioStatus !== "failed"),
+    app: String(payload.app || ""),
+    channel: String(payload.channel || ""),
+    from: String(payload.from || ""),
+    to: String(payload.to || ""),
+    receivedAt: String(options && options.receivedAt || new Date().toISOString())
+  };
+}
+
+function extractMediaFromPayload(parsedMessage, woztellPayload) {
+  const parsed = parsedMessage || {};
+  const payload = woztellPayload || {};
+  const data = payload.data || {};
+  const type = String(parsed.type || payload.type || data.type || "TEXT").toUpperCase();
+  const candidates = [];
+  const rawMedia = []
+    .concat(Array.isArray(parsed.media) ? parsed.media : [])
+    .concat(Array.isArray(data.media) ? data.media : [])
+    .concat(Array.isArray(payload.media) ? payload.media : [])
+    .concat(Array.isArray(data.attachments) ? data.attachments : [])
+    .concat(Array.isArray(payload.attachments) ? payload.attachments : []);
+
+  if (parsed.fileId) {
+    rawMedia.unshift({
+      type: type,
+      fileId: parsed.fileId,
+      mimeType: parsed.mimeType || "",
+      fileName: parsed.fileName || ""
+    });
+  }
+
+  for (const item of rawMedia) {
+    const fileId = String(item.fileId || item.file_id || item.mediaId || item.id || "");
+    if (!fileId) continue;
+
+    const itemType = String(item.type || type || "FILE").toUpperCase();
+    const mimeType = String(item.mimeType || item.mime_type || item.contentType || "");
+    const normalizedType = mimeType.startsWith("image/") ? "IMAGE"
+      : mimeType.startsWith("video/") ? "VIDEO"
+      : mimeType.startsWith("audio/") ? "AUDIO"
+      : itemType;
+
+    if (["AUDIO", "VOICE", "PTT"].includes(normalizedType)) continue;
+
+    candidates.push({
+      type: ["IMAGE", "VIDEO", "FILE"].includes(normalizedType) ? normalizedType : "FILE",
+      fileId: fileId,
+      mimeType: mimeType,
+      fileName: String(item.fileName || item.file_name || item.name || ""),
+      caption: String(item.caption || item.text || "")
+    });
+  }
+
+  const seen = new Set();
+  return candidates.filter(function (item) {
+    if (seen.has(item.fileId)) return false;
+    seen.add(item.fileId);
+    return true;
+  });
+}
+
+function collectCaptions(parsedMessage, woztellPayload) {
+  const parsed = parsedMessage || {};
+  const payload = woztellPayload || {};
+  const data = payload.data || {};
+  const captions = []
+    .concat(parsed.caption || [])
+    .concat(payload.caption || [])
+    .concat(data.caption || [])
+    .concat((Array.isArray(parsed.media) ? parsed.media : []).map(function (item) { return item.caption || item.text || ""; }))
+    .concat((Array.isArray(data.media) ? data.media : []).map(function (item) { return item.caption || item.text || ""; }))
+    .map(function (value) { return String(value || "").trim(); })
+    .filter(Boolean);
+
+  if (parsed.text && captions.indexOf(String(parsed.text).trim()) === -1 && parsed.fileId) {
+    captions.unshift(String(parsed.text).trim());
+  }
+
+  return Array.from(new Set(captions));
+}
+
+function buildAudioBatch(messages) {
+  const audioItems = [];
+
+  for (const message of messages || []) {
+    for (const audio of message.audio || []) {
+      audioItems.push(Object.assign({}, audio, {
+        messageId: message.messageId,
+        transcript: message.audioTranscript || audio.transcript || "",
+        status: message.audioStatus || audio.status || "pending"
+      }));
+    }
+
+    if (!(message.audio || []).length && ((message.originalType || "").toUpperCase() === "AUDIO" || message.audioTranscript)) {
+      audioItems.push({
+        messageId: message.messageId,
+        fileId: message.originalFileId || message.fileId || "",
+        transcript: message.audioTranscript || String(message.text || "").replace(/^\[Audio transcrito\]:\s*/i, ""),
+        status: message.audioStatus || "transcribed"
+      });
+    }
+  }
+
+  return {
+    items: audioItems,
+    count: audioItems.length,
+    transcribedCount: audioItems.filter(function (item) { return item.status === "transcribed" && item.transcript; }).length,
+    failedCount: audioItems.filter(function (item) { return item.status === "failed"; }).length,
+    pendingCount: audioItems.filter(function (item) { return item.status === "pending" || item.status === "pending_transcription"; }).length,
+    transcripts: audioItems.map(function (item) { return item.transcript || ""; }).filter(Boolean)
+  };
+}
+
+function buildVideoMetadata(parsedMessage, woztellPayload) {
+  const parsed = parsedMessage || {};
+  const type = String(parsed.type || "").toUpperCase();
+
+  if (type !== "VIDEO") return [];
+
+  return [{
+    fileId: String(parsed.fileId || ""),
+    mimeType: String(parsed.mimeType || ""),
+    fileName: String(parsed.fileName || ""),
+    url: String(parsed.url || ""),
+    duration: parsed.duration || woztellPayload && woztellPayload.duration || "",
+    receivedAt: new Date().toISOString()
+  }].filter(function (item) {
+    return item.fileId || item.url;
+  });
+}
+
+function buildFileMetadata(parsedMessage, woztellPayload) {
+  const parsed = parsedMessage || {};
+  const type = String(parsed.type || "").toUpperCase();
+
+  if (type !== "FILE") return [];
+
+  return [{
+    fileId: String(parsed.fileId || ""),
+    mimeType: String(parsed.mimeType || ""),
+    fileName: String(parsed.fileName || ""),
+    url: String(parsed.url || ""),
+    receivedAt: new Date().toISOString()
+  }].filter(function (item) {
+    return item.fileId || item.url;
+  });
+}
+
+function shouldStartNewTurn(messages, previousState) {
+  const text = normalizeTextForIntent(consolidatedMessagesText(messages || []));
+
+  if (!text) return false;
+  if (text === "/reset") return true;
+  if (isNewCampaignRequest(text)) return true;
+
+  const hasNewMedia = (messages || []).some(function (message) {
+    return (message.media && message.media.length) || (message.video && message.video.length) || (message.files && message.files.length);
+  });
+
+  return Boolean(hasNewMedia && previousState && previousState.workflow_status && !shouldUsePreviousContext(messages));
+}
+
+function shouldUsePreviousContext(messages) {
+  const text = normalizeTextForIntent(consolidatedMessagesText(messages || []));
+
+  return [
+    "anterior",
+    "la anterior",
+    "el anterior",
+    "cambia el anterior",
+    "usa la imagen anterior",
+    "haz otra version",
+    "haz otra versión",
+    "segunda imagen",
+    "primera imagen",
+    "tercera imagen"
+  ].some(function (pattern) {
+    return text.includes(normalizeTextForIntent(pattern));
+  });
+}
+
+function buildUserTurn(messages, campaignState, options) {
+  const state = normalizeCampaignState(campaignState || {});
+  const turnId = options && options.turnId || "turn_" + Date.now() + "_" + randomId(6);
+  const mediaBatch = buildMediaBatch(state, messages || [], { turnId: turnId });
+  const audioBatch = buildAudioBatch(messages || []);
+  const captions = (messages || []).flatMap(function (message) {
+    return message.captions || [];
+  }).filter(Boolean);
+  const videos = (messages || []).flatMap(function (message) { return message.video || []; });
+  const files = (messages || []).flatMap(function (message) { return message.files || []; });
+  const textMessages = (messages || []).filter(function (message) {
+    return String(message.text || "").trim() && !String(message.text || "").startsWith("[IMAGE uploaded");
+  });
+  const contextPolicy = shouldUsePreviousContext(messages)
+    ? "use_previous_context"
+    : shouldStartNewTurn(messages, state) ? "new_request_from_current_turn" : "current_turn_only";
+
+  return {
+    turn_id: turnId,
+    request_id: turnId,
+    message_ids: (messages || []).map(function (message) { return message.messageId; }),
+    input_types: Array.from(new Set((messages || []).map(function (message) { return message.type || "TEXT"; }))),
+    messages: messages || [],
+    text_count: textMessages.length,
+    audio_count: audioBatch.count,
+    image_count: mediaBatch.assets.filter(function (asset) { return asset.media_type === "IMAGE"; }).length,
+    video_count: videos.length,
+    file_count: files.length,
+    captions: captions,
+    current_turn_text: consolidatedMessagesText(messages || []),
+    audio_transcripts: audioBatch.transcripts,
+    audio_batch: audioBatch,
+    media_batch: mediaBatch,
+    media_batch_summary: buildMediaBatchSummary(mediaBatch),
+    video_metadata: videos,
+    file_metadata: files,
+    context_policy: contextPolicy,
+    created_at: new Date().toISOString()
+  };
+}
+
+function buildTurnSummary(userTurn) {
+  const turn = userTurn || {};
+
+  return {
+    turn_id: turn.turn_id || "",
+    input_types: turn.input_types || [],
+    text_count: turn.text_count || 0,
+    audio_count: turn.audio_count || 0,
+    image_count: turn.image_count || 0,
+    video_count: turn.video_count || 0,
+    file_count: turn.file_count || 0,
+    captions: turn.captions || [],
+    context_policy: turn.context_policy || "current_turn_only",
+    text_preview: String(turn.current_turn_text || "").slice(0, 1200)
+  };
+}
+
+function shouldSendAudioOnlyFallback(userTurn) {
+  const turn = userTurn || {};
+  const audio = turn.audio_batch || {};
+  const hasUsefulText = String(turn.current_turn_text || "")
+    .split("\n")
+    .some(function (line) {
+      const clean = line.trim();
+      return clean &&
+        !clean.includes("[AUDIO pending transcription]") &&
+        !clean.includes("[AUDIO no transcrito]") &&
+        !clean.includes("[IMAGE uploaded without caption]");
+    });
+
+  return Boolean(
+    audio.count > 0 &&
+    audio.transcribedCount === 0 &&
+    audio.pendingCount === 0 &&
+    turn.image_count === 0 &&
+    turn.video_count === 0 &&
+    turn.file_count === 0 &&
+    !hasUsefulText
+  );
+}
+
+function compactConversationHistory(history) {
+  return (Array.isArray(history) ? history : []).slice(-6).map(function (item) {
+    return {
+      role: item.role || "",
+      type: item.type || "",
+      text: String(item.text || "").slice(0, 500),
+      at: item.at || ""
+    };
+  });
+}
+
+function buildRelevantPreviousState(campaignState, userTurn) {
+  const state = normalizeCampaignState(campaignState || {});
+
+  if (userTurn && userTurn.context_policy !== "use_previous_context") {
+    return {
+      workflow_status: state.workflow_status,
+      expected_next_target: state.expected_next_target,
+      note: "Previous campaign content intentionally omitted for current turn."
+    };
+  }
+
+  return {
+    campaign_id: state.campaign_id,
+    workflow_status: state.workflow_status,
+    expected_next_target: state.expected_next_target,
+    last_copy: state.last_copy ? state.last_copy.slice(0, 1200) : "",
+    last_image_url: state.last_image_url || "",
+    content_calendar_count: state.content_calendar.length,
+    bulk_posts_count: state.bulk_posts.length,
+    history: compactConversationHistory(state.history)
+  };
+}
+
+function buildOrchestratorInput(params) {
+  const userTurn = params.userTurn || buildUserTurn(params.messages || [], params.campaignState || {});
+  const state = normalizeCampaignState(params.campaignState || {});
+
+  return {
+    current_turn_summary: buildTurnSummary(userTurn),
+    current_turn_text: userTurn.current_turn_text || "",
+    media_batch_summary: userTurn.media_batch_summary || null,
+    audio_transcripts: userTurn.audio_transcripts || [],
+    video_metadata: userTurn.video_metadata || [],
+    file_metadata: userTurn.file_metadata || [],
+    relevant_previous_state: buildRelevantPreviousState(state, userTurn),
+    allowed_actions: getAllowedOrchestratorActions(),
+    campaign_state_brief: {
+      campaign_id: state.campaign_id,
+      campaign_type: state.campaign_type,
+      workflow_status: state.workflow_status,
+      expected_next_target: state.expected_next_target,
+      current_asset_source: state.current_asset_source || ""
+    }
+  };
+}
+
+function getAllowedOrchestratorActions() {
+  return [
+    "generate_copy",
+    "generate_image",
+    "edit_image",
+    "analyze_uploaded_image",
+    "save_draft_to_sheets",
+    "create_content_calendar",
+    "generate_bulk_posts",
+    "approve_draft",
+    "mark_ready_to_publish",
+    "request_changes",
+    "ask_clarification"
+  ];
+}
+
+function mapOrchestratorActions(plan) {
+  const allowed = new Set(getAllowedOrchestratorActions());
+  const actions = Array.isArray(plan && plan.actions) ? plan.actions : [];
+  return actions.filter(function (action) {
+    return allowed.has(action && action.type);
+  });
+}
+
+function buildMediaBatch(campaignState, messages, options) {
+  const state = normalizeCampaignState(campaignState || {});
+  const turnId = options && options.turnId || "";
+  const messageFileIds = new Set((messages || []).flatMap(function (message) {
+    const ids = [];
+    if (message.fileId) ids.push(String(message.fileId));
+    for (const item of message.media || []) {
+      if (item.fileId) ids.push(String(item.fileId));
+    }
+    return ids;
+  }));
+  let assets = normalizeCampaignAssets(state.campaign_assets);
+
+  if (messageFileIds.size) {
+    assets = assets.filter(function (asset) {
+      return messageFileIds.has(asset.file_id);
+    });
+  }
+
+  if (turnId) {
+    const turnAssets = assets.filter(function (asset) {
+      return asset.turn_id === turnId || asset.request_id === turnId;
+    });
+    if (turnAssets.length) assets = turnAssets;
+  }
+
+  if (!assets.length && state.last_uploaded_image) {
+    const last = getLastUploadedImage(state);
+    assets = normalizeCampaignAssets([{
+      asset_id: "asset_1",
+      file_id: last.fileId || "",
+      url: last.url || "",
+      media_type: last.type || "IMAGE",
+      mime_type: last.mimeType || "",
+      analysis: state.uploaded_image_analysis || null,
+      received_at: last.receivedAt || new Date().toISOString(),
+      status: state.uploaded_image_analysis ? "analyzed" : "received"
+    }]);
+  }
+
+  const fileIds = assets.map(function (asset) { return asset.file_id; }).filter(Boolean);
+  const analyzedAssetCount = assets.filter(function (asset) { return asset.status === "analyzed" && asset.analysis; }).length;
+  const failedAssetCount = assets.filter(function (asset) { return asset.status === "analysis_failed"; }).length;
+
+  return {
+    assets: assets,
+    fileIds: fileIds,
+    assetCount: assets.length,
+    analyzedAssetCount: analyzedAssetCount,
+    failedAssetCount: failedAssetCount
+  };
+}
+
+function getUploadedMediaBatch(campaignState, messages, options) {
+  return buildMediaBatch(campaignState, messages, options);
+}
+
+async function analyzeMediaBatch(env, params) {
+  const mediaBatch = params.mediaBatch || { assets: [] };
+  const analyzedAssets = [];
+
+  for (const asset of mediaBatch.assets) {
+    const assetForAnalysis = Object.assign({}, asset);
+
+    console.log("MEDIA_ASSET_ANALYSIS_START:", JSON.stringify({
+      doName: params.doName || "",
+      assetId: asset.asset_id,
+      fileId: asset.file_id,
+      assetCount: mediaBatch.assets.length
+    }));
+
+    try {
+      const analysis = await analyzeSingleMediaAsset(env, {
+        asset: asset,
+        caption: params.caption || "",
+        woztellPayload: params.woztellPayload || {}
+      });
+
+      assetForAnalysis.analysis = analysis;
+      assetForAnalysis.status = "analyzed";
+
+      console.log("MEDIA_ASSET_ANALYSIS_OK:", JSON.stringify({
+        doName: params.doName || "",
+        assetId: asset.asset_id,
+        fileId: asset.file_id,
+        confidence: analysis && analysis.confidence || 0
+      }));
+    } catch (error) {
+      assetForAnalysis.status = "analysis_failed";
+      assetForAnalysis.analysis_error = String(error.message || error);
+
+      console.log("MEDIA_ASSET_ANALYSIS_FAILED:", JSON.stringify({
+        doName: params.doName || "",
+        assetId: asset.asset_id,
+        fileId: asset.file_id,
+        message: String(error.message || error),
+        usedFallback: true
+      }));
+    }
+
+    analyzedAssets.push(assetForAnalysis);
+  }
+
+  const summary = buildMediaBatchSummary({ assets: analyzedAssets });
+
+  return {
+    assets: analyzedAssets,
+    summary: summary
+  };
+}
+
+async function analyzeSingleMediaAsset(env, params) {
+  const asset = params.asset || {};
+
+  return await analyzeUploadedImageWithOpenAI(env, {
+    uploadedImage: {
+      fileId: asset.file_id,
+      url: asset.url,
+      type: asset.media_type || "IMAGE",
+      mimeType: asset.mime_type || "",
+      app: params.woztellPayload && params.woztellPayload.app || ""
+    },
+    caption: params.caption || "",
+    woztellPayload: params.woztellPayload || {}
+  });
+}
+
+function updateCampaignAssetsWithAnalysis(campaignState, analyzedAssets) {
+  const state = normalizeCampaignState(campaignState || {});
+  const byId = new Map((analyzedAssets || []).map(function (asset) {
+    return [asset.asset_id, asset];
+  }));
+  const byFileId = new Map((analyzedAssets || []).filter(function (asset) {
+    return asset.file_id;
+  }).map(function (asset) {
+    return [asset.file_id, asset];
+  }));
+
+  state.campaign_assets = normalizeCampaignAssets(state.campaign_assets).map(function (asset) {
+    const patch = byId.get(asset.asset_id) || byFileId.get(asset.file_id);
+    return patch ? Object.assign({}, asset, patch) : asset;
+  });
+
+  state.media_batch_summary = buildMediaBatchSummary({ assets: state.campaign_assets });
+
+  return state;
+}
+
+function buildMediaBatchSummary(mediaBatch) {
+  const assets = normalizeCampaignAssets(mediaBatch && mediaBatch.assets || []);
+  const analyzed = assets.filter(function (asset) { return asset.status === "analyzed" && asset.analysis; });
+  const failed = assets.filter(function (asset) { return asset.status === "analysis_failed"; });
+  const subjects = analyzed.map(function (asset) {
+    return asset.analysis && (asset.analysis.product_type || asset.analysis.main_subject || asset.analysis.marketing_notes || "");
+  }).filter(Boolean);
+
+  return {
+    asset_count: assets.length,
+    analyzed_asset_count: analyzed.length,
+    failed_asset_count: failed.length,
+    file_ids: assets.map(function (asset) { return asset.file_id; }).filter(Boolean),
+    analyzed_asset_ids: analyzed.map(function (asset) { return asset.asset_id; }),
+    failed_asset_ids: failed.map(function (asset) { return asset.asset_id; }),
+    summary: subjects.length ? subjects.join(" | ").slice(0, 1200) : "",
+    assets: assets.map(function (asset) {
+      return {
+        asset_id: asset.asset_id,
+        file_id: asset.file_id,
+        status: asset.status,
+        url: asset.url,
+        analysis: asset.analysis
+      };
+    })
+  };
+}
+
+function buildOrchestratorInputSummary(params) {
+  const state = normalizeCampaignState(params.campaignState || {});
+  const batch = params.mediaBatch || buildMediaBatch(state, params.messages || []);
+  const summary = params.mediaBatchSummary || buildMediaBatchSummary(batch);
+
+  return {
+    message_count: (params.messages || []).length,
+    asset_count: summary.asset_count || batch.assets.length,
+    analyzed_asset_count: summary.analyzed_asset_count || 0,
+    failed_asset_count: summary.failed_asset_count || 0,
+    file_ids: summary.file_ids || batch.fileIds || [],
+    workflow_status: state.workflow_status,
+    campaign_type: state.campaign_type,
+    current_asset_source: state.current_asset_source || "",
+    has_uploaded_image_analysis: Boolean(state.uploaded_image_analysis),
+    consolidated_messages_preview: consolidatedMessagesText(params.messages || []).slice(0, 1000)
+  };
+}
+
+function buildMediaLogPayload(data, messages, summary, usedFallback) {
+  return {
+    doName: data.doName || "",
+    messageCount: (messages || []).length,
+    assetCount: summary.asset_count || 0,
+    fileIds: summary.file_ids || [],
+    analyzedAssetCount: summary.analyzed_asset_count || 0,
+    failedAssetCount: summary.failed_asset_count || 0,
+    workflow_status: data.campaignState && data.campaignState.workflow_status || "",
+    campaign_type: data.campaignState && data.campaignState.campaign_type || "",
+    usedFallback: Boolean(usedFallback)
+  };
+}
+
 function extractWoztellMessage(body) {
   const data = body.data || {};
   const type = body.type || data.type || "TEXT";
@@ -4529,6 +5502,13 @@ function getBufferTimingConfig(env) {
   };
 }
 
+function getAudioTurnWaitConfig(env) {
+  return {
+    maxAudioTurnWaitMs: getNumberEnv(env && env.AUDIO_TURN_WAIT_SECONDS, 75) * 1000,
+    retryWaitMs: getNumberEnv(env && env.AUDIO_TURN_RETRY_SECONDS, 3) * 1000
+  };
+}
+
 function sanitizeKeyPart(value) {
   return String(value || "unknown").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
 }
@@ -4549,6 +5529,27 @@ function sleep(ms) {
     setTimeout(resolve, ms);
   });
 }
+
+export {
+  extractWoztellMessage,
+  normalizeIncomingMessage,
+  extractMediaFromPayload,
+  addCampaignAsset,
+  getUploadedMediaBatch,
+  buildMediaBatch,
+  buildAudioBatch,
+  buildVideoMetadata,
+  shouldStartNewTurn,
+  shouldUsePreviousContext,
+  buildUserTurn,
+  buildTurnSummary,
+  buildOrchestratorInput,
+  compactConversationHistory,
+  mapOrchestratorActions,
+  analyzeMediaBatch,
+  buildMediaBatchSummary,
+  consolidatedMessagesText
+};
 
 
 

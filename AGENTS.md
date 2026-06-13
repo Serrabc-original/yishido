@@ -12,4 +12,13 @@
 - Multiple images must be processed as a batch.
 - If one image fails, the whole process must not fail.
 - Create tests or scripts before touching critical logic.
+- Do not delete existing functions without a clear reason.
+- Prefer incremental changes over rewrites.
+- Tests must cover multiple uploaded images.
+- campaign_assets is the source of truth for uploaded media batches.
+- last_uploaded_image is compatibility state only.
+- User Turn is the unit sent to the orchestrator.
+- Do not send full raw history to the orchestrator when compact state is enough.
+- Video and files are metadata-only unless explicit processing support is added.
 - Maintain compatibility with Woztell, OpenAI, Claude, and Cloudflare Workers.
+- Maintain compatibility with Google Sheets.

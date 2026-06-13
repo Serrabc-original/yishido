@@ -1,0 +1,24 @@
+[
+  {
+    "eventType": "INBOUND",
+    "type": "AUDIO",
+    "messageId": "msg_audio_1",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "fileId": "file_audio_1",
+    "mimeType": "audio/ogg"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "AUDIO",
+    "messageId": "msg_audio_2",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "fileId": "file_audio_2",
+    "mimeType": "audio/ogg"
+  }
+]

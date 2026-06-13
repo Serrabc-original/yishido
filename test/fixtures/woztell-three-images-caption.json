@@ -1,0 +1,35 @@
+[
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_img_cap_1",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "fileId": "file_image_1",
+    "caption": "primera"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_img_cap_2",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "fileId": "file_image_2",
+    "caption": "segunda"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_img_cap_3",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "fileId": "file_image_3",
+    "caption": "tercera"
+  }
+]

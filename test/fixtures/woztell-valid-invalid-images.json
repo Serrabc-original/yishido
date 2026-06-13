@@ -1,0 +1,22 @@
+[
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_valid_image",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "fileId": "file_image_valid"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "IMAGE",
+    "messageId": "msg_invalid_image",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "fileId": "invalid_file_id"
+  }
+]

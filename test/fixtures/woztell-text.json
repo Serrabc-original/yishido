@@ -1,0 +1,10 @@
+{
+  "eventType": "INBOUND",
+  "type": "TEXT",
+  "messageId": "msg_text_1",
+  "app": "app_test",
+  "channel": "channel_test",
+  "from": "user_test",
+  "to": "bot_test",
+  "text": "Hazme un post para Instagram sobre este producto"
+}

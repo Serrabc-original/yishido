@@ -1,0 +1,12 @@
+[
+  {
+    "eventType": "INBOUND",
+    "type": "TEXT",
+    "messageId": "msg_new_request",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "text": "Ahora necesito otro post para otro producto"
+  }
+]

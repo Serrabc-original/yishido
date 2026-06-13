@@ -1,0 +1,23 @@
+[
+  {
+    "eventType": "INBOUND",
+    "type": "AUDIO",
+    "messageId": "msg_invalid_audio",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "fileId": "invalid_audio_id",
+    "mimeType": "audio/ogg"
+  },
+  {
+    "eventType": "INBOUND",
+    "type": "TEXT",
+    "messageId": "msg_text_valid_after_audio",
+    "app": "app_test",
+    "channel": "channel_test",
+    "from": "user_test",
+    "to": "bot_test",
+    "text": "Si el audio falla, usa este texto"
+  }
+]

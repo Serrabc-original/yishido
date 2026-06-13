@@ -1,0 +1,11 @@
+{
+  "eventType": "INBOUND",
+  "type": "VIDEO",
+  "messageId": "msg_video_1",
+  "app": "app_test",
+  "channel": "channel_test",
+  "from": "user_test",
+  "to": "bot_test",
+  "fileId": "file_video_1",
+  "caption": "puedes usar este video como referencia"
+}

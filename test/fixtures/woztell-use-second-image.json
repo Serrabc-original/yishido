@@ -1,0 +1,10 @@
+{
+  "eventType": "INBOUND",
+  "type": "TEXT",
+  "messageId": "msg_second_image",
+  "app": "app_test",
+  "channel": "channel_test",
+  "from": "user_test",
+  "to": "bot_test",
+  "text": "No, usa la segunda imagen"
+}
