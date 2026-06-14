@@ -81,6 +81,15 @@ export function createConversationSupervisorPlan(input) {
   const previousRelevantMedia = currentTurn.previous_relevant_media || currentTurn.previousRelevantMedia || {};
   const hasPreviousRelevantMedia = Number(previousRelevantMedia.asset_count || previousRelevantMedia.image_count || 0) > 0;
   const hasText = Boolean(normalized);
+  const hasAudioText = Number(currentTurn.audio_count || currentTurn.counts && currentTurn.counts.audio || 0) > 0 && hasText;
+  const hasMultipleAudio = Number(currentTurn.audio_count || currentTurn.counts && currentTurn.counts.audio || 0) > 1;
+  const hasMultipleText = Number(currentTurn.text_count || currentTurn.counts && currentTurn.counts.text || 0) > 1;
+  const hasClearGeneralQuestion = hasText &&
+    isClearGeneralQuestion(normalized) &&
+    !isImageQuestionIntent(normalized) &&
+    !isPriceReviewIntent(normalized) &&
+    !isProductAdviceIntent(normalized) &&
+    !isOcrIntent(normalized);
   const isReminder = isReminderIntent(normalized);
   const isList = isListIntent(normalized);
   const isMarketing = isMarketingIntent(normalized);
@@ -124,7 +133,24 @@ export function createConversationSupervisorPlan(input) {
   const actions = [];
   const memoryUpdates = detectMemoryUpdates(currentText);
 
-  if (isReminder) {
+  if (hasClearGeneralQuestion) {
+    intent = "general";
+    activeTask = "general";
+    targetModules = ["general_llm"];
+    mediaScope = hasCurrentImages ? "current_only" : "none";
+    responseStrategy = "answer_now";
+    logEvent(hasAudioText ? "SUPERVISOR_AUDIO_TEXT_PRIORITIZED" : "SUPERVISOR_TEXT_INTENT_PRIORITIZED", {
+      imageCount: imageCount,
+      audioCount: currentTurn.audio_count || 0,
+      textCount: currentTurn.text_count || 0
+    });
+    if (hasCurrentImages) {
+      logEvent("SUPERVISOR_UNKNOWN_IMAGE_BLOCKED_BY_TEXT", {
+        imageCount: imageCount,
+        reason: "clear_general_question"
+      });
+    }
+  } else if (isReminder) {
     intent = "reminder";
     activeTask = "reminder";
     targetModules = ["reminders", "whatsapp_interactive"];
@@ -202,6 +228,25 @@ export function createConversationSupervisorPlan(input) {
     needsClarification = false;
     responseStrategy = "analyze_then_answer";
     clarificationQuestion = "";
+    if (intent === "unknown_image_request") {
+      logEvent("SUPERVISOR_UNKNOWN_IMAGE_ALLOWED", {
+        imageCount: imageCount,
+        reason: "image_without_clear_text"
+      });
+    }
+  }
+
+  if (hasMultipleAudio) {
+    logEvent("SUPERVISOR_MULTI_AUDIO_CONTEXT_USED", {
+      audioCount: currentTurn.audio_count || 0,
+      textLength: currentText.length
+    });
+  }
+  if (hasMultipleText) {
+    logEvent("SUPERVISOR_MULTI_TEXT_CONTEXT_USED", {
+      textCount: currentTurn.text_count || 0,
+      textLength: currentText.length
+    });
   }
 
   if (hasAwaitingMediaTask && hasCurrentImages && !isContextSwitch) {
@@ -467,6 +512,10 @@ function isProductAdviceIntent(text) {
 
 function isImageQuestionIntent(text) {
   return /\b(que tal|como lo ves|vale la pena|que ves|que aparece|analiza|revisa|opina|este producto|esta imagen|esta foto)\b/.test(text);
+}
+
+function isClearGeneralQuestion(text) {
+  return /\b(como funciona|como se hace|que es|por que|para que sirve|puedes explicar|explicame|cual es|cuanto es|ayudame a entender)\b/.test(text);
 }
 
 function isOcrIntent(text) {

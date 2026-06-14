@@ -26,6 +26,16 @@
 // - IMAGE_MESSAGE_WAIT_SECONDS = 8
 // - BUFFER_MAX_WAIT_SECONDS = 15
 import { captureError, createTraceId, logEvent } from "./logger.js";
+import { normalizeInboundEvent, normalizeEventType, shouldIgnoreInboundEvent } from "./conversation/inboundEventCollector.js";
+import {
+  appendPendingEvent,
+  getTurnAggregationTiming,
+  logFinalEventCounts,
+  logTurnReady,
+  logTurnTimerReset
+} from "./conversation/turnAggregator.js";
+import { attachUserTurnContract, buildCombinedUserText, cleanUserVisibleText } from "./conversation/userTurnBuilder.js";
+import { buildMediaBatchFromUserTurn } from "./conversation/mediaBatchBuilder.js";
 import { getCoreFeatureFlags, updateConversationMemory } from "./conversationMemory.js";
 import { routeCoreUtilityIntent } from "./coreUtilityRouter.js";
 import { createReminder, listReminders, selectReminderDeliveryPath } from "./modules/reminders/index.js";
@@ -51,7 +61,9 @@ import {
   splitConversationalText,
   validateSpecialistOutputAgainstIntent
 } from "./ai/finalResponseComposer.js";
+import { composeCustomerReply } from "./ai/customerReplyComposer.js";
 import {
+  getCustomerReplyModel,
   getFinalResponseModel,
   getImageGenerationModel,
   getRouterModel,
@@ -125,12 +137,20 @@ export default {
       });
     }
 
-    if (body.type && !["TEXT", "IMAGE", "VIDEO", "AUDIO", "VOICE", "PTT", "FILE"].includes(body.type)) {
-      console.log("WOZTELL_STATUS_EVENT_IGNORED:", body.type);
+    const preliminaryTraceId = createTraceId([
+      body.channel || "",
+      body.from || "",
+      body.messageId || ""
+    ]);
+    const inboundEvent = normalizeInboundEvent(body, { traceId: preliminaryTraceId });
+    const ignoreInbound = shouldIgnoreInboundEvent(inboundEvent, [], { traceId: preliminaryTraceId });
+
+    if (ignoreInbound.ignore) {
+      console.log("WOZTELL_STATUS_EVENT_IGNORED:", inboundEvent.rawType || inboundEvent.type);
       return jsonResponse({
         status: "ignored",
-        reason: "Unsupported Woztell event",
-        type: body.type
+        reason: ignoreInbound.reason,
+        type: inboundEvent.rawType || inboundEvent.type
       });
     }
 
@@ -503,6 +523,7 @@ export class ConversationCoordinator {
     const messageId = parsedMessage.messageId || woztellPayload.messageId || randomId(12);
     const now = Date.now();
     const incomingTraceId = body.traceId || "";
+    const inboundEvent = normalizeInboundEvent(woztellPayload, { traceId: incomingTraceId });
 
     data.doName = body.doName || data.doName || buildConversationName(woztellPayload);
     data.channel = woztellPayload.channel || data.channel || "";
@@ -529,10 +550,23 @@ export class ConversationCoordinator {
       hasLastImageUrl: Boolean(data.campaignState.last_image_url)
     }));
 
+    const seenMessageIds = new Set([].concat(data.processedMessageIds || []).concat((data.pendingMessages || []).map(function (msg) {
+      return msg.messageId;
+    })));
+    const ignoreInbound = shouldIgnoreInboundEvent(inboundEvent, seenMessageIds, { traceId: incomingTraceId });
+    if (ignoreInbound.ignore) {
+      return jsonResponse({ status: "ignored", reason: ignoreInbound.reason, messageId: messageId });
+    }
+
     if (data.processedMessageIds.includes(messageId) || data.pendingMessages.some(function (msg) {
       return msg.messageId === messageId;
     })) {
       console.log("DO_DUPLICATE_MESSAGE_IGNORED:", messageId);
+      logEvent("INBOUND_EVENT_DEDUPED", {
+        traceId: incomingTraceId,
+        messageId: messageId,
+        type: parsedMessage.type || ""
+      });
       return jsonResponse({ status: "duplicate_ignored", messageId: messageId });
     }
 
@@ -871,7 +905,7 @@ export class ConversationCoordinator {
     data.lastMessageAt = now;
     normalized.turnId = data.currentTurnId || "turn_" + now + "_" + randomId(6);
     normalized.traceId = data.currentTraceId || incomingTraceId || createTraceId([data.doName, normalized.turnId, messageId]);
-    data.pendingMessages.push(normalized);
+    data = appendPendingEvent(data, normalized, { traceId: normalized.traceId });
 
     if (normalized.video.length) {
       logEvent("VIDEO_RECEIVED", {
@@ -1082,6 +1116,13 @@ export class ConversationCoordinator {
 
     await this.saveData(data);
     await this.state.storage.setAlarm(data.processAfter);
+    logTurnTimerReset(data, {
+      traceId: normalized.traceId,
+      turnId: normalized.turnId,
+      reason: waitReason,
+      processAfter: data.processAfter,
+      processAfterIso: new Date(data.processAfter).toISOString()
+    });
 
     if (activeTaskForTiming && activeTaskForTiming.status === "awaiting_media") {
       logEvent("TASK_INTAKE_TIMER_RESET", {
@@ -1158,13 +1199,16 @@ export class ConversationCoordinator {
         updated = true;
         const transcript = String(body.transcript || "").trim();
         const audioStatus = body.type === "audio_transcribed" && transcript ? "transcribed" : "failed";
+        const cleanExistingText = cleanUserVisibleText(message.text || "");
         const text = transcript
-          ? ["[Audio transcrito]: " + transcript, message.text && !message.text.includes("[AUDIO") ? "[Texto adicional]: " + message.text : ""].filter(Boolean).join("\n")
-          : message.text || "[AUDIO no transcrito]";
+          ? [transcript, cleanExistingText && cleanExistingText !== transcript ? cleanExistingText : ""].filter(Boolean).join("\n")
+          : cleanExistingText;
 
         return Object.assign({}, message, {
-          type: transcript ? "TEXT" : message.type,
+          type: "AUDIO",
           text: text,
+          originalType: "AUDIO",
+          originalFileId: message.originalFileId || message.fileId || "",
           audio: (message.audio || []).map(function (audio) {
             return Object.assign({}, audio, {
               status: audioStatus,
@@ -1295,6 +1339,14 @@ export class ConversationCoordinator {
           waitAgeMs: audioWaitAgeMs,
           retryInMs: audioWait.retryWaitMs
         }));
+        logEvent("TURN_WAITING_AUDIO_TRANSCRIPT", {
+          traceId: data.currentTraceId || "",
+          turnId: data.currentTurnId || "",
+          doName: data.doName,
+          pendingAudioCount: pendingAudioMessages.length,
+          waitAgeMs: audioWaitAgeMs,
+          retryInMs: audioWait.retryWaitMs
+        });
 
         return;
       }
@@ -1316,6 +1368,13 @@ export class ConversationCoordinator {
         pendingAudioCount: pendingAudioMessages.length,
         waitAgeMs: audioWaitAgeMs
       }));
+      logEvent("TURN_AUDIO_TIMEOUT", {
+        traceId: data.currentTraceId || "",
+        turnId: data.currentTurnId || "",
+        doName: data.doName,
+        pendingAudioCount: pendingAudioMessages.length,
+        waitAgeMs: audioWaitAgeMs
+      });
     }
 
     const activeTaskBeforeProcessing = normalizeActiveTask(data.campaignState.active_task);
@@ -1383,6 +1442,10 @@ export class ConversationCoordinator {
         reason: taskDecision.reason,
         receivedMediaCount: activeTaskBeforeProcessing.receivedMediaCount
       });
+      logTurnReady(taskDecision.reason === "user_done" ? "user_done" : taskDecision.reason === "silence" ? "silence" : "max_wait", data, {
+        reason: taskDecision.reason,
+        receivedMediaCount: activeTaskBeforeProcessing.receivedMediaCount
+      });
       logEvent("MULTI_IMAGE_BATCH_READY", {
         traceId: data.currentTraceId || "",
         turnId: data.currentTurnId || "",
@@ -1424,6 +1487,7 @@ export class ConversationCoordinator {
         userTurn.current_turn_media = summarizeAssetsForContext(mediaRecount.mediaBatch.assets);
         userTurn.currentTurnMedia = userTurn.current_turn_media;
       }
+      logFinalEventCounts(userTurn, data);
       const coreFlags = getCoreFeatureFlags(this.env);
       activeLogContext = {
         traceId: userTurn.trace_id,
@@ -1620,7 +1684,7 @@ export class ConversationCoordinator {
           transcribedCount: userTurn.audio_batch.transcribedCount,
           failedCount: userTurn.audio_batch.failedCount
         }));
-      } else if (supervisorPlan.intent === "general" && composeGeneralTextAnswer(userTurn.current_turn_text || "")) {
+      } else if (supervisorPlan.intent === "general" && shouldUseLocalGeneralAnswer(userTurn.current_turn_text || "") && composeGeneralTextAnswer(userTurn.current_turn_text || "")) {
         const composed = composeFinalResponse({
           supervisorPlan: supervisorPlan,
           specialistResults: { text: composeGeneralTextAnswer(userTurn.current_turn_text || "") },
@@ -1635,6 +1699,9 @@ export class ConversationCoordinator {
           traceId: userTurn.trace_id,
           turnId: userTurn.turn_id,
           doName: data.doName,
+          userTurn: userTurn,
+          supervisorPlan: supervisorPlan,
+          intent: supervisorPlan.intent,
           text: composed.text
         });
         data.activeContext = updateConversationContext(data.activeContext, {
@@ -2088,6 +2155,9 @@ export class ConversationCoordinator {
         traceId: userTurn && userTurn.trace_id || "",
         turnId: userTurn && userTurn.turn_id || "",
         doName: data.doName,
+        userTurn: userTurn,
+        supervisorPlan: route.supervisorPlan || { intent: route.intent || "image_question" },
+        intent: route.supervisorPlan && route.supervisorPlan.intent || route.intent || "image_question",
         text: text
       });
       logEvent("VISION_FINAL_RESPONSE_SENT", {
@@ -5853,8 +5923,20 @@ async function sendConversationalResponse(env, params) {
   const enabled = String(env && env.CONVERSATIONAL_SPLIT_ENABLED || "true").toLowerCase() !== "false";
   const maxChars = getNumberEnv(env && env.CONVERSATIONAL_SPLIT_MAX_CHARS, 650);
   const delayMs = getNumberEnv(env && env.CONVERSATIONAL_SPLIT_DELAY_MS, 750);
-  const text = String(params && params.text || "").trim();
-  const parts = enabled ? splitConversationalText(text, { maxChars: maxChars }) : [text].filter(Boolean);
+  const reply = composeCustomerReply({
+    userTurn: params && params.userTurn || {},
+    intent: params && params.intent || params && params.supervisorPlan && params.supervisorPlan.intent || "",
+    systemResult: { text: params && params.text || "" },
+    visibleFacts: params && params.visibleFacts || [],
+    nextAction: params && params.nextAction || "",
+    locale: "es",
+    maxChars: maxChars,
+    traceId: params && params.traceId || "",
+    turnId: params && params.turnId || ""
+  }, env || {});
+  if (!reply.shouldSend) return { partCount: 0 };
+  const text = reply.text;
+  const parts = enabled ? reply.splitMessages : [text].filter(Boolean);
 
   if (parts.length > 1) {
     logEvent("CONVERSATIONAL_SPLIT_APPLIED", {
@@ -7790,7 +7872,7 @@ function getLastUploadedImage(state) {
 function normalizeIncomingMessage(parsedMessage, woztellPayload, options) {
   const parsed = parsedMessage || {};
   const payload = woztellPayload || {};
-  const type = String(parsed.type || "TEXT").toUpperCase();
+  const type = String(parsed.type || normalizeEventType(payload.type || payload.data && payload.data.type || "", payload) || "UNSUPPORTED").toUpperCase();
   const fileId = String(parsed.fileId || "");
   const media = extractMediaFromPayload(parsed, payload);
   const audio = isAudioMessage(parsed) && fileId ? [{
@@ -7803,7 +7885,8 @@ function normalizeIncomingMessage(parsedMessage, woztellPayload, options) {
   const video = buildVideoMetadata(parsed, payload);
   const files = buildFileMetadata(parsed, payload);
 
-  const fallbackText = fileId && !isAudioMessage(parsed)
+  const fallbackText = type === "UNSUPPORTED" ? ""
+    : fileId && !isAudioMessage(parsed)
     ? "[" + type + " uploaded without caption]"
     : isAudioMessage(parsed) ? "[AUDIO pending transcription]" : "";
 
@@ -7817,10 +7900,11 @@ function normalizeIncomingMessage(parsedMessage, woztellPayload, options) {
     audio: audio,
     video: video,
     files: files,
+    location: buildLocationMetadata(parsed, payload),
     captions: collectCaptions(parsed, payload),
     mimeType: String(parsed.mimeType || ""),
     fileName: String(parsed.fileName || ""),
-    originalType: parsed.originalType || "",
+    originalType: parsed.originalType || (type === "AUDIO" ? "AUDIO" : ""),
     originalFileId: parsed.originalFileId || "",
     audioStatus: parsed.audioStatus || (audio.length ? "pending" : ""),
     audioTranscript: parsed.audioTranscript || "",
@@ -7852,7 +7936,8 @@ function extractMediaFromPayload(parsedMessage, woztellPayload) {
       type: type,
       fileId: parsed.fileId,
       mimeType: parsed.mimeType || "",
-      fileName: parsed.fileName || ""
+      fileName: parsed.fileName || "",
+      caption: parsed.caption || parsed.text || ""
     });
   }
 
@@ -7973,16 +8058,34 @@ function buildFileMetadata(parsedMessage, woztellPayload) {
   });
 }
 
+function buildLocationMetadata(parsedMessage, woztellPayload) {
+  const parsed = parsedMessage || {};
+  const payload = woztellPayload || {};
+  const data = payload.data || {};
+  const type = String(parsed.type || payload.type || data.type || "").toUpperCase();
+
+  if (type !== "LOCATION") return null;
+
+  const location = data.location || payload.location || parsed.location || data;
+  return {
+    latitude: Number(location.latitude || location.lat || 0) || null,
+    longitude: Number(location.longitude || location.lng || location.lon || 0) || null,
+    name: String(location.name || ""),
+    address: String(location.address || "")
+  };
+}
+
 function shouldStartNewTurn(messages, previousState) {
   const text = normalizeTextForIntent(consolidatedMessagesText(messages || []));
-
-  if (!text) return false;
-  if (text === "/reset") return true;
-  if (isNewCampaignRequest(text)) return true;
 
   const hasNewMedia = (messages || []).some(function (message) {
     return (message.media && message.media.length) || (message.video && message.video.length) || (message.files && message.files.length);
   });
+
+  if (hasNewMedia && previousState && previousState.workflow_status && !shouldUsePreviousContext(messages)) return true;
+  if (!text) return false;
+  if (text === "/reset") return true;
+  if (isNewCampaignRequest(text)) return true;
 
   return Boolean(hasNewMedia && previousState && previousState.workflow_status && !shouldUsePreviousContext(messages));
 }
@@ -8048,7 +8151,7 @@ function buildUserTurn(messages, campaignState, options) {
     return !selected.has(asset.file_id);
   });
 
-  return {
+  const turn = {
     turn_id: turnId,
     request_id: turnId,
     message_ids: (messages || []).map(function (message) { return message.messageId; }),
@@ -8082,6 +8185,22 @@ function buildUserTurn(messages, campaignState, options) {
     context_policy: contextPolicy,
     created_at: new Date().toISOString()
   };
+  attachUserTurnContract(turn, messages || [], mediaBatch);
+  const userTurnMediaBatch = buildMediaBatchFromUserTurn({
+    userTurn: turn,
+    activeTaskAssets: taskMediaAssets
+  });
+  if (userTurnMediaBatch.assets.length) {
+    turn.media_batch = userTurnMediaBatch;
+    turn.media_batch_summary = buildMediaBatchSummary(userTurnMediaBatch);
+    turn.image_count = userTurnMediaBatch.assets.filter(function (asset) { return asset.media_type === "IMAGE"; }).length;
+    turn.video_count = Math.max(turn.video_count, userTurnMediaBatch.assets.filter(function (asset) { return asset.media_type === "VIDEO"; }).length);
+    turn.file_count = Math.max(turn.file_count, userTurnMediaBatch.assets.filter(function (asset) { return asset.media_type === "FILE"; }).length);
+    turn.counts.image = turn.image_count;
+    turn.counts.video = turn.video_count;
+    turn.counts.file = turn.file_count;
+  }
+  return turn;
 }
 
 function buildTurnSummary(userTurn) {
@@ -8127,6 +8246,12 @@ function shouldSendAudioOnlyFallback(userTurn) {
     turn.file_count === 0 &&
     !hasUsefulText
   );
+}
+
+function shouldUseLocalGeneralAnswer(text) {
+  const clean = normalizeTextForIntent(text);
+  if (/^(hola|buenas|buenos dias|buenas tardes|buenas noches|hey|ola)$/.test(clean)) return false;
+  return Boolean(composeGeneralTextAnswer(text));
 }
 
 function compactConversationHistory(history) {
@@ -8236,6 +8361,12 @@ function mapOrchestratorActions(plan) {
 }
 
 function buildMediaBatch(campaignState, messages, options) {
+  if (options && options.userTurn) {
+    return buildMediaBatchFromUserTurn({
+      userTurn: options.userTurn,
+      activeTaskAssets: options.activeTaskAssets || []
+    });
+  }
   const state = normalizeCampaignState(campaignState || {});
   const turnId = options && options.turnId || "";
   const mode = options && options.mode || (options && options.allowPreviousMedia ? "previous_relevant" : "current_turn");
@@ -8276,17 +8407,41 @@ function buildMediaBatch(campaignState, messages, options) {
     }]);
   }
 
+  const beforeDedupe = assets.length;
+  assets = normalizeCampaignAssets(assets).filter(function (asset, index, list) {
+    const id = asset.file_id || asset.message_id || "";
+    return id && list.findIndex(function (candidate) {
+      return (candidate.file_id || candidate.message_id || "") === id;
+    }) === index;
+  });
+  if (beforeDedupe !== assets.length) {
+    logEvent("MEDIA_BATCH_DEDUPED", {
+      before: beforeDedupe,
+      after: assets.length
+    });
+  }
+
   const fileIds = assets.map(function (asset) { return asset.file_id; }).filter(Boolean);
   const analyzedAssetCount = assets.filter(function (asset) { return asset.status === "analyzed" && asset.analysis; }).length;
   const failedAssetCount = assets.filter(function (asset) { return asset.status === "analysis_failed"; }).length;
 
-  return {
+  const result = {
     assets: assets,
     fileIds: fileIds,
     assetCount: assets.length,
     analyzedAssetCount: analyzedAssetCount,
     failedAssetCount: failedAssetCount
   };
+  logEvent("MEDIA_BATCH_FILE_IDS_FINAL", {
+    fileIds: fileIds
+  });
+  logEvent("MEDIA_BATCH_COUNTS_FINAL", {
+    assetCount: assets.length,
+    imageCount: assets.filter(function (asset) { return asset.media_type === "IMAGE"; }).length,
+    videoCount: assets.filter(function (asset) { return asset.media_type === "VIDEO"; }).length,
+    fileCount: assets.filter(function (asset) { return asset.media_type === "FILE"; }).length
+  });
+  return result;
 }
 
 function selectReferencedPreviousMediaAssets(assets, messages) {
@@ -8503,30 +8658,34 @@ function buildMediaLogPayload(data, messages, summary, usedFallback) {
 }
 
 function extractWoztellMessage(body) {
-  const data = body.data || {};
-  const type = body.type || data.type || "TEXT";
-  const text = data.text || body.text || data.caption || body.caption || "";
+  const payload = body || {};
+  const event = normalizeInboundEvent(payload);
+  const data = payload.data || {};
+  const type = event.type || normalizeEventType(payload.type || data.type || "", payload) || "UNSUPPORTED";
+  const text = event.text || event.caption || "";
   const fileId = data.fileId ||
-    body.fileId ||
+    payload.fileId ||
     data.mediaId ||
-    body.mediaId ||
+    payload.mediaId ||
     data.file && data.file.fileId ||
-    body.file && body.file.fileId ||
+    payload.file && payload.file.fileId ||
     data.attachment && data.attachment.fileId ||
-    body.attachment && body.attachment.fileId ||
+    payload.attachment && payload.attachment.fileId ||
     data.audio && data.audio.fileId ||
-    body.audio && body.audio.fileId ||
+    payload.audio && payload.audio.fileId ||
     data.voice && data.voice.fileId ||
-    body.voice && body.voice.fileId ||
+    payload.voice && payload.voice.fileId ||
     "";
 
   return {
     type: type,
     text: String(text || "").trim(),
     fileId: String(fileId || ""),
-    fileName: data.fileName || body.fileName || data.file && data.file.fileName || body.file && body.file.fileName || "",
-    mimeType: data.mimeType || body.mimeType || data.file && data.file.mimeType || body.file && body.file.mimeType || data.audio && data.audio.mimeType || body.audio && body.audio.mimeType || "",
-    messageId: body.messageId || data.messageId || ""
+    caption: event.caption || "",
+    media: Array.isArray(payload.media) ? payload.media : Array.isArray(data.media) ? data.media : [],
+    fileName: data.fileName || payload.fileName || data.file && data.file.fileName || payload.file && payload.file.fileName || "",
+    mimeType: data.mimeType || payload.mimeType || data.file && data.file.mimeType || payload.file && payload.file.mimeType || data.audio && data.audio.mimeType || payload.audio && payload.audio.mimeType || "",
+    messageId: payload.messageId || data.messageId || ""
   };
 }
 
@@ -8551,11 +8710,7 @@ function buildWoztellPayloadFromData(data, messages) {
 }
 
 function consolidatedMessagesText(messages) {
-  return (messages || []).map(function (msg, index) {
-    const label = "[" + (index + 1) + "] " + (msg.type || "TEXT");
-    const media = msg.fileId ? " fileId=" + msg.fileId : "";
-    return label + media + ": " + (msg.text || "");
-  }).join("\n");
+  return buildCombinedUserText(messages || []);
 }
 
 function buildImagePrompt(userPrompt, state) {
@@ -8727,6 +8882,7 @@ function buildVersionDiagnostic(env) {
     SPECIALIST_DEFAULT_MODEL: getSpecialistModel(env || {}, "default"),
     SPECIALIST_CHEAP_MODEL: String(env && env.SPECIALIST_CHEAP_MODEL || "gpt-5.4-nano"),
     FINAL_RESPONSE_MODEL: getFinalResponseModel(env || {}),
+    CUSTOMER_REPLY_MODEL: getCustomerReplyModel(env || {}),
     VISION_MODEL: getVisionModel(env || {}),
     DEBUG_LOGS: String(flags.debugLogs),
     ENABLE_LISTS: String(flags.enableLists),
@@ -8765,6 +8921,7 @@ function formatVersionDiagnosticForWhatsApp(diagnostic) {
     "SPECIALIST_DEFAULT_MODEL: " + (data.SPECIALIST_DEFAULT_MODEL || ""),
     "SPECIALIST_CHEAP_MODEL: " + (data.SPECIALIST_CHEAP_MODEL || ""),
     "FINAL_RESPONSE_MODEL: " + (data.FINAL_RESPONSE_MODEL || ""),
+    "CUSTOMER_REPLY_MODEL: " + (data.CUSTOMER_REPLY_MODEL || ""),
     "VISION_MODEL: " + (data.VISION_MODEL || ""),
     "DEBUG_LOGS: " + (data.DEBUG_LOGS || ""),
     "ENABLE_LISTS: " + (data.ENABLE_LISTS || ""),
@@ -9009,16 +9166,23 @@ function getTaskIntakeTimingConfig(env) {
 }
 
 function getBufferTimingConfig(env) {
+  const timing = getTurnAggregationTiming(env || {});
   return {
-    bufferWaitSeconds: getNumberEnv(env && env.BUFFER_WAIT_SECONDS, 5),
-    imageMessageWaitSeconds: getNumberEnv(env && env.IMAGE_MESSAGE_WAIT_SECONDS, 8),
-    bufferMaxWaitSeconds: getNumberEnv(env && env.BUFFER_MAX_WAIT_SECONDS, 15)
+    bufferWaitSeconds: Math.max(1, Math.round((Number(env && env.BUFFER_WAIT_SECONDS || 0) || timing.minWaitMs / 1000))),
+    imageMessageWaitSeconds: Math.max(1, Math.round((Number(env && env.IMAGE_MESSAGE_WAIT_SECONDS || 0) || timing.silenceMs / 1000))),
+    bufferMaxWaitSeconds: Math.max(1, Math.round((Number(env && env.BUFFER_MAX_WAIT_SECONDS || 0) || timing.maxWaitMs / 1000))),
+    turnSilenceMs: timing.silenceMs,
+    turnMaxWaitMs: timing.maxWaitMs,
+    turnMinWaitMs: timing.minWaitMs
   };
 }
 
 function getAudioTurnWaitConfig(env) {
+  const timing = getTurnAggregationTiming(env || {});
   return {
-    maxAudioTurnWaitMs: getNumberEnv(env && env.AUDIO_TURN_WAIT_SECONDS, 75) * 1000,
+    maxAudioTurnWaitMs: Number(env && env.AUDIO_TURN_WAIT_SECONDS || 0) > 0
+      ? getNumberEnv(env && env.AUDIO_TURN_WAIT_SECONDS, 75) * 1000
+      : timing.audioMaxWaitMs,
     retryWaitMs: getNumberEnv(env && env.AUDIO_TURN_RETRY_SECONDS, 3) * 1000
   };
 }

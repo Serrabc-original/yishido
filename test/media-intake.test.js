@@ -163,7 +163,7 @@ test("consolidatedMessagesText keeps text plus image context together", () => {
   ]);
 
   assert.match(text, /hazme 3 posts/);
-  assert.match(text, /fileId=file_1/);
+  assert.doesNotMatch(text, /fileId=file_1/);
 });
 
 test("extractMediaFromPayload supports multiple media in one payload", () => {
@@ -199,7 +199,8 @@ test("buildUserTurn groups text, captions, images, audio, video and files", () =
 
   const turn = buildUserTurn(messages, campaignState, { turnId: "turn_test" });
 
-  assert.equal(turn.text_count, 5);
+  assert.equal(turn.text_count, 2);
+  assert.equal(turn.counts.text, 1);
   assert.equal(turn.audio_count, 1);
   assert.equal(turn.image_count, 1);
   assert.equal(turn.video_count, 1);

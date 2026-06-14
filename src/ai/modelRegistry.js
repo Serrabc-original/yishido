@@ -5,6 +5,7 @@ const FALLBACKS = {
   router: "gpt-5.4-nano",
   specialist: "gpt-5.4-mini",
   final_response: "gpt-5.4-mini",
+  customer_reply: "gpt-5.4-mini",
   vision: "gpt-5.4-mini",
   image_generation: "gpt-image-2",
   transcription: "whisper-1"
@@ -13,6 +14,7 @@ const FALLBACKS = {
 const VALID_MODELS = new Set([
   "gpt-5.4-mini",
   "gpt-5.4-nano",
+  "gpt-4.1-mini",
   "gpt-image-2",
   "whisper-1",
   "mock"
@@ -39,6 +41,12 @@ export function getCheapSpecialistModel(env) {
 
 export function getFinalResponseModel(env) {
   return selectModel(env && env.FINAL_RESPONSE_MODEL, FALLBACKS.final_response, "final_response");
+}
+
+export function getCustomerReplyModel(env) {
+  const configured = env && env.CUSTOMER_REPLY_MODEL || "gpt-4.1-mini";
+  const fallback = env && env.FINAL_RESPONSE_MODEL || FALLBACKS.customer_reply;
+  return selectModel(configured, fallback, "customer_reply");
 }
 
 export function getVisionModel(env) {
