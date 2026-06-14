@@ -137,7 +137,10 @@ function env() {
     VISION_FALLBACK_MODEL: "gpt-4.1-mini",
     CONVERSATIONAL_SPLIT_ENABLED: "false",
     TURN_MIN_WAIT_MS: "1",
-    TURN_SILENCE_MS: "1"
+    TURN_SILENCE_MS: "1",
+    TURN_MAX_WAIT_MS: "50",
+    IMAGE_MESSAGE_WAIT_SECONDS: "1",
+    BUFFER_MAX_WAIT_SECONDS: "1"
   };
 }
 
@@ -146,36 +149,24 @@ function mockRuntimeFetch(captures) {
     const cleanUrl = String(url);
     const bodyText = options && options.body ? String(options.body) : "";
 
-    if (bodyText.includes("apiViewer") || bodyText.includes("fileId")) {
-      const body = JSON.parse(bodyText);
-      const fileId = body.variables && body.variables.fileId || "file_unknown";
-      return json({
-        data: {
-          apiViewer: {
-            file: {
-              url: "https://cdn.test/" + fileId + ".jpg",
-              fileType: fileId.startsWith("aud") ? "audio/ogg" : "image/jpeg",
-              size: 1234
-            }
-          }
-        }
-      });
-    }
-
     if (cleanUrl.includes("api.openai.com/v1/responses")) {
       const request = JSON.parse(bodyText);
-      if (request.input && request.input[0] && Array.isArray(request.input[0].content)) {
-        const imageUrl = request.input[0].content.find((item) => item.type === "input_image").image_url;
+      const content = request.input && request.input[0] && Array.isArray(request.input[0].content)
+        ? request.input[0].content
+        : [];
+      const imageInput = content.find((item) => item.type === "input_image");
+      if (imageInput) {
+        const imageUrl = imageInput.image_url;
         captures.visionUrls.push(imageUrl);
         return json({
           output_text: JSON.stringify({
-            main_subject: imageUrl.includes("img_a") ? "imagen A" : "imagen B",
+            main_subject: imageUrl.includes("img_a") ? "imagen A" : imageUrl.includes("img_b") ? "imagen B" : "imagen C",
             product_type: "foto",
-            visible_text: imageUrl.includes("img_a") ? "A" : "B",
+            visible_text: imageUrl.includes("img_a") ? "A" : imageUrl.includes("img_b") ? "B" : "C",
             brand_or_labels: "",
             colors: ["azul"],
             style: "foto",
-            objects_detected: [imageUrl.includes("img_a") ? "objeto A" : "objeto B"],
+            objects_detected: [imageUrl.includes("img_a") ? "objeto A" : imageUrl.includes("img_b") ? "objeto B" : "objeto C"],
             marketing_notes: "",
             possible_use_cases: [],
             recommended_angle: "",
@@ -195,9 +186,27 @@ function mockRuntimeFetch(captures) {
           needs_clarification: false,
           clarification_question: "",
           actions: [],
-          user_facing_ack: "La respuesta general queda unida y clara.",
+          user_facing_ack: captures.forceBadGeneric
+            ? "¿Quieres que lo explique, lo resuma o revise algún detalle puntual?"
+            : "La respuesta general queda unida y clara.",
           state_updates: {}
         })
+      });
+    }
+
+    if (bodyText.includes("apiViewer")) {
+      const body = JSON.parse(bodyText);
+      const fileId = body.variables && body.variables.fileId || "file_unknown";
+      return json({
+        data: {
+          apiViewer: {
+            file: {
+              url: "https://cdn.test/" + fileId + ".jpg",
+              fileType: fileId.startsWith("aud") ? "audio/ogg" : "image/jpeg",
+              size: 1234
+            }
+          }
+        }
       });
     }
 
@@ -214,16 +223,78 @@ function json(value) {
   });
 }
 
-test("conversation.local/message batches two real images into one UserTurn and vision batch", async () => {
+function installFakeClock(start) {
+  const originalNow = Date.now;
+  let now = start;
+  Date.now = () => now;
+  return {
+    tick(ms) {
+      now += ms;
+    },
+    restore() {
+      Date.now = originalNow;
+    }
+  };
+}
+
+test("conversation.local/message batches three images only after turn max wait", async () => {
   const state = createMemoryState();
   const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
   const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781466000000);
   globalThis.fetch = mockRuntimeFetch(captures);
   const coordinator = new ConversationCoordinator(state, env());
 
   try {
     await coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_img_a", "primera")));
+    clock.tick(5);
     await coordinator.fetch(localMessageRequest(imageMessage("img_b", "msg_img_b", "segunda")));
+    clock.tick(5);
+    await coordinator.fetch(localMessageRequest(imageMessage("img_c", "msg_img_c", "tercera")));
+
+    let saved = await state.storage.get("data");
+    assert.equal(new Set(saved.pendingMessages.map((message) => message.turnId)).size, 1);
+    assert.equal(saved.pendingMessages.length, 3);
+    assert.equal(captures.visionUrls.length, 0);
+    assert.equal(captures.sentTexts.length, 0);
+
+    await coordinator.processBuffer();
+    saved = await state.storage.get("data");
+    assert.equal(saved.pendingMessages.length, 3);
+    assert.equal(captures.visionUrls.length, 0);
+    assert.equal(captures.sentTexts.length, 0);
+
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    saved = await state.storage.get("data");
+    assert.equal(saved.campaignState.active_turn.counts.image, 3);
+    assert.deepEqual(saved.campaignState.active_turn.images.map((image) => image.fileId), ["img_a", "img_b", "img_c"]);
+    assert.equal(saved.campaignState.active_turn.media_batch.assetCount, 3);
+    assert.equal(saved.campaignState.media_batch_summary.asset_count, 3);
+    assert.deepEqual(captures.visionUrls.sort(), ["https://cdn.test/img_a.jpg", "https://cdn.test/img_b.jpg", "https://cdn.test/img_c.jpg"]);
+    assert.equal(captures.sentTexts.length > 0, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("conversation.local/message batches two real images into one UserTurn and vision batch", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781466100000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_img_a", "primera")));
+    clock.tick(5);
+    await coordinator.fetch(localMessageRequest(imageMessage("img_b", "msg_img_b", "segunda")));
+    assert.equal(captures.visionUrls.length, 0);
+    assert.equal(captures.sentTexts.length, 0);
+    clock.tick(100);
     await coordinator.processBuffer();
 
     const saved = await state.storage.get("data");
@@ -236,6 +307,7 @@ test("conversation.local/message batches two real images into one UserTurn and v
     assert.equal(sent.includes("objeto A") && sent.includes("objeto B") || captures.sentTexts.length > 0, true);
   } finally {
     globalThis.fetch = originalFetch;
+    clock.restore();
   }
 });
 
@@ -243,6 +315,7 @@ test("conversation.local/message keeps two audio transcripts clean and ordered",
   const state = createMemoryState();
   const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
   const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781466200000);
   globalThis.fetch = mockRuntimeFetch(captures);
   const coordinator = new ConversationCoordinator(state, env());
 
@@ -259,6 +332,7 @@ test("conversation.local/message keeps two audio transcripts clean and ordered",
       messageId: "msg_aud_b",
       transcript: "Explicalo sencillo."
     }));
+    clock.tick(100);
     await coordinator.processBuffer();
 
     const saved = await state.storage.get("data");
@@ -268,18 +342,23 @@ test("conversation.local/message keeps two audio transcripts clean and ordered",
     assert.equal(captures.sentTexts.length > 0, true);
   } finally {
     globalThis.fetch = originalFetch;
+    clock.restore();
   }
 });
 
-test("image plus audio uses audio intent and does not become unknown_image_request", async () => {
+test("two images plus audio use audio intent and vision receives both images", async () => {
   const state = createMemoryState();
   const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
   const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781466300000);
   globalThis.fetch = mockRuntimeFetch(captures);
   const coordinator = new ConversationCoordinator(state, env());
 
   try {
     await coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_img_a", "")));
+    clock.tick(5);
+    await coordinator.fetch(localMessageRequest(imageMessage("img_b", "msg_img_b", "")));
+    clock.tick(5);
     await coordinator.fetch(localMessageRequest(audioMessage("aud_a", "msg_aud_a")));
     await coordinator.fetch(toolResultRequest({
       type: "audio_transcribed",
@@ -290,10 +369,12 @@ test("image plus audio uses audio intent and does not become unknown_image_reque
 
     const saved = await state.storage.get("data");
     assert.notEqual(saved.activeContext.activeIntent, "unknown_image_request");
-    assert.equal(saved.campaignState.active_turn.counts.image, 1);
+    assert.equal(saved.campaignState.active_turn.counts.image, 2);
     assert.equal(saved.campaignState.active_turn.counts.audio, 1);
+    assert.deepEqual(captures.visionUrls.sort(), ["https://cdn.test/img_a.jpg", "https://cdn.test/img_b.jpg"]);
   } finally {
     globalThis.fetch = originalFetch;
+    clock.restore();
   }
 });
 
@@ -311,6 +392,62 @@ test("clear text question goes through composer and answers directly", async () 
     const saved = await state.storage.get("data");
     assert.equal(saved.activeContext.activeIntent, "general");
     assert.equal(captures.sentTexts.length > 0, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("bad generic reply is blocked for clear text request", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [], forceBadGeneric: true };
+  const logLines = [];
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  globalThis.fetch = mockRuntimeFetch(captures);
+  console.log = (...args) => {
+    logLines.push(args.map(String).join(" "));
+  };
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Que opinas de este libro y que ingredientes le pongo al aguacate molido?", "msg_text_bad")));
+    await coordinator.processBuffer();
+
+    const sent = captures.sentTexts.join("\n");
+    assert.equal(sent.includes("¿Quieres que lo explique"), false);
+    assert.match(sent, /aguacate|ingredientes/i);
+    assert.equal(logLines.some((line) => line.includes("BAD_GENERIC_REPLY_BLOCKED")), true);
+    assert.equal(logLines.some((line) => line.includes("DIRECT_GENERAL_ANSWER_FORCED")), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+  }
+});
+
+test("runtime commands /version and /reset keep short-circuit behavior", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    const versionResponse = await coordinator.fetch(localMessageRequest(textMessage("/version", "msg_version")));
+    const versionBody = await versionResponse.json();
+    assert.equal(versionBody.status, "version_sent");
+    assert.equal(captures.sentTexts.length, 1);
+
+    await coordinator.fetch(localMessageRequest(textMessage("texto pendiente", "msg_pending")));
+    let saved = await state.storage.get("data");
+    assert.equal(saved.pendingMessages.length, 1);
+
+    const resetResponse = await coordinator.fetch(localMessageRequest(textMessage("/reset", "msg_reset")));
+    const resetBody = await resetResponse.json();
+    saved = await state.storage.get("data");
+
+    assert.equal(resetBody.status, "reset_done");
+    assert.equal(saved.pendingMessages.length, 0);
+    assert.equal(saved.currentTurnId, "");
   } finally {
     globalThis.fetch = originalFetch;
   }

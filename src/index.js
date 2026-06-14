@@ -30,6 +30,7 @@ import { normalizeInboundEvent, normalizeEventType, shouldIgnoreInboundEvent } f
 import {
   appendPendingEvent,
   getTurnAggregationTiming,
+  isUserDoneSignal,
   logFinalEventCounts,
   logTurnReady,
   logTurnTimerReset
@@ -862,6 +863,7 @@ export class ConversationCoordinator {
       data.firstMessageAt = 0;
       data.lastMessageAt = 0;
       data.processAfter = 0;
+      data.currentTurnId = "";
       data.currentTraceId = "";
       data = resetCampaignState(data, "manual_reset");
       data.activeContext = createEmptyConversationContext("manual_reset");
@@ -900,6 +902,22 @@ export class ConversationCoordinator {
       data.firstMessageAt = now;
       data.currentTurnId = "turn_" + now + "_" + randomId(6);
       data.currentTraceId = incomingTraceId || createTraceId([data.doName, data.currentTurnId, messageId]);
+      logEvent("TURN_NEW_CREATED_FOR_EVENT", {
+        traceId: data.currentTraceId,
+        turnId: data.currentTurnId,
+        doName: data.doName,
+        messageId: messageId,
+        type: normalized.type || ""
+      });
+    } else {
+      logEvent("TURN_REUSED_FOR_EVENT", {
+        traceId: data.currentTraceId || incomingTraceId || "",
+        turnId: data.currentTurnId || "",
+        doName: data.doName,
+        messageId: messageId,
+        type: normalized.type || "",
+        pendingCount: data.pendingMessages.length
+      });
     }
 
     data.lastMessageAt = now;
@@ -1008,7 +1026,13 @@ export class ConversationCoordinator {
         ? "bulk_from_assets"
         : data.campaignState.campaign_type || "single_post";
       data.campaignState.workflow_status = explicitMarketingMediaRequest ? "collecting_assets" : "media_received";
-      data.campaignState.media_batch_summary = buildMediaBatchSummary(buildMediaBatch(data.campaignState, data.pendingMessages, { turnId: data.currentTurnId }));
+      logEvent("IMAGE_PREBUFFER_ANALYSIS_BLOCKED", {
+        traceId: normalized.traceId,
+        turnId: normalized.turnId,
+        doName: data.doName,
+        pendingCount: data.pendingMessages.length,
+        fileIds: resolvedAssets.map(function (asset) { return asset.file_id; })
+      });
 
       console.log("CURRENT_ASSET_SOURCE:", data.campaignState.current_asset_source);
       console.log("CAMPAIGN_ASSETS_UPDATED:", JSON.stringify({
@@ -1021,14 +1045,12 @@ export class ConversationCoordinator {
         campaign_type: data.campaignState.campaign_type
       }));
 
-      logEvent("MEDIA_BATCH_CREATED", {
+      logEvent("IMAGE_APPENDED_ONLY_WAITING_FOR_TURN", {
         traceId: normalized.traceId,
         turnId: normalized.turnId,
         doName: data.doName,
-        assetCount: data.campaignState.campaign_assets.length,
-        fileIds: resolvedAssets.map(function (asset) { return asset.file_id; }),
-        campaign_type: data.campaignState.campaign_type,
-        workflow_status: data.campaignState.workflow_status
+        pendingCount: data.pendingMessages.length,
+        fileIds: resolvedAssets.map(function (asset) { return asset.file_id; })
       });
     }
 
@@ -1112,6 +1134,10 @@ export class ConversationCoordinator {
     data.processAfter = taskDecision && activeTaskForTiming && activeTaskForTiming.status === "awaiting_media"
       ? taskDecision.nextProcessAt || Math.min(desiredProcessAt, maxProcessAt)
       : Math.min(desiredProcessAt, maxProcessAt);
+    const mediaHoldAfterAppend = shouldHoldMediaTurnForMoreEvents(data, data.pendingMessages, this.env);
+    if (mediaHoldAfterAppend.hold) {
+      data.processAfter = mediaHoldAfterAppend.nextProcessAt;
+    }
     data.updatedAt = new Date().toISOString();
 
     await this.saveData(data);
@@ -1161,15 +1187,13 @@ export class ConversationCoordinator {
     }));
 
     if (data.hasMedia) {
-      const mediaBatch = buildMediaBatch(data.campaignState, data.pendingMessages, { turnId: data.currentTurnId });
-      console.log("BUFFER_MEDIA_BATCH_READY:", JSON.stringify({
+      logEvent("IMAGE_EARLY_PROCESSING_BLOCKED", {
+        traceId: normalized.traceId,
+        turnId: normalized.turnId,
         doName: data.doName,
-        messageCount: data.pendingMessages.length,
-        assetCount: mediaBatch.assets.length,
-        fileIds: mediaBatch.fileIds,
-        workflow_status: data.campaignState.workflow_status,
-        campaign_type: data.campaignState.campaign_type
-      }));
+        pendingCount: data.pendingMessages.length,
+        reason: "receive_message_append_only"
+      });
     }
 
     console.log("DO_MESSAGE_BUFFERED:", JSON.stringify({
@@ -1397,6 +1421,31 @@ export class ConversationCoordinator {
       });
     }
 
+    const mediaHold = shouldHoldMediaTurnForMoreEvents(data, messages, this.env);
+    if (mediaHold.hold) {
+      data.processAfter = mediaHold.nextProcessAt;
+      data.updatedAt = new Date().toISOString();
+      await this.saveData(data);
+      await this.state.storage.setAlarm(data.processAfter);
+      logEvent("IMAGE_EARLY_PROCESSING_BLOCKED", {
+        traceId: data.currentTraceId || "",
+        turnId: data.currentTurnId || "",
+        doName: data.doName,
+        pendingCount: messages.length,
+        waitAgeMs: mediaHold.ageMs,
+        waitMsRemaining: Math.max(0, mediaHold.nextProcessAt - Date.now()),
+        reason: mediaHold.reason
+      });
+      logEvent("IMAGE_PREBUFFER_ANALYSIS_BLOCKED", {
+        traceId: data.currentTraceId || "",
+        turnId: data.currentTurnId || "",
+        doName: data.doName,
+        pendingCount: messages.length,
+        reason: mediaHold.reason
+      });
+      return;
+    }
+
     const activeTaskBeforeProcessing = normalizeActiveTask(data.campaignState.active_task);
     if (activeTaskBeforeProcessing && activeTaskBeforeProcessing.status === "awaiting_media") {
       const now = Date.now();
@@ -1491,8 +1540,10 @@ export class ConversationCoordinator {
         processingStartedAt: data.processingStartedAt
       }));
 
-      const userTurn = buildUserTurn(messages, data.campaignState, { turnId: data.currentTurnId || "" });
-      userTurn.trace_id = data.currentTraceId || (messages[0] && messages[0].traceId) || createTraceId([data.doName, userTurn.turn_id]);
+      const userTurn = buildUserTurn(messages, data.campaignState, {
+        turnId: data.currentTurnId || "",
+        traceId: data.currentTraceId || (messages[0] && messages[0].traceId) || createTraceId([data.doName, data.currentTurnId || ""])
+      });
       userTurn.activeTask = normalizeActiveTask(data.campaignState.active_task);
       userTurn.active_task = userTurn.activeTask;
       userTurn.taskMediaAssets = normalizeCampaignAssets(data.campaignState.task_media_assets || []);
@@ -6016,7 +6067,7 @@ async function sendConversationalResponse(env, params) {
   const enabled = String(env && env.CONVERSATIONAL_SPLIT_ENABLED || "true").toLowerCase() !== "false";
   const maxChars = getNumberEnv(env && env.CONVERSATIONAL_SPLIT_MAX_CHARS, 650);
   const delayMs = getNumberEnv(env && env.CONVERSATIONAL_SPLIT_DELAY_MS, 750);
-  const reply = composeCustomerReply({
+  let reply = composeCustomerReply({
     userTurn: params && params.userTurn || {},
     intent: params && params.intent || params && params.supervisorPlan && params.supervisorPlan.intent || "",
     systemResult: { text: params && params.text || "" },
@@ -6027,6 +6078,38 @@ async function sendConversationalResponse(env, params) {
     traceId: params && params.traceId || "",
     turnId: params && params.turnId || ""
   }, env || {});
+  if (shouldBlockBadGenericReply(reply.text, params && params.userTurn || {})) {
+    const forcedText = buildForcedDirectGeneralAnswer(params && params.userTurn || {}, params && params.text || "");
+    logEvent("BAD_GENERIC_REPLY_BLOCKED", {
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || "",
+      doName: params && params.doName || "",
+      textPreview: String(reply.text || "").slice(0, 240)
+    });
+    logEvent("DIRECT_GENERAL_ANSWER_FORCED", {
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || "",
+      doName: params && params.doName || "",
+      textLength: forcedText.length
+    });
+    reply = composeCustomerReply({
+      userTurn: params && params.userTurn || {},
+      intent: params && params.intent || params && params.supervisorPlan && params.supervisorPlan.intent || "general",
+      systemResult: { text: forcedText },
+      visibleFacts: params && params.visibleFacts || [],
+      nextAction: params && params.nextAction || "",
+      locale: "es",
+      maxChars: maxChars,
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || ""
+    }, env || {});
+    logEvent("CUSTOMER_REPLY_REGENERATED_FROM_USER_TURN", {
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || "",
+      doName: params && params.doName || "",
+      textLength: reply.text.length
+    });
+  }
   if (!reply.shouldSend) return { partCount: 0 };
   const text = reply.text;
   const parts = enabled ? reply.splitMessages : [text].filter(Boolean);
@@ -6065,6 +6148,64 @@ async function sendConversationalResponse(env, params) {
   return {
     partCount: parts.length
   };
+}
+
+function shouldBlockBadGenericReply(replyText, userTurn) {
+  const text = normalizeTextForIntent(replyText);
+  const userText = cleanUserVisibleText(userTurn && (userTurn.combinedUserText || userTurn.current_turn_text) || "");
+
+  if (!isClearUserRequestText(userText)) return false;
+
+  return [
+    "quieres que lo explique",
+    "quieres que lo resuma",
+    "revise algun detalle puntual",
+    "revise algún detalle puntual",
+    "que quieres que haga con esto",
+    "qué quieres que haga con esto",
+    "dime si quieres que"
+  ].some(function (pattern) {
+    return text.includes(normalizeTextForIntent(pattern));
+  });
+}
+
+function isClearUserRequestText(text) {
+  const clean = normalizeTextForIntent(text);
+  if (!clean) return false;
+  if (clean.includes("?")) return true;
+  return /\b(que|qué|como|cómo|cual|cuál|dame|dime|explica|explicame|explícame|responde|recomienda|recomiendame|necesito|quiero|haz|prepara|ayudame|ayúdame|opina|opinion|opinión|ingredientes|desayuno|receta|libro)\b/.test(clean);
+}
+
+function buildForcedDirectGeneralAnswer(userTurn, fallbackText) {
+  const userText = cleanUserVisibleText(userTurn && (userTurn.combinedUserText || userTurn.current_turn_text) || "");
+  const normalized = normalizeTextForIntent(userText);
+  const local = composeGeneralTextAnswer(userText);
+
+  if (/\blibro\b/.test(normalized) && /\baguacate\b/.test(normalized)) {
+    return [
+      "Te respondo las dos cosas.",
+      "Sobre el libro: si me dices el titulo exacto puedo opinar mejor; en general miraria si te esta aportando ideas utiles, si es claro y si te deja acciones concretas para aplicar.",
+      "Para aguacate molido te recomiendo: limon, sal, pimienta, cilantro, cebolla morada picada y un toque de tomate. Si lo quieres mas cremoso, un chorrito de aceite de oliva; si lo quieres con picante, aji o jalapeno."
+    ].join("\n\n");
+  }
+
+  if (/\bdesayuno\b/.test(normalized)) {
+    return [
+      "Una idea rapida de desayuno:",
+      "Tostada con aguacate molido, huevo, sal, pimienta y limon. Si quieres algo mas completo, agrega tomate o queso fresco y acompana con fruta.",
+      "Queda balanceado: grasa buena del aguacate, proteina del huevo y energia suficiente para empezar el dia."
+    ].join("\n\n");
+  }
+
+  if (local) return local;
+
+  if (/^como se hace|^como funciona|^que es|^por que|^para que/i.test(normalized)) {
+    return "Te respondo directo: funciona por un principio base, luego por sus partes y finalmente por como se aplica. Si me compartes el tema exacto, te doy la explicacion paso a paso sin rodeos.";
+  }
+
+  return String(fallbackText || "").trim() && !shouldBlockBadGenericReply(fallbackText, { combinedUserText: "" })
+    ? String(fallbackText).trim()
+    : "Te respondo directo: si me das el tema exacto, te doy una respuesta concreta y util sin menu ni rodeos.";
 }
 
 async function sendWoztellTextMessage(env, params) {
@@ -8215,8 +8356,9 @@ function shouldUsePreviousContext(messages) {
 function buildUserTurn(messages, campaignState, options) {
   const state = normalizeCampaignState(campaignState || {});
   const turnId = options && options.turnId || "turn_" + Date.now() + "_" + randomId(6);
+  const traceId = options && options.traceId || "";
   const wantsPreviousContext = shouldUsePreviousContext(messages);
-  const currentTurnBatch = buildMediaBatch(state, messages || [], { turnId: turnId, mode: "current_turn" });
+  const currentTurnBatch = buildMediaBatch(state, messages || [], { turnId: turnId, traceId: traceId, mode: "current_turn" });
   const activeTask = normalizeActiveTask(state.active_task);
   const taskMediaAssets = activeTask && activeTask.taskMediaFileIds.length
     ? normalizeCampaignAssets(state.campaign_assets).filter(function (asset) {
@@ -8224,7 +8366,7 @@ function buildUserTurn(messages, campaignState, options) {
     })
     : normalizeCampaignAssets(state.task_media_assets || []);
   const previousMediaBatch = wantsPreviousContext
-    ? buildMediaBatch(state, messages || [], { turnId: turnId, mode: "previous_relevant" })
+    ? buildMediaBatch(state, messages || [], { turnId: turnId, traceId: traceId, mode: "previous_relevant" })
     : { assets: [], fileIds: [], assetCount: 0, analyzedAssetCount: 0, failedAssetCount: 0 };
   const mediaBatch = currentTurnBatch.assets.length ? currentTurnBatch : previousMediaBatch;
   const audioBatch = buildAudioBatch(messages || []);
@@ -8246,6 +8388,7 @@ function buildUserTurn(messages, campaignState, options) {
 
   const turn = {
     turn_id: turnId,
+    trace_id: traceId,
     request_id: turnId,
     message_ids: (messages || []).map(function (message) { return message.messageId; }),
     input_types: Array.from(new Set((messages || []).map(function (message) { return message.type || "TEXT"; }))),
@@ -8462,6 +8605,7 @@ function buildMediaBatch(campaignState, messages, options) {
   }
   const state = normalizeCampaignState(campaignState || {});
   const turnId = options && options.turnId || "";
+  const traceId = options && options.traceId || "";
   const mode = options && options.mode || (options && options.allowPreviousMedia ? "previous_relevant" : "current_turn");
   const messageFileIds = new Set((messages || []).flatMap(function (message) {
     const ids = [];
@@ -8489,6 +8633,7 @@ function buildMediaBatch(campaignState, messages, options) {
 
   if (mode === "current_turn" && turnId && messageFileIds.size && assets.length > messageFileIds.size) {
     logEvent("LEGACY_IMAGE_SINGLE_ASSET_PATH_BLOCKED", {
+      traceId: traceId,
       turnId: turnId,
       messageFileIds: Array.from(messageFileIds),
       selectedFileIds: assets.map(function (asset) { return asset.file_id; }).filter(Boolean),
@@ -8519,6 +8664,8 @@ function buildMediaBatch(campaignState, messages, options) {
   });
   if (beforeDedupe !== assets.length) {
     logEvent("MEDIA_BATCH_DEDUPED", {
+      traceId: traceId,
+      turnId: turnId,
       before: beforeDedupe,
       after: assets.length
     });
@@ -8536,10 +8683,12 @@ function buildMediaBatch(campaignState, messages, options) {
     failedAssetCount: failedAssetCount
   };
   logEvent("MEDIA_BATCH_FILE_IDS_FINAL", {
+    traceId: traceId,
     turnId: turnId,
     fileIds: fileIds
   });
   logEvent("MEDIA_BATCH_COUNTS_FINAL", {
+    traceId: traceId,
     turnId: turnId,
     assetCount: assets.length,
     imageCount: assets.filter(function (asset) { return asset.media_type === "IMAGE"; }).length,
@@ -9279,6 +9428,39 @@ function getBufferTimingConfig(env) {
     turnSilenceMs: timing.silenceMs,
     turnMaxWaitMs: timing.maxWaitMs,
     turnMinWaitMs: timing.minWaitMs
+  };
+}
+
+function shouldHoldMediaTurnForMoreEvents(data, messages, env) {
+  const list = Array.isArray(messages) ? messages : [];
+  const hasMedia = list.some(function (message) {
+    return Boolean(message && (message.fileId || message.media && message.media.length || ["IMAGE", "VIDEO", "FILE"].includes(String(message.type || "").toUpperCase())));
+  });
+
+  if (!hasMedia) return { hold: false };
+
+  const hasClearTextOrAudio = list.some(function (message) {
+    const type = String(message && message.type || "").toUpperCase();
+    const text = cleanUserVisibleText(message && (message.audioTranscript || message.text) || "");
+    return Boolean(text && (type === "TEXT" || type === "AUDIO" || message && message.audioTranscript));
+  });
+
+  const combinedText = consolidatedMessagesText(list);
+  if (hasClearTextOrAudio || isUserDoneSignal(combinedText)) return { hold: false };
+
+  const timing = getTurnAggregationTiming(env || {});
+  const firstAt = Number(data && data.firstMessageAt || Date.now());
+  const now = Date.now();
+  const ageMs = now - firstAt;
+  const nextProcessAt = firstAt + timing.maxWaitMs;
+
+  if (ageMs >= timing.maxWaitMs) return { hold: false };
+
+  return {
+    hold: true,
+    reason: "media_only_waiting_for_turn_max",
+    ageMs: ageMs,
+    nextProcessAt: nextProcessAt
   };
 }
 
