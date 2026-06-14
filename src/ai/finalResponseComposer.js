@@ -188,7 +188,7 @@ export function composeGeneralTextAnswer(text) {
   const normalized = normalizeText(text);
 
   if (isGreeting(normalized)) {
-    return "Hola, soy Yishido. Puedo ayudarte con preguntas, fotos, audios, listas, recordatorios y revision de productos o precios cuando me lo pidas.";
+    return "Hola, Mateo. Estoy listo. Puedes mandarme texto, audios, fotos o capturas y te ayudo a analizarlas, comparar precios, hacer listas o dejar recordatorios.";
   }
 
   if (asksCapabilities(normalized)) {
@@ -350,7 +350,7 @@ function formatImageResponse(summary, message) {
     return [
       "Veo " + subject + ".",
       visible ? "Texto visible: " + visible : "",
-      hasClearQuestion(message) ? "Con lo que se ve en la imagen, esa es la parte más relevante para responderte." : "Si quieres, puedo describirla mejor, sacar un caption o ayudarte a editarla."
+      hasClearQuestion(message) ? "Con lo que se ve en la imagen, esa es la parte mas relevante para responderte." : "Quieres que la analice, extraiga texto o la compare con otra imagen?"
     ].filter(Boolean).join("\n");
   }
 
@@ -378,7 +378,10 @@ function formatProductAdvice(summary, message) {
 function formatPriceReview(summary) {
   const assets = Array.isArray(summary && summary.assets) ? summary.assets : [];
   const analyzed = assets.filter(function (asset) { return asset && asset.analysis; });
-  if (!analyzed.length) return "No pude leer un precio claro. Envíame una foto donde el precio se vea completo y lo reviso.";
+  const failedCount = Number(summary && summary.failed_asset_count || assets.filter(function (asset) {
+    return asset && asset.status === "analysis_failed";
+  }).length || 0);
+  if (!analyzed.length) return "No pude leer un precio claro. Enviame una foto donde el precio se vea completo y lo reviso.";
 
   const lines = ["Sí, revisé " + analyzed.length + " imagen" + (analyzed.length === 1 ? "" : "es") + "."];
   const priced = [];
@@ -399,18 +402,21 @@ function formatPriceReview(summary) {
     validPrices.sort(function (a, b) { return a.amount - b.amount; });
     lines.push("Con solo el precio visible, la imagen " + validPrices[0].index + " parece mas conveniente; confirma modelo, estado y garantia antes de decidir.");
   }
-  lines.push("Para decir si está caro con seguridad faltaría comparar modelo exacto, estado, tienda y garantía.");
+  if (failedCount) {
+    lines.push("Ojo: " + failedCount + " imagen" + (failedCount === 1 ? "" : "es") + " no se pudo analizar, pero segui con las demas.");
+  }
+  lines.push("Para decir si esta caro con seguridad faltaria comparar modelo exacto, estado, tienda y garantia.");
   return lines.join("\n");
 }
 
 function buildSpecificClarification(message, mediaSummary) {
   const subject = firstSubject(mediaSummary);
   if (subject) {
-    return "Veo " + subject + ". ¿Quieres que haga una descripción, un caption o que revise algún detalle específico?";
+    return "Veo " + subject + ". Quieres que la analice, extraiga texto o la compare con otra imagen?";
   }
   return hasClearQuestion(message)
-    ? "Quiero responderte bien, pero me falta un dato específico. ¿Te refieres al funcionamiento, al armado o a los materiales?"
-    : "¿Quieres que lo describa, lo convierta en una lista o revise algún detalle puntual?";
+    ? "Quiero responderte bien, pero me falta un dato especifico. Te refieres al funcionamiento, al armado o a los materiales?"
+    : "Quieres que lo analice, extraiga texto o lo convierta en una lista?";
 }
 
 function isGenericFallback(text) {

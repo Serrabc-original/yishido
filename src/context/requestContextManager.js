@@ -51,6 +51,13 @@ export function buildSupervisorInput(input) {
     memorySummary: requestContext.conversationSummary || null,
     utilityMemory: requestContext.utilityMemory || null,
     mediaMemorySummary: requestContext.mediaMemorySummary || null,
+    activeTask: clean.activeTask || clean.userTurn && (clean.userTurn.activeTask || clean.userTurn.active_task) || null,
+    taskMediaAssets: clean.taskMediaAssets || clean.userTurn && (clean.userTurn.taskMediaAssets || clean.userTurn.task_media_assets) || [],
+    pendingMedia: clean.pendingMedia || clean.userTurn && (clean.userTurn.current_turn_media || clean.userTurn.currentTurnMedia) || {},
+    mediaCounts: {
+      expected: clean.userTurn && clean.userTurn.expected_media_count || "",
+      received: clean.userTurn && clean.userTurn.received_media_count || clean.userTurn && clean.userTurn.image_count || 0
+    },
     requestContext: requestContext,
     supervisorConfig: clean.supervisorConfig || {}
   };

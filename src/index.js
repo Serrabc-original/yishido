@@ -74,7 +74,7 @@ const USER_MESSAGES = {
   requestFailed: "Tuve un problema procesando tu solicitud. Intenta nuevamente en unos minutos.",
   uploadedImageMissing: "No pude encontrar la imagen subida. ¿Puedes reenviarla o describirme brevemente qué aparece en la imagen?",
   imageAnalysisFailed: "No pude leer bien la imagen. ¿Me puedes describir el producto o reenviarla con una breve descripción?",
-  uploadedImageClarification: "Veo la imagen. ¿Quieres que la describa, extraiga texto o revise algún detalle específico?",
+  uploadedImageClarification: "Veo la imagen. ¿Quieres que la analice, extraiga texto o la compare con otra imagen?",
   changesAck: "Perfecto, hago los ajustes y te envío una nueva versión.",
   imageGenerationAck: "Perfecto. Voy a generar la imagen y te la envío apenas esté lista.",
   imageRevisionAck: "Listo. Voy a preparar una nueva versión de la imagen con ese cambio.",
@@ -82,7 +82,7 @@ const USER_MESSAGES = {
   genericClarification: "¿Quieres que lo explique, lo resuma o revise algún detalle puntual?",
   imageFailed: "Tuve un problema al generar o enviar la imagen. ¿Quieres que lo intente nuevamente?",
   imageQueueFallback: "Tuve un problema generando la imagen. Puedes intentar de nuevo con una descripción más específica.",
-  assetsCollected: "Ya recibí {count} imagenes. ¿Quieres que extraiga texto, las analice, las convierta en una lista o las use para marketing?",
+  assetsCollected: "Ya recibí {count} imagenes. ¿Quieres que las analice, extraiga texto, las compare o las convierta en una lista?",
   calendarReady: "Te preparé un calendario de contenido. ¿Lo apruebas completo o quieres cambiar algún post?",
   bulkPostsReady: "Listo, generé los posts del calendario. Puedes aprobar todos, cambiar un número específico o dejarlos listos para publicar.",
   bulkApproved: "Perfecto, aprobé los posts seleccionados ?\n¿Quieres dejarlos listos para publicar?",
@@ -1006,6 +1006,52 @@ export class ConversationCoordinator {
       at: normalized.receivedAt
     });
 
+    const taskTiming = getTaskIntakeTimingConfig(this.env);
+    const existingTask = normalizeActiveTask(data.campaignState.active_task);
+    const hadActiveTask = Boolean(existingTask && existingTask.status === "awaiting_media");
+    const openedTask = hadActiveTask ? null : createTaskIntakeFromText(normalized.text, {
+      now: now,
+      waitSeconds: taskTiming.waitSeconds,
+      maxWaitSeconds: taskTiming.maxWaitSeconds,
+      silenceSeconds: taskTiming.silenceSeconds
+    });
+
+    if (openedTask) {
+      data.campaignState.active_task = updateTaskIntakeWithMessage(openedTask, normalized, { now: now });
+      logEvent("TASK_INTAKE_WINDOW_OPENED", {
+        traceId: normalized.traceId,
+        turnId: normalized.turnId,
+        doName: data.doName,
+        type: data.campaignState.active_task.type,
+        expectedInputs: data.campaignState.active_task.expectedInputs,
+        waitSeconds: taskTiming.waitSeconds,
+        maxWaitSeconds: taskTiming.maxWaitSeconds,
+        silenceSeconds: taskTiming.silenceSeconds
+      });
+    } else if (hadActiveTask) {
+      data.campaignState.active_task = updateTaskIntakeWithMessage(existingTask, normalized, { now: now });
+      const activeTask = data.campaignState.active_task;
+      const addedMedia = extractImageFileIdsFromMessage(normalized);
+
+      logEvent(addedMedia.length ? "TASK_INTAKE_MEDIA_ADDED" : "TASK_INTAKE_MESSAGE_ADDED", {
+        traceId: normalized.traceId,
+        turnId: normalized.turnId,
+        doName: data.doName,
+        type: activeTask.type,
+        receivedMediaCount: activeTask.receivedMediaCount,
+        fileIds: addedMedia
+      });
+      if (addedMedia.length) {
+        logEvent(activeTask.receivedMediaCount === addedMedia.length ? "MULTI_IMAGE_BATCH_STARTED" : "MULTI_IMAGE_BATCH_ASSET_ADDED", {
+          traceId: normalized.traceId,
+          turnId: normalized.turnId,
+          doName: data.doName,
+          receivedMediaCount: activeTask.receivedMediaCount,
+          fileIds: activeTask.taskMediaFileIds
+        });
+      }
+    }
+
     const timing = getBufferTimingConfig(this.env);
     const waitReason = data.hasMedia ? "media_message" : "text_or_audio_transcript";
     const waitSeconds = data.hasMedia
@@ -1014,12 +1060,48 @@ export class ConversationCoordinator {
     const maxWaitSeconds = timing.bufferMaxWaitSeconds;
     const desiredProcessAt = data.lastMessageAt + waitSeconds * 1000;
     const maxProcessAt = data.firstMessageAt + maxWaitSeconds * 1000;
+    const activeTaskForTiming = normalizeActiveTask(data.campaignState.active_task);
+    if (activeTaskForTiming && activeTaskForTiming.taskMediaFileIds.length) {
+      const taskFileIds = new Set(activeTaskForTiming.taskMediaFileIds);
+      data.campaignState.task_media_assets = normalizeCampaignAssets(data.campaignState.campaign_assets).filter(function (asset) {
+        return taskFileIds.has(asset.file_id);
+      });
+    }
+    const taskDecision = activeTaskForTiming
+      ? buildTaskIntakeDecision(activeTaskForTiming, {
+        now: now,
+        hasMedia: activeTaskForTiming.receivedMediaCount > 0,
+        userDone: isTaskDoneSignal(normalized.text)
+      })
+      : null;
 
-    data.processAfter = Math.min(desiredProcessAt, maxProcessAt);
+    data.processAfter = taskDecision && activeTaskForTiming && activeTaskForTiming.status === "awaiting_media"
+      ? taskDecision.nextProcessAt || Math.min(desiredProcessAt, maxProcessAt)
+      : Math.min(desiredProcessAt, maxProcessAt);
     data.updatedAt = new Date().toISOString();
 
     await this.saveData(data);
     await this.state.storage.setAlarm(data.processAfter);
+
+    if (activeTaskForTiming && activeTaskForTiming.status === "awaiting_media") {
+      logEvent("TASK_INTAKE_TIMER_RESET", {
+        traceId: normalized.traceId,
+        turnId: normalized.turnId,
+        doName: data.doName,
+        reason: taskDecision && taskDecision.reason || "",
+        processAfter: data.processAfter,
+        processAfterIso: new Date(data.processAfter).toISOString(),
+        receivedMediaCount: activeTaskForTiming.receivedMediaCount
+      });
+      if (taskDecision && taskDecision.ready && taskDecision.reason === "user_done") {
+        logEvent("TASK_INTAKE_READY_BY_USER_DONE", {
+          traceId: normalized.traceId,
+          turnId: normalized.turnId,
+          doName: data.doName,
+          receivedMediaCount: activeTaskForTiming.receivedMediaCount
+        });
+      }
+    }
 
     console.log("BUFFER_TIMING_CONFIG:", JSON.stringify(timing));
     console.log("BUFFER_WAIT_REASON:", JSON.stringify({
@@ -1236,6 +1318,80 @@ export class ConversationCoordinator {
       }));
     }
 
+    const activeTaskBeforeProcessing = normalizeActiveTask(data.campaignState.active_task);
+    if (activeTaskBeforeProcessing && activeTaskBeforeProcessing.status === "awaiting_media") {
+      const now = Date.now();
+      const hasTaskMedia = activeTaskBeforeProcessing.receivedMediaCount > 0;
+      const taskDecision = buildTaskIntakeDecision(activeTaskBeforeProcessing, {
+        now: now,
+        hasMedia: hasTaskMedia,
+        userDone: messages.some(function (message) { return isTaskDoneSignal(message.text || ""); })
+      });
+
+      if (!taskDecision.ready) {
+        data.processAfter = taskDecision.nextProcessAt || data.processAfter || now + 1000;
+        data.updatedAt = new Date().toISOString();
+        await this.saveData(data);
+        await this.state.storage.setAlarm(data.processAfter);
+        logEvent("TASK_INTAKE_TIMER_RESET", {
+          traceId: data.currentTraceId || "",
+          turnId: data.currentTurnId || "",
+          doName: data.doName,
+          reason: taskDecision.reason,
+          processAfter: data.processAfter,
+          processAfterIso: new Date(data.processAfter).toISOString(),
+          receivedMediaCount: activeTaskBeforeProcessing.receivedMediaCount
+        });
+        return;
+      }
+
+      if (taskDecision.reason === "expired_no_media") {
+        await sendWoztellTextMessage(this.env, {
+          channelId: data.channel,
+          recipientId: data.phone,
+          memberId: data.member,
+          appId: data.app,
+          text: "Pasame las imagenes o capturas y te ayudo a revisar los precios."
+        });
+        logEvent("TASK_INTAKE_EXPIRED_NO_MEDIA", {
+          traceId: data.currentTraceId || "",
+          turnId: data.currentTurnId || "",
+          doName: data.doName,
+          type: activeTaskBeforeProcessing.type
+        });
+        for (const msg of messages) data.processedMessageIds.push(msg.messageId);
+        data.processedMessageIds = data.processedMessageIds.slice(-80);
+        data.pendingMessages = [];
+        data.hasMedia = false;
+        data.currentTurnId = "";
+        data.currentTraceId = "";
+        data.processAfter = 0;
+        data.campaignState.active_task = null;
+        data.campaignState.task_media_assets = [];
+        data.updatedAt = new Date().toISOString();
+        await this.saveData(data);
+        return;
+      }
+
+      const readyEvent = taskDecision.reason === "user_done"
+        ? "TASK_INTAKE_READY_BY_USER_DONE"
+        : taskDecision.reason === "silence" ? "TASK_INTAKE_READY_BY_SILENCE" : "TASK_INTAKE_READY_BY_MAX_WAIT";
+      logEvent(readyEvent, {
+        traceId: data.currentTraceId || "",
+        turnId: data.currentTurnId || "",
+        doName: data.doName,
+        reason: taskDecision.reason,
+        receivedMediaCount: activeTaskBeforeProcessing.receivedMediaCount
+      });
+      logEvent("MULTI_IMAGE_BATCH_READY", {
+        traceId: data.currentTraceId || "",
+        turnId: data.currentTurnId || "",
+        doName: data.doName,
+        receivedMediaCount: activeTaskBeforeProcessing.receivedMediaCount,
+        fileIds: activeTaskBeforeProcessing.taskMediaFileIds
+      });
+    }
+
     data.processing = true;
     data.processingStartedAt = Date.now();
     data.updatedAt = new Date().toISOString();
@@ -1254,6 +1410,20 @@ export class ConversationCoordinator {
 
       const userTurn = buildUserTurn(messages, data.campaignState, { turnId: data.currentTurnId || "" });
       userTurn.trace_id = data.currentTraceId || (messages[0] && messages[0].traceId) || createTraceId([data.doName, userTurn.turn_id]);
+      userTurn.activeTask = normalizeActiveTask(data.campaignState.active_task);
+      userTurn.active_task = userTurn.activeTask;
+      userTurn.taskMediaAssets = normalizeCampaignAssets(data.campaignState.task_media_assets || []);
+      userTurn.task_media_assets = userTurn.taskMediaAssets;
+      userTurn.expected_media_count = userTurn.activeTask && userTurn.activeTask.expectedInputs === "images" ? "unknown" : 0;
+      userTurn.received_media_count = userTurn.activeTask ? userTurn.activeTask.receivedMediaCount : userTurn.image_count;
+      const mediaRecount = handleUserClaimedMoreImages(userTurn.current_turn_text || "", data.campaignState, messages);
+      if (mediaRecount.claimed && mediaRecount.shouldReanalyze) {
+        userTurn.media_batch = mediaRecount.mediaBatch;
+        userTurn.media_batch_summary = buildMediaBatchSummary(mediaRecount.mediaBatch);
+        userTurn.image_count = mediaRecount.receivedCount;
+        userTurn.current_turn_media = summarizeAssetsForContext(mediaRecount.mediaBatch.assets);
+        userTurn.currentTurnMedia = userTurn.current_turn_media;
+      }
       const coreFlags = getCoreFeatureFlags(this.env);
       activeLogContext = {
         traceId: userTurn.trace_id,
@@ -1286,6 +1456,7 @@ export class ConversationCoordinator {
         customerMemory: data.customerMemory,
         utilityMemory: data.utilityMemory,
         mediaMemorySummary: data.campaignState.media_batch_summary,
+        activeTask: userTurn.activeTask,
         recentLimit: 20
       });
       data.requestContext = requestContext;
@@ -1296,6 +1467,7 @@ export class ConversationCoordinator {
         conversationSummary: data.conversationSummary,
         utilityMemory: data.utilityMemory,
         mediaMemorySummary: data.campaignState.media_batch_summary,
+        activeTask: userTurn.activeTask,
         supervisorConfig: getSupervisorConfig(this.env)
       }));
       applySupervisorMediaScope(userTurn, supervisorPlan, data.campaignState, messages);
@@ -1414,7 +1586,21 @@ export class ConversationCoordinator {
         }));
       }
 
-      if (shouldSendAudioOnlyFallback(userTurn)) {
+      if (mediaRecount.claimed && !mediaRecount.shouldReanalyze) {
+        await sendWoztellTextMessage(this.env, {
+          channelId: data.channel,
+          recipientId: data.phone,
+          memberId: data.member,
+          appId: data.app,
+          text: mediaRecount.message
+        });
+        data.activeContext = updateConversationContext(data.activeContext, {
+          userTurn: userTurn,
+          route: { intent: "price_review", targetModule: "vision" },
+          campaignState: data.campaignState,
+          pendingClarification: "awaiting_missing_image"
+        });
+      } else if (shouldSendAudioOnlyFallback(userTurn)) {
         await sendWoztellTextMessage(this.env, {
           channelId: data.channel,
           recipientId: data.phone,
@@ -1487,12 +1673,17 @@ export class ConversationCoordinator {
         await this.sendInteractiveOrText(data, {
           traceId: userTurn.trace_id,
           text: text,
-          fallbackText: text + "\nOpciones: Analizar imagen, Extraer texto, Usar para contenido.",
+          fallbackText: text + "\nOpciones: Analizar imagen, Extraer texto, Comparar imagen.",
           buttons: [
             { id: "image_analyze", title: "Analizar imagen" },
             { id: "image_ocr", title: "Extraer texto" },
-            { id: "image_marketing", title: "Usar contenido" }
+            { id: "image_compare", title: "Comparar" }
           ]
+        });
+        logEvent("GENERAL_IMAGE_CLARIFICATION_SENT", {
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName
         });
 
         data.activeContext = updateConversationContext(data.activeContext, {
@@ -1508,12 +1699,12 @@ export class ConversationCoordinator {
         await this.sendInteractiveOrText(data, {
           traceId: userTurn.trace_id,
           text: text,
-          fallbackText: text + "\nOpciones: Analizar imagenes, Extraer texto, Crear lista, Usar para marketing.",
+          fallbackText: text + "\nOpciones: Analizar imagenes, Extraer texto, Comparar, Crear lista.",
           listRows: [
             { id: "batch_analyze", title: "Analizar imagenes" },
             { id: "batch_ocr", title: "Extraer texto" },
-            { id: "batch_list", title: "Crear lista" },
-            { id: "batch_marketing", title: "Usar marketing" }
+            { id: "batch_compare", title: "Comparar" },
+            { id: "batch_list", title: "Crear lista" }
           ],
           buttonText: "Ver opciones",
           listTitle: "Imagenes"
@@ -1539,6 +1730,12 @@ export class ConversationCoordinator {
         timezone: this.env.USER_TIMEZONE || "America/Bogota"
       });
       if (isMarketingRoute(utilityRoute, userTurn)) {
+        logEvent("LEGACY_MARKETING_PATH_ALLOWED", {
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName,
+          intent: utilityRoute.intent
+        });
         logEvent("CAMPAIGN_STATE_USED_FOR_MARKETING_INTENT", {
           traceId: userTurn.trace_id,
           turnId: userTurn.turn_id,
@@ -1546,6 +1743,14 @@ export class ConversationCoordinator {
           intent: utilityRoute.intent
         });
       } else {
+        if (hasActiveMarketingWorkflow(data.campaignState)) {
+          logEvent("LEGACY_MARKETING_PATH_BLOCKED", {
+            traceId: userTurn.trace_id,
+            turnId: userTurn.turn_id,
+            doName: data.doName,
+            intent: utilityRoute.intent
+          });
+        }
         data.campaignState = clearCampaignStateForGeneralIntent(data.campaignState, {
           traceId: userTurn.trace_id,
           turnId: userTurn.turn_id,
@@ -1603,6 +1808,10 @@ export class ConversationCoordinator {
       if (!data.pendingMessages.length) {
         data.currentTurnId = "";
         data.currentTraceId = "";
+        if (activeTaskBeforeProcessing && activeTaskBeforeProcessing.status === "awaiting_media") {
+          data.campaignState.active_task = null;
+          data.campaignState.task_media_assets = [];
+        }
       }
       data.firstMessageAt = data.pendingMessages.length ? Date.now() : 0;
       data.lastMessageAt = data.pendingMessages.length ? Date.now() : 0;
@@ -1815,6 +2024,14 @@ export class ConversationCoordinator {
       return data;
     }
 
+    logEvent("MULTI_IMAGE_BATCH_ANALYSIS_STARTED", {
+      traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+      turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+      doName: data.doName,
+      assetCount: imageAnalysisBatch.assets.length,
+      fileIds: imageAnalysisBatch.assets.map(function (asset) { return asset.file_id; }).filter(Boolean)
+    });
+
     const analysisResult = await analyzeMediaBatch(this.env, {
       doName: data.doName,
       traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
@@ -1823,6 +2040,14 @@ export class ConversationCoordinator {
       mediaBatch: imageAnalysisBatch,
       caption: consolidatedMessagesText(messages),
       woztellPayload: woztellPayload
+    });
+    logEvent("MULTI_IMAGE_BATCH_ANALYSIS_DONE", {
+      traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+      turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+      doName: data.doName,
+      assetCount: analysisResult.summary && analysisResult.summary.asset_count || 0,
+      analyzedAssetCount: analysisResult.summary && analysisResult.summary.analyzed_asset_count || 0,
+      failedAssetCount: analysisResult.summary && analysisResult.summary.failed_asset_count || 0
     });
 
     data.campaignState = updateCampaignAssetsWithAnalysis(data.campaignState, analysisResult.assets);
@@ -2274,6 +2499,14 @@ export class ConversationCoordinator {
         }
       } else {
 
+      logEvent("MULTI_IMAGE_BATCH_ANALYSIS_STARTED", {
+        traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+        turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+        doName: data.doName,
+        assetCount: imageAnalysisBatch.assets.length,
+        fileIds: imageAnalysisBatch.assets.map(function (asset) { return asset.file_id; }).filter(Boolean)
+      });
+
       const analysisResult = await analyzeMediaBatch(this.env, {
         doName: data.doName,
         traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
@@ -2282,6 +2515,14 @@ export class ConversationCoordinator {
         mediaBatch: imageAnalysisBatch,
         caption: consolidatedMessagesText(messages),
         woztellPayload: woztellPayload
+      });
+      logEvent("MULTI_IMAGE_BATCH_ANALYSIS_DONE", {
+        traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+        turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+        doName: data.doName,
+        assetCount: analysisResult.summary && analysisResult.summary.asset_count || 0,
+        analyzedAssetCount: analysisResult.summary && analysisResult.summary.analyzed_asset_count || 0,
+        failedAssetCount: analysisResult.summary && analysisResult.summary.failed_asset_count || 0
       });
 
       data.campaignState = updateCampaignAssetsWithAnalysis(data.campaignState, analysisResult.assets);
@@ -6501,8 +6742,8 @@ function formatVisionUtilityResponse(intent, summary, userTurn) {
   }
 
   return [
-    question ? "Sobre tu pregunta: " + question : "Analisis visual",
-    subjects.length ? "Parece mostrar: " + subjects.join(" | ") : "",
+    question ? "Sobre tu pregunta: " + question : "Listo, revise la imagen.",
+    subjects.length ? "Veo: " + subjects.join(" | ") : "",
     objects.length ? "Objetos detectados: " + objects.join(", ") : "",
     visibleTexts.length ? "Texto visible: " + visibleTexts.join(" | ") : "",
     data.failed_asset_count ? "Nota: " + data.failed_asset_count + " imagen(es) no se pudieron analizar." : "",
@@ -6672,6 +6913,8 @@ function createEmptyCampaignState(reason) {
     expected_next_target: "unknown",
     collecting_assets: false,
     campaign_assets: [],
+    active_task: null,
+    task_media_assets: [],
     media_batch_summary: null,
     current_turn: null,
     active_turn: null,
@@ -6711,6 +6954,8 @@ function normalizeCampaignState(state) {
     expected_next_target: String(clean.expected_next_target || clean.expectedNextTarget || "unknown"),
     collecting_assets: Boolean(clean.collecting_assets || clean.collectingAssets || false),
     campaign_assets: normalizeCampaignAssets(clean.campaign_assets || clean.campaignAssets || []),
+    active_task: normalizeActiveTask(clean.active_task || clean.activeTask || null),
+    task_media_assets: normalizeCampaignAssets(clean.task_media_assets || clean.taskMediaAssets || []),
     media_batch_summary: clean.media_batch_summary || clean.mediaBatchSummary || null,
     current_turn: clean.current_turn || clean.currentTurn || null,
     active_turn: clean.active_turn || clean.activeTurn || null,
@@ -7757,6 +8002,10 @@ function shouldUsePreviousContext(messages) {
     "primera imagen",
     "tercera imagen",
     "los precios",
+    "te mande 2 imagenes",
+    "te envie 2 imagenes",
+    "te pase 2 imagenes",
+    "mande 2 imagenes",
     "cual conviene",
     "cuál conviene",
     "lo de antes",
@@ -7764,7 +8013,7 @@ function shouldUsePreviousContext(messages) {
     "y esta otra"
   ].some(function (pattern) {
     return text.includes(normalizeTextForIntent(pattern));
-  });
+  }) || isUserClaimingMoreImages(text);
 }
 
 function buildUserTurn(messages, campaignState, options) {
@@ -7772,6 +8021,12 @@ function buildUserTurn(messages, campaignState, options) {
   const turnId = options && options.turnId || "turn_" + Date.now() + "_" + randomId(6);
   const wantsPreviousContext = shouldUsePreviousContext(messages);
   const currentTurnBatch = buildMediaBatch(state, messages || [], { turnId: turnId, mode: "current_turn" });
+  const activeTask = normalizeActiveTask(state.active_task);
+  const taskMediaAssets = activeTask && activeTask.taskMediaFileIds.length
+    ? normalizeCampaignAssets(state.campaign_assets).filter(function (asset) {
+      return activeTask.taskMediaFileIds.includes(asset.file_id);
+    })
+    : normalizeCampaignAssets(state.task_media_assets || []);
   const previousMediaBatch = wantsPreviousContext
     ? buildMediaBatch(state, messages || [], { turnId: turnId, mode: "previous_relevant" })
     : { assets: [], fileIds: [], assetCount: 0, analyzedAssetCount: 0, failedAssetCount: 0 };
@@ -7810,6 +8065,12 @@ function buildUserTurn(messages, campaignState, options) {
     audio_batch: audioBatch,
     media_batch: mediaBatch,
     media_batch_summary: buildMediaBatchSummary(mediaBatch),
+    active_task: activeTask,
+    activeTask: activeTask,
+    task_media_assets: taskMediaAssets,
+    taskMediaAssets: taskMediaAssets,
+    expected_media_count: activeTask && activeTask.expectedInputs === "images" ? "unknown" : 0,
+    received_media_count: activeTask ? activeTask.receivedMediaCount : mediaBatch.assets.length,
     current_turn_media: summarizeAssetsForContext(currentTurnBatch.assets),
     previous_relevant_media: summarizeAssetsForContext(previousMediaBatch.assets),
     stale_media: summarizeAssetsForContext(staleAssets),
@@ -8527,9 +8788,224 @@ function formatVersionDiagnosticForWhatsApp(diagnostic) {
   ].join("\n");
 }
 
+function normalizeActiveTask(task) {
+  if (!task || typeof task !== "object") return null;
+  const taskMediaFileIds = Array.isArray(task.taskMediaFileIds || task.task_media_file_ids)
+    ? (task.taskMediaFileIds || task.task_media_file_ids).map(String).filter(Boolean)
+    : [];
+  const relatedMessageIds = Array.isArray(task.relatedMessageIds || task.related_message_ids)
+    ? (task.relatedMessageIds || task.related_message_ids).map(String).filter(Boolean)
+    : [];
+  const relatedText = Array.isArray(task.relatedText || task.related_text)
+    ? (task.relatedText || task.related_text).map(String).filter(Boolean).slice(-8)
+    : [];
+
+  return {
+    type: String(task.type || "pending_media_task"),
+    status: String(task.status || "awaiting_media"),
+    startedAt: Number(task.startedAt || task.started_at || Date.now()),
+    startedAtIso: String(task.startedAtIso || task.started_at_iso || new Date(Number(task.startedAt || Date.now())).toISOString()),
+    expectedInputs: String(task.expectedInputs || task.expected_inputs || "images"),
+    originalUserRequest: String(task.originalUserRequest || task.original_user_request || "").slice(0, 1000),
+    waitSeconds: Number(task.waitSeconds || task.wait_seconds || 30),
+    maxWaitSeconds: Number(task.maxWaitSeconds || task.max_wait_seconds || 45),
+    silenceSeconds: Number(task.silenceSeconds || task.silence_seconds || 8),
+    waitUntil: Number(task.waitUntil || task.wait_until || 0),
+    maxWaitUntil: Number(task.maxWaitUntil || task.max_wait_until || 0),
+    lastActivityAt: Number(task.lastActivityAt || task.last_activity_at || task.startedAt || Date.now()),
+    lastMediaAt: Number(task.lastMediaAt || task.last_media_at || 0),
+    taskMediaFileIds: Array.from(new Set(taskMediaFileIds)),
+    relatedMessageIds: Array.from(new Set(relatedMessageIds)),
+    relatedText: relatedText,
+    receivedMediaCount: Number(task.receivedMediaCount || task.received_media_count || taskMediaFileIds.length || 0),
+    doneSignalReceived: Boolean(task.doneSignalReceived || task.done_signal_received || false),
+    completedReason: String(task.completedReason || task.completed_reason || "")
+  };
+}
+
+function createTaskIntakeFromText(text, options) {
+  const original = String(text || "").trim();
+  if (!original || !isPendingMediaTaskRequest(original)) return null;
+  const timing = options || {};
+  const now = Number(timing.now || Date.now());
+  const waitSeconds = Number(timing.waitSeconds || 30);
+  const maxWaitSeconds = Number(timing.maxWaitSeconds || 45);
+  const silenceSeconds = Number(timing.silenceSeconds || 8);
+
+  return normalizeActiveTask({
+    type: inferTaskIntakeType(original),
+    status: "awaiting_media",
+    startedAt: now,
+    startedAtIso: new Date(now).toISOString(),
+    expectedInputs: "images",
+    originalUserRequest: original,
+    waitSeconds: waitSeconds,
+    maxWaitSeconds: maxWaitSeconds,
+    silenceSeconds: silenceSeconds,
+    waitUntil: now + waitSeconds * 1000,
+    maxWaitUntil: now + maxWaitSeconds * 1000,
+    lastActivityAt: now,
+    relatedText: [original],
+    taskMediaFileIds: [],
+    receivedMediaCount: 0
+  });
+}
+
+function updateTaskIntakeWithMessage(activeTask, message, options) {
+  const task = normalizeActiveTask(activeTask);
+  if (!task || task.status !== "awaiting_media") return task;
+  const msg = message || {};
+  const now = Number(options && options.now || Date.now());
+  const fileIds = extractImageFileIdsFromMessage(msg);
+  const text = extractPlainTurnText(msg.text || "");
+  const relatedMessageIds = task.relatedMessageIds.slice();
+  const relatedText = task.relatedText.slice();
+  const taskMediaFileIds = task.taskMediaFileIds.slice();
+
+  if (msg.messageId) relatedMessageIds.push(String(msg.messageId));
+  if (text) relatedText.push(text);
+  for (const fileId of fileIds) taskMediaFileIds.push(fileId);
+
+  return normalizeActiveTask(Object.assign({}, task, {
+    lastActivityAt: now,
+    lastMediaAt: fileIds.length ? now : task.lastMediaAt,
+    taskMediaFileIds: Array.from(new Set(taskMediaFileIds)),
+    relatedMessageIds: Array.from(new Set(relatedMessageIds)),
+    relatedText: relatedText.slice(-8),
+    receivedMediaCount: Array.from(new Set(taskMediaFileIds)).length,
+    doneSignalReceived: task.doneSignalReceived || isTaskDoneSignal(text)
+  }));
+}
+
+function buildTaskIntakeDecision(activeTask, options) {
+  const task = normalizeActiveTask(activeTask);
+  if (!task || task.status !== "awaiting_media") {
+    return { ready: false, shouldWait: false, reason: "no_active_task", nextProcessAt: 0 };
+  }
+  const now = Number(options && options.now || Date.now());
+  const silenceSeconds = Number(options && options.silenceSeconds || task.silenceSeconds || 8);
+  const userDone = Boolean(options && options.userDone || task.doneSignalReceived);
+  const hasMedia = Boolean(options && Object.prototype.hasOwnProperty.call(options, "hasMedia")
+    ? options.hasMedia
+    : task.receivedMediaCount > 0);
+  const silenceAt = (task.lastMediaAt || task.lastActivityAt || task.startedAt) + silenceSeconds * 1000;
+  const maxWaitUntil = task.maxWaitUntil || task.startedAt + task.maxWaitSeconds * 1000;
+  const waitUntil = task.waitUntil || task.startedAt + task.waitSeconds * 1000;
+
+  if (hasMedia && userDone) return { ready: true, shouldWait: false, reason: "user_done", nextProcessAt: now };
+  if (hasMedia && now >= maxWaitUntil) return { ready: true, shouldWait: false, reason: "max_wait", nextProcessAt: now };
+  if (hasMedia && now >= silenceAt) return { ready: true, shouldWait: false, reason: "silence", nextProcessAt: now };
+  if (!hasMedia && now >= waitUntil) return { ready: true, shouldWait: false, reason: "expired_no_media", nextProcessAt: now };
+
+  return {
+    ready: false,
+    shouldWait: true,
+    reason: hasMedia ? "awaiting_silence" : "awaiting_media",
+    nextProcessAt: hasMedia ? Math.min(silenceAt, maxWaitUntil) : Math.min(waitUntil, maxWaitUntil)
+  };
+}
+
+function handleUserClaimedMoreImages(text, campaignState, messages) {
+  const normalized = normalizeTextForIntent(text);
+  if (!isUserClaimingMoreImages(normalized)) {
+    return { claimed: false, claimedCount: 0, receivedCount: 0, shouldReanalyze: false, mediaBatch: { assets: [], fileIds: [] }, message: "" };
+  }
+  const claimedCount = extractClaimedImageCount(normalized) || 2;
+  const mediaBatch = buildMediaBatch(campaignState || {}, messages || [], { mode: "previous_relevant" });
+  const imageAssets = (mediaBatch.assets || []).filter(function (asset) {
+    return String(asset.media_type || "IMAGE").toUpperCase() === "IMAGE";
+  });
+  const receivedCount = imageAssets.length;
+  const shouldReanalyze = receivedCount >= claimedCount;
+  const message = shouldReanalyze
+    ? ""
+    : "Me llego solo una imagen; mandame la otra y la comparo.";
+
+  logEvent("USER_CLAIMED_MORE_IMAGES", {
+    claimedCount: claimedCount,
+    receivedCount: receivedCount
+  });
+  logEvent("MEDIA_RECOUNT_DONE", {
+    claimedCount: claimedCount,
+    receivedCount: receivedCount,
+    shouldReanalyze: shouldReanalyze,
+    fileIds: imageAssets.map(function (asset) { return asset.file_id; }).filter(Boolean)
+  });
+
+  return {
+    claimed: true,
+    claimedCount: claimedCount,
+    receivedCount: receivedCount,
+    shouldReanalyze: shouldReanalyze,
+    mediaBatch: Object.assign({}, mediaBatch, {
+      assets: imageAssets,
+      fileIds: imageAssets.map(function (asset) { return asset.file_id; }).filter(Boolean),
+      assetCount: imageAssets.length
+    }),
+    message: message
+  };
+}
+
+function isPendingMediaTaskRequest(text) {
+  const normalized = normalizeTextForIntent(text);
+  if (isExplicitMarketingRequest(normalized)) return false;
+  return /\b(revisa|mira|analiza|compara|puedes ver|te mando|te paso|voy a mandar|voy a pasar)\b.*\b(precio|precios|valor|valores|caro|cara|captura|capturas|foto|fotos|imagen|imagenes|imagenes|producto|productos)\b/.test(normalized) ||
+    /\b(que tal|que tal)\b.*\b(precio|precios|valores)\b/.test(normalized) ||
+    /\b(te mando unas imagenes|te paso fotos|compara estas fotos|revisa estas capturas|mira estas imagenes|analiza estos productos)\b/.test(normalized);
+}
+
+function inferTaskIntakeType(text) {
+  const normalized = normalizeTextForIntent(text);
+  if (/\b(precio|precios|valor|valores|caro|cara|barato|barata|conviene)\b/.test(normalized)) return "price_review";
+  if (/\b(documento|documentos|archivo|archivos|pdf)\b/.test(normalized)) return "document_review";
+  if (/\b(imagen|imagenes|foto|fotos|captura|capturas|producto|productos)\b/.test(normalized)) return "image_review";
+  return "pending_media_task";
+}
+
+function isTaskDoneSignal(text) {
+  const normalized = normalizeTextForIntent(text);
+  return /^(listo|ya|esas son|eso es todo|dale|revisa|revise|analiza|compara)\.?$/.test(normalized) ||
+    /\b(eso es todo|esas son|ya estan|dale revisa|dale analiza)\b/.test(normalized);
+}
+
+function isUserClaimingMoreImages(text) {
+  const normalized = normalizeTextForIntent(text);
+  return /\b(te mande|te envie|te pase|mande|envie|pase)\s+\d+\s+(imagen|imagenes|foto|fotos|captura|capturas)\b/.test(normalized) ||
+    /\b(pero|oye|no)\b.*\b(eran|son)\s+\d+\s+(imagen|imagenes|foto|fotos|captura|capturas)\b/.test(normalized);
+}
+
+function extractClaimedImageCount(text) {
+  const numeric = String(text || "").match(/\b(\d{1,2})\s+(?:imagen|imagenes|foto|fotos|captura|capturas)\b/);
+  if (numeric) return Number(numeric[1]);
+  if (/\bdos\s+(?:imagenes|fotos|capturas)\b/.test(text)) return 2;
+  if (/\btres\s+(?:imagenes|fotos|capturas)\b/.test(text)) return 3;
+  return 0;
+}
+
+function extractImageFileIdsFromMessage(message) {
+  const msg = message || {};
+  const ids = [];
+  if (msg.fileId && String(msg.type || "").toUpperCase() === "IMAGE") ids.push(String(msg.fileId));
+  for (const item of msg.media || []) {
+    if (item && item.fileId && String(item.type || "IMAGE").toUpperCase() === "IMAGE") ids.push(String(item.fileId));
+  }
+  return Array.from(new Set(ids));
+}
+
 function getNumberEnv(value, fallback) {
   const num = Number(value);
   return Number.isFinite(num) && num > 0 ? num : fallback;
+}
+
+function getTaskIntakeTimingConfig(env) {
+  const waitSeconds = getNumberEnv(env && env.TASK_INTAKE_WAIT_SECONDS, 30);
+  const maxWaitSeconds = Math.max(waitSeconds, getNumberEnv(env && env.TASK_INTAKE_MAX_WAIT_SECONDS, 45));
+
+  return {
+    waitSeconds: waitSeconds,
+    maxWaitSeconds: maxWaitSeconds,
+    silenceSeconds: getNumberEnv(env && env.TASK_INTAKE_SILENCE_SECONDS, 8)
+  };
 }
 
 function getBufferTimingConfig(env) {
@@ -8599,6 +9075,10 @@ export {
   mapOrchestratorActions,
   analyzeMediaBatch,
   buildMediaBatchSummary,
+  createTaskIntakeFromText,
+  updateTaskIntakeWithMessage,
+  buildTaskIntakeDecision,
+  handleUserClaimedMoreImages,
   buildVersionDiagnostic,
   formatVersionDiagnosticForWhatsApp,
   consolidatedMessagesText

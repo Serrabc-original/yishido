@@ -62,6 +62,7 @@ export function createConversationSupervisorPlan(input) {
   const clean = input || {};
   const currentTurn = clean.currentTurn || clean.current_turn || {};
   const activeContext = clean.activeContext || clean.active_context || {};
+  const activeTaskContext = normalizeActiveTaskForSupervisor(clean.activeTask || currentTurn.activeTask || currentTurn.active_task || activeContext.activeTask || activeContext.active_task || null);
   const recentWindow = Array.isArray(clean.recentConversationWindow || clean.recent_conversation_window)
     ? clean.recentConversationWindow || clean.recent_conversation_window
     : [];
@@ -86,7 +87,11 @@ export function createConversationSupervisorPlan(input) {
   const isOcr = isOcrIntent(normalized);
   const isMemory = isMemoryIntent(normalized);
   const hasExplicitContinuationReference = isContinuationReference(currentText);
-  const isPrice = isPriceReviewIntent(normalized) || (!hasText && hasCurrentImages && previousTask.intent === "price_review" && !hasPetMedia);
+  const hasAwaitingMediaTask = Boolean(activeTaskContext && activeTaskContext.status === "awaiting_media");
+  const activeTaskType = activeTaskContext && activeTaskContext.type || "";
+  const isPrice = isPriceReviewIntent(normalized) ||
+    (!hasText && hasCurrentImages && previousTask.intent === "price_review" && !hasPetMedia) ||
+    (hasCurrentImages && activeTaskType === "price_review" && !hasPetMedia);
   const isProductAdvice = isProductAdviceIntent(normalized) || (hasCurrentImages && hasCommercialMedia && isImageQuestionIntent(normalized));
   const inferredCurrentIntent = inferIntentName({
     isReminder: isReminder,
@@ -197,6 +202,39 @@ export function createConversationSupervisorPlan(input) {
     needsClarification = false;
     responseStrategy = "analyze_then_answer";
     clarificationQuestion = "";
+  }
+
+  if (hasAwaitingMediaTask && hasCurrentImages && !isContextSwitch) {
+    logEvent("SUPERVISOR_ACTIVE_TASK_USED", {
+      activeTaskType: activeTaskType,
+      imageCount: imageCount
+    });
+    logEvent("SUPERVISOR_MEDIA_ASSIGNED_TO_TASK", {
+      activeTaskType: activeTaskType,
+      imageCount: imageCount
+    });
+    if (activeTaskType === "price_review" && !hasPetMedia) {
+      intent = imageCount > 1 ? "multi_image_price_review" : "price_review";
+      activeTask = "price_review";
+      targetModules = ["vision", "general_llm"];
+      mediaScope = imageCount > 1 ? "all_pending_batch" : "current_only";
+      responseStrategy = "analyze_then_answer";
+      needsClarification = false;
+      clarificationQuestion = "";
+      logEvent("SUPERVISOR_SKIPPED_CLARIFICATION_DUE_TO_TASK", {
+        activeTaskType: activeTaskType,
+        imageCount: imageCount
+      });
+    }
+  } else if (hasAwaitingMediaTask && isContextSwitch) {
+    logEvent("SUPERVISOR_ACTIVE_TASK_IGNORED", {
+      activeTaskType: activeTaskType,
+      reason: "context_switch"
+    });
+  } else if (hasCurrentImages && intent === "unknown_image_request") {
+    logEvent("SUPERVISOR_ASKED_IMAGE_CLARIFICATION", {
+      imageCount: imageCount
+    });
   }
 
   const currentTextForLegacyContinuation = hasExplicitContinuationReference ? currentText : "";
@@ -379,6 +417,20 @@ function findPreviousTask(window, activeContext) {
   }
 
   return { intent: active && active !== "unknown" ? active : "general", source: active ? "active_context" : "" };
+}
+
+function normalizeActiveTaskForSupervisor(task) {
+  if (!task || typeof task !== "object") return null;
+  return {
+    type: String(task.type || task.activeTask || task.active_task || ""),
+    status: String(task.status || ""),
+    originalUserRequest: String(task.originalUserRequest || task.original_user_request || ""),
+    expectedInputs: String(task.expectedInputs || task.expected_inputs || ""),
+    receivedMediaCount: Number(task.receivedMediaCount || task.received_media_count || 0),
+    taskMediaFileIds: Array.isArray(task.taskMediaFileIds || task.task_media_file_ids)
+      ? (task.taskMediaFileIds || task.task_media_file_ids).map(String).filter(Boolean)
+      : []
+  };
 }
 
 function inferIntentName(flags) {
