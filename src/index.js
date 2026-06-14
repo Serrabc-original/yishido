@@ -1197,12 +1197,32 @@ export class ConversationCoordinator {
         if (message.messageId !== messageId) return message;
 
         updated = true;
-        const transcript = String(body.transcript || "").trim();
+        const transcript = cleanUserVisibleText(body.transcript || "");
         const audioStatus = body.type === "audio_transcribed" && transcript ? "transcribed" : "failed";
         const cleanExistingText = cleanUserVisibleText(message.text || "");
         const text = transcript
           ? [transcript, cleanExistingText && cleanExistingText !== transcript ? cleanExistingText : ""].filter(Boolean).join("\n")
           : cleanExistingText;
+        if (transcript) {
+          logEvent("AUDIO_TRANSCRIPT_CLEANED", {
+            traceId: data.currentTraceId || message.traceId || "",
+            turnId: data.currentTurnId || message.turnId || "",
+            doName: data.doName || "",
+            messageId: messageId,
+            fileId: message.fileId || message.originalFileId || "",
+            textPreview: transcript.slice(0, 240),
+            source: "conversation_tool_result"
+          });
+          logEvent("AUDIO_TRANSCRIPT_USED_AS_USER_TEXT", {
+            traceId: data.currentTraceId || message.traceId || "",
+            turnId: data.currentTurnId || message.turnId || "",
+            doName: data.doName || "",
+            messageId: messageId,
+            fileId: message.fileId || message.originalFileId || "",
+            textLength: text.length,
+            source: "conversation_tool_result"
+          });
+        }
 
         return Object.assign({}, message, {
           type: "AUDIO",
@@ -2526,7 +2546,10 @@ export class ConversationCoordinator {
   async executePlan(data, messages, plan, userTurn) {
     const woztellPayload = buildWoztellPayloadFromData(data, messages);
     const actions = Array.isArray(plan.actions) ? plan.actions : [];
-    const mediaBatch = userTurn && userTurn.media_batch || buildMediaBatch(data.campaignState, messages, { turnId: data.currentTurnId || "" });
+    const mediaBatch = buildMediaBatch(data.campaignState, messages, {
+      userTurn: userTurn,
+      activeTaskAssets: userTurn && userTurn.taskMediaAssets || userTurn && userTurn.task_media_assets || []
+    });
     let copyText = "";
     let ackSent = false;
     let draftSaved = false;
@@ -2543,7 +2566,19 @@ export class ConversationCoordinator {
     });
 
     if (shouldAnalyzeUploadedImage) {
-      const uploadedMediaBatch = userTurn && userTurn.media_batch || getUploadedMediaBatch(data.campaignState, messages, { turnId: data.currentTurnId || "" });
+      const uploadedMediaBatch = mediaBatch && mediaBatch.assets && mediaBatch.assets.length
+        ? mediaBatch
+        : getUploadedMediaBatch(data.campaignState, messages, { turnId: data.currentTurnId || "" });
+      if (userTurn && userTurn.images && userTurn.images.length && uploadedMediaBatch.assets.length < userTurn.images.length) {
+        logEvent("LEGACY_IMAGE_SINGLE_ASSET_PATH_BLOCKED", {
+          traceId: userTurn.trace_id || data.currentTraceId || "",
+          turnId: userTurn.turn_id || data.currentTurnId || "",
+          doName: data.doName,
+          userTurnImageCount: userTurn.images.length,
+          selectedImageCount: uploadedMediaBatch.assets.length,
+          reason: "execute_plan_requires_user_turn_media"
+        });
+      }
       const imageAnalysisBatch = Object.assign({}, uploadedMediaBatch, {
         assets: (uploadedMediaBatch.assets || []).filter(function (asset) {
           return String(asset.media_type || "IMAGE").toUpperCase() === "IMAGE";
@@ -2637,10 +2672,19 @@ export class ConversationCoordinator {
         });
         const text = formatVisionUtilityResponse(plan.intent, analysisResult.summary, userTurn);
         try {
-          await sendLongTextByWoztell(this.env, {
+          await sendConversationalResponse(this.env, {
             channelId: data.channel,
             recipientId: data.phone,
-            text: text
+            memberId: data.member,
+            appId: data.app,
+            traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+            turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+            doName: data.doName,
+            userTurn: userTurn,
+            intent: plan.intent,
+            text: text,
+            visibleFacts: [analysisResult.summary],
+            nextAction: ""
           });
           logEvent("VISION_FINAL_RESPONSE_SENT", {
             traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
@@ -2695,10 +2739,25 @@ export class ConversationCoordinator {
     }
 
     if (plan.user_facing_ack && hasAsyncImageAction) {
-      await sendWoztellTextMessage(this.env, {
+      logEvent("LEGACY_ORCHESTRATOR_DIRECT_REPLY_BLOCKED", {
+        traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+        turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+        doName: data.doName,
+        reason: "async_image_ack_uses_customer_reply_composer"
+      });
+      await sendConversationalResponse(this.env, {
         channelId: data.channel,
         recipientId: data.phone,
-        text: plan.user_facing_ack
+        memberId: data.member,
+        appId: data.app,
+        traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+        turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+        doName: data.doName,
+        userTurn: userTurn,
+        intent: plan.intent || "image_action",
+        text: plan.user_facing_ack,
+        visibleFacts: [],
+        nextAction: ""
       });
       ackSent = true;
       data.campaignState.history = appendHistory(data.campaignState.history, {
@@ -3036,10 +3095,25 @@ export class ConversationCoordinator {
 
     if (!copyText && !hasAsyncImageAction && !approvalDone && !ackSent) {
       const fallbackText = plan.user_facing_ack || USER_MESSAGES.genericClarification;
-      await sendWoztellTextMessage(this.env, {
+      logEvent("LEGACY_ORCHESTRATOR_DIRECT_REPLY_BLOCKED", {
+        traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+        turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+        doName: data.doName,
+        reason: "final_ack_uses_customer_reply_composer"
+      });
+      await sendConversationalResponse(this.env, {
         channelId: data.channel,
         recipientId: data.phone,
-        text: fallbackText
+        memberId: data.member,
+        appId: data.app,
+        traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+        turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+        doName: data.doName,
+        userTurn: userTurn,
+        intent: plan.intent || "general",
+        text: fallbackText,
+        visibleFacts: [],
+        nextAction: ""
       });
     }
 
@@ -3270,25 +3344,32 @@ async function convertAudioMessageToText(env, woztellPayload, parsedMessage) {
     throw new Error("AUDIO_TRANSCRIPTION_EMPTY");
   }
 
-  const parts = ["[Audio transcrito]: " + transcript.trim()];
+  const cleanTranscript = cleanUserVisibleText(transcript);
+  const cleanCaption = cleanUserVisibleText(parsedMessage.text || "");
+  const text = [cleanTranscript, cleanCaption && cleanCaption !== cleanTranscript ? cleanCaption : ""].filter(Boolean).join("\n");
 
-  if (parsedMessage.text && parsedMessage.text.trim()) {
-    parts.push("[Texto adicional]: " + parsedMessage.text.trim());
-  }
-
-  const text = parts.join("\n");
-
-    console.log("AUDIO_AS_TEXT_BUFFERED:", JSON.stringify({
-      textPreview: text.slice(0, 500)
-    }));
-    logEvent("AUDIO_TRANSCRIPT_NORMALIZED", {
-      textPreview: transcript.trim().slice(0, 240),
-      source: "direct_audio_conversion"
-    });
+  logEvent("LEGACY_AUDIO_TEXT_PREFIX_BLOCKED", {
+    messageId: parsedMessage.messageId || "",
+    fileId: parsedMessage.fileId || "",
+    source: "direct_audio_conversion"
+  });
+  logEvent("AUDIO_TRANSCRIPT_CLEANED", {
+    messageId: parsedMessage.messageId || "",
+    fileId: parsedMessage.fileId || "",
+    textPreview: cleanTranscript.slice(0, 240),
+    source: "direct_audio_conversion"
+  });
+  logEvent("AUDIO_TRANSCRIPT_USED_AS_USER_TEXT", {
+    messageId: parsedMessage.messageId || "",
+    fileId: parsedMessage.fileId || "",
+    textLength: text.length,
+    source: "direct_audio_conversion"
+  });
 
   return Object.assign({}, parsedMessage, {
     type: "TEXT",
     text: text,
+    audioTranscript: cleanTranscript,
     originalType: parsedMessage.type,
     originalFileId: parsedMessage.fileId,
     fileId: ""
@@ -5320,38 +5401,50 @@ async function processAudioQueueJob(env, job) {
       throw new Error("AUDIO_TRANSCRIPTION_EMPTY");
     }
 
-    const parts = ["[Audio transcrito]: " + transcript.trim()];
+    const cleanTranscript = cleanUserVisibleText(transcript);
 
-    if (parsedMessage.text && parsedMessage.text.trim()) {
-      parts.push("[Texto adicional]: " + parsedMessage.text.trim());
-    }
-
-    const text = parts.join("\n");
-
-    console.log("AUDIO_AS_TEXT_BUFFERED:", JSON.stringify({
+    logEvent("LEGACY_AUDIO_TEXT_PREFIX_BLOCKED", {
+      traceId: job.traceId || "",
       doName: job.doName || "",
       messageId: job.messageId || "",
-      textPreview: text.slice(0, 500)
-    }));
+      fileId: job.fileId || "",
+      source: "audio_queue"
+    });
+    logEvent("AUDIO_TRANSCRIPT_CLEANED", {
+      traceId: job.traceId || "",
+      doName: job.doName || "",
+      messageId: job.messageId || "",
+      fileId: job.fileId || "",
+      textPreview: cleanTranscript.slice(0, 240),
+      source: "audio_queue"
+    });
     logEvent("AUDIO_TRANSCRIPT_NORMALIZED", {
       traceId: job.traceId || "",
       doName: job.doName || "",
       messageId: job.messageId || "",
-      textPreview: transcript.trim().slice(0, 240),
+      textPreview: cleanTranscript.slice(0, 240),
+      source: "audio_queue"
+    });
+    logEvent("AUDIO_TRANSCRIPT_USED_AS_USER_TEXT", {
+      traceId: job.traceId || "",
+      doName: job.doName || "",
+      messageId: job.messageId || "",
+      fileId: job.fileId || "",
+      textLength: cleanTranscript.length,
       source: "audio_queue"
     });
 
     await notifyConversationDO(env, job.doName || buildConversationName(woztellPayload), {
       type: "audio_transcribed",
       messageId: job.messageId || parsedMessage.messageId || woztellPayload.messageId || "",
-      transcript: transcript,
+      transcript: cleanTranscript,
       transcribedAt: new Date().toISOString()
     });
 
     console.log("AUDIO_PIPELINE_DONE:", JSON.stringify({
       doName: job.doName || "",
       messageId: job.messageId || "",
-      transcriptLength: transcript.length
+      transcriptLength: cleanTranscript.length
     }));
     console.log("AUDIO_BATCH_TRANSCRIPTION_DONE:", JSON.stringify({
       doName: job.doName || "",
@@ -8383,7 +8476,8 @@ function buildMediaBatch(campaignState, messages, options) {
 
   if (messageFileIds.size) {
     assets = allAssets.filter(function (asset) {
-      return messageFileIds.has(asset.file_id);
+      return messageFileIds.has(asset.file_id) ||
+        mode === "current_turn" && turnId && (asset.turn_id === turnId || asset.request_id === turnId);
     });
   } else if (mode === "current_turn" && turnId) {
     assets = allAssets.filter(function (asset) {
@@ -8391,6 +8485,15 @@ function buildMediaBatch(campaignState, messages, options) {
     });
   } else if (mode === "previous_relevant") {
     assets = selectReferencedPreviousMediaAssets(allAssets, messages || []);
+  }
+
+  if (mode === "current_turn" && turnId && messageFileIds.size && assets.length > messageFileIds.size) {
+    logEvent("LEGACY_IMAGE_SINGLE_ASSET_PATH_BLOCKED", {
+      turnId: turnId,
+      messageFileIds: Array.from(messageFileIds),
+      selectedFileIds: assets.map(function (asset) { return asset.file_id; }).filter(Boolean),
+      reason: "same_turn_assets_preserved"
+    });
   }
 
   if (!assets.length && mode === "previous_relevant" && state.last_uploaded_image) {
@@ -8433,9 +8536,11 @@ function buildMediaBatch(campaignState, messages, options) {
     failedAssetCount: failedAssetCount
   };
   logEvent("MEDIA_BATCH_FILE_IDS_FINAL", {
+    turnId: turnId,
     fileIds: fileIds
   });
   logEvent("MEDIA_BATCH_COUNTS_FINAL", {
+    turnId: turnId,
     assetCount: assets.length,
     imageCount: assets.filter(function (asset) { return asset.media_type === "IMAGE"; }).length,
     videoCount: assets.filter(function (asset) { return asset.media_type === "VIDEO"; }).length,
