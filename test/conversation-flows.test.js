@@ -1,0 +1,147 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  composeFinalResponse,
+  composeGeneralTextAnswer
+} from "../src/ai/finalResponseComposer.js";
+import {
+  createConversationSupervisorPlan,
+  generateFinalUserResponse
+} from "../src/supervisor/conversationSupervisor.js";
+import {
+  buildUserTurn,
+  normalizeIncomingMessage
+} from "../src/index.js";
+
+const basePayload = {
+  type: "TEXT",
+  app: "app",
+  channel: "channel",
+  from: "user",
+  to: "bot"
+};
+
+function textMessage(text, messageId) {
+  return normalizeIncomingMessage({ type: "TEXT", text }, basePayload, {
+    messageId: messageId || "text",
+    receivedAt: "2026-06-14T12:00:00.000Z"
+  });
+}
+
+function imageMessage(fileId, messageId) {
+  return normalizeIncomingMessage({ type: "IMAGE", fileId }, Object.assign({}, basePayload, { type: "IMAGE" }), {
+    messageId: messageId || fileId,
+    receivedAt: "2026-06-14T12:00:01.000Z"
+  });
+}
+
+function planTurn(messages, campaignState, recentConversationWindow, activeContext, turnId) {
+  const turn = buildUserTurn(messages, campaignState || {}, { turnId: turnId || "turn_flow" });
+  const plan = createConversationSupervisorPlan({
+    currentTurn: turn,
+    recentConversationWindow: recentConversationWindow || [],
+    activeContext: activeContext || {}
+  });
+  return { turn, plan };
+}
+
+test("price request followed by three images is treated as one comparison flow", () => {
+  const recent = [{ turnId: "turn_text", type: "text", summary: "Puedes revisar estos precios?", mediaRefs: {} }];
+  const campaignState = {
+    campaign_assets: [
+      { asset_id: "asset_1", file_id: "img_1", url: "https://cdn/1.jpg", media_type: "IMAGE", turn_id: "turn_imgs" },
+      { asset_id: "asset_2", file_id: "img_2", url: "https://cdn/2.jpg", media_type: "IMAGE", turn_id: "turn_imgs" },
+      { asset_id: "asset_3", file_id: "img_3", url: "https://cdn/3.jpg", media_type: "IMAGE", turn_id: "turn_imgs" }
+    ]
+  };
+  const { turn, plan } = planTurn([
+    imageMessage("img_1"),
+    imageMessage("img_2"),
+    imageMessage("img_3")
+  ], campaignState, recent, { activeIntent: "price_review" }, "turn_imgs");
+
+  assert.equal(plan.intent, "multi_image_price_review");
+  assert.equal(plan.mediaScope, "all_pending_batch");
+  assert.equal(turn.media_batch.assets.length, 3);
+});
+
+test("new technical question after price flow does not inherit stale media or task", () => {
+  const { plan } = planTurn([
+    textMessage("como funciona un motor de induccion?", "tech")
+  ], {
+    campaign_assets: [
+      { asset_id: "asset_old", file_id: "old_price", url: "https://cdn/old.jpg", media_type: "IMAGE", turn_id: "old" }
+    ]
+  }, [
+    { turnId: "old", type: "image", summary: "precios de productos", mediaRefs: { assetCount: 1 } }
+  ], { activeIntent: "price_review" }, "turn_tech");
+  const answer = composeGeneralTextAnswer("como funciona un motor de induccion?");
+
+  assert.equal(plan.intent, "general");
+  assert.equal(plan.mediaScope, "none");
+  assert.equal(plan.isContextSwitch, true);
+  assert.match(answer, /estator|rotor|campo/i);
+});
+
+test("single image without caption is analyzed and final response is image-specific", () => {
+  const vision = {
+    assets: [{
+      analysis: {
+        main_subject: "gatito gris acostado en una cama",
+        product_type: "",
+        objects_detected: ["gato", "cama"],
+        confidence: 0.9
+      }
+    }]
+  };
+  const { plan } = planTurn([imageMessage("cat")], {
+    campaign_assets: [{ asset_id: "asset_1", file_id: "cat", url: "https://cdn/cat.jpg", media_type: "IMAGE", turn_id: "turn_cat" }]
+  }, [], { activeIntent: "general" }, "turn_cat");
+  const response = composeFinalResponse({
+    supervisorPlan: plan,
+    specialistResults: { vision },
+    currentMediaSummary: vision
+  });
+
+  assert.equal(plan.responseStrategy, "analyze_then_answer");
+  assert.match(response.text, /gatito|gato|caption|describir/i);
+  assert.doesNotMatch(response.text, /modelo exacto|garantia|precio/i);
+});
+
+test("continuation phrase keeps the previous price comparison task", () => {
+  const campaignState = {
+    campaign_assets: [
+      { asset_id: "asset_1", file_id: "img_next", url: "https://cdn/next.jpg", media_type: "IMAGE", turn_id: "turn_next" }
+    ]
+  };
+  const { plan } = planTurn([
+    textMessage("y este otro?", "next_text"),
+    imageMessage("img_next")
+  ], campaignState, [
+    { turnId: "old", type: "text", summary: "revisa estos precios", mediaRefs: {} }
+  ], { activeIntent: "price_review" }, "turn_next");
+
+  assert.equal(plan.intent, "price_review");
+  assert.equal(plan.isContinuation, true);
+  assert.equal(plan.mediaScope, "current_only");
+});
+
+test("multi image final answer compares all visible prices", () => {
+  const text = generateFinalUserResponse({
+    intent: "multi_image_price_review",
+    mediaScope: "all_pending_batch"
+  }, {
+    vision: {
+      assets: [
+        { analysis: { main_subject: "parlante", product_type: "parlante JBL", visible_text: "$55.99" } },
+        { analysis: { main_subject: "audifonos", product_type: "audifonos Sony", visible_text: "$39.99" } },
+        { analysis: { main_subject: "cargador", product_type: "cargador USB-C", visible_text: "$24.99" } }
+      ]
+    }
+  });
+
+  assert.match(text, /Imagen 1/);
+  assert.match(text, /Imagen 2/);
+  assert.match(text, /Imagen 3/);
+  assert.match(text, /parece mas conveniente/i);
+});

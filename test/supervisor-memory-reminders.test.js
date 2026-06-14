@@ -153,6 +153,41 @@ test("topic switch from prices to reminder does not keep price intent", () => {
   assert.equal(plan.mediaScope, "none");
 });
 
+test("technical text after price context is a context switch, not price continuation", () => {
+  const turn = buildUserTurn([textMessage("Como funciona un motor de induccion?", "tech")], {}, { turnId: "turn_tech" });
+  const plan = createConversationSupervisorPlan({
+    currentTurn: turn,
+    recentConversationWindow: [{ turnId: "old", type: "text", summary: "revisa estos precios", mediaRefs: {} }],
+    activeContext: { activeIntent: "price_review" }
+  });
+
+  assert.equal(plan.intent, "general");
+  assert.equal(plan.activeTask, "general");
+  assert.equal(plan.isContextSwitch, true);
+  assert.equal(plan.isContinuation, false);
+});
+
+test("clear audio question after images does not drag stale image context", () => {
+  const msg = textMessage("[Audio transcrito]: Como funciona un motor de induccion?", "audio_tech");
+  msg.originalType = "AUDIO";
+  msg.audioTranscript = "Como funciona un motor de induccion?";
+  const turn = buildUserTurn([msg], {
+    campaign_assets: [
+      { asset_id: "asset_old", file_id: "old_img", url: "https://cdn/old.jpg", media_type: "IMAGE", turn_id: "old" }
+    ]
+  }, { turnId: "audio_tech_turn" });
+  const plan = createConversationSupervisorPlan({
+    currentTurn: turn,
+    recentConversationWindow: [{ turnId: "old", type: "image", summary: "foto anterior", mediaRefs: { assetCount: 1 } }],
+    activeContext: { activeIntent: "image_question" }
+  });
+
+  assert.equal(plan.intent, "general");
+  assert.equal(plan.mediaScope, "none");
+  assert.equal(plan.isContextSwitch, true);
+  assert.equal(turn.media_batch.assets.length, 0);
+});
+
 test("audio transcript list request routes to list without dragging images", () => {
   const msg = textMessage("[Audio transcrito]: hazme una lista de huevos, pan, leche y carne", "audio_text");
   msg.originalType = "AUDIO";
@@ -167,6 +202,45 @@ test("audio transcript list request routes to list without dragging images", () 
   assert.equal(plan.intent, "list");
   assert.equal(plan.mediaScope, "none");
   assert.equal(turn.media_batch.assets.length, 0);
+});
+
+test("single image without text is analyzed before asking a useful question", () => {
+  const messages = [imageMessage("img_lonely")];
+  const campaignState = {
+    campaign_assets: [
+      { asset_id: "asset_1", asset_index: 1, file_id: "img_lonely", url: "https://cdn/lonely.jpg", media_type: "IMAGE", turn_id: "turn_lonely" }
+    ]
+  };
+  const turn = buildUserTurn(messages, campaignState, { turnId: "turn_lonely" });
+  const plan = createConversationSupervisorPlan({
+    currentTurn: turn,
+    recentConversationWindow: [],
+    activeContext: { activeIntent: "general" }
+  });
+
+  assert.equal(plan.intent, "unknown_image_request");
+  assert.equal(plan.responseStrategy, "analyze_then_answer");
+  assert.equal(plan.needsClarification, false);
+  assert.equal(plan.mediaScope, "current_only");
+});
+
+test("short continuation keeps previous price task for the next image", () => {
+  const messages = [textMessage("y este otro?", "and_this"), imageMessage("img_next")];
+  const campaignState = {
+    campaign_assets: [
+      { asset_id: "asset_1", asset_index: 1, file_id: "img_next", url: "https://cdn/next.jpg", media_type: "IMAGE", turn_id: "turn_next" }
+    ]
+  };
+  const turn = buildUserTurn(messages, campaignState, { turnId: "turn_next" });
+  const plan = createConversationSupervisorPlan({
+    currentTurn: turn,
+    recentConversationWindow: [{ turnId: "old", type: "text", summary: "revisa estos precios", mediaRefs: {} }],
+    activeContext: { activeIntent: "price_review" }
+  });
+
+  assert.equal(plan.intent, "price_review");
+  assert.equal(plan.isContinuation, true);
+  assert.equal(plan.mediaScope, "current_only");
 });
 
 test("reset clears media context while lists stay available only via lists command", () => {

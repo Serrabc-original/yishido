@@ -66,6 +66,29 @@ test("clear technical text question gets direct explanation instead of generic f
   assert.doesNotMatch(answer, /qué necesitas que haga con esto|que necesitas que haga con esto/i);
 });
 
+test("simple greeting gets a warm assistant intro", () => {
+  const answer = composeGeneralTextAnswer("hola");
+
+  assert.match(answer, /Hola|Yishido/i);
+  assert.match(answer, /preguntas|fotos|audios/i);
+  assert.doesNotMatch(answer, /que necesitas que haga con esto/i);
+});
+
+test("capability question explains useful WhatsApp actions", () => {
+  const answer = composeGeneralTextAnswer("que puedes hacer?");
+
+  assert.match(answer, /listas|recordatorios|imagenes|precios/i);
+  assert.match(answer, /solo cuando/i);
+});
+
+test("generic help request asks for the artifact and goal, not a bot fallback", () => {
+  const answer = composeGeneralTextAnswer("ayudame con esto");
+
+  assert.match(answer, /Mandame|foto|audio|texto/i);
+  assert.match(answer, /explicarlo|resumirlo|recordatorio/i);
+  assert.doesNotMatch(answer, /que necesitas que haga con esto/i);
+});
+
 test("clear audio transcript question gets direct explanation", () => {
   const response = composeFinalResponse({
     supervisorPlan: { intent: "general" },

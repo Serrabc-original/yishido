@@ -144,7 +144,27 @@ export function validateSpecialistOutputAgainstIntent(input) {
 export function composeGeneralTextAnswer(text) {
   const normalized = normalizeText(text);
 
+  if (isGreeting(normalized)) {
+    return "Hola, soy Yishido. Puedo ayudarte con preguntas, fotos, audios, listas, recordatorios y revision de productos o precios cuando me lo pidas.";
+  }
+
+  if (asksCapabilities(normalized)) {
+    return "Puedo responder preguntas, explicar temas rapido, revisar imagenes, comparar precios, leer texto visible en fotos, entender audios transcritos, crear listas y preparar recordatorios. Tambien puedo ayudarte con contenido para redes, pero solo cuando me lo pidas claramente.";
+  }
+
+  if (asksGenericHelp(normalized)) {
+    return "Claro. Mandame el texto, foto o audio y dime que quieres lograr: explicarlo, resumirlo, comparar opciones, sacar una lista o dejar un recordatorio.";
+  }
+
   if (!hasClearQuestion(text)) return "";
+
+  if (/\bmotor(es)?\s+de\s+induccion\b/.test(normalized)) {
+    return [
+      "Si, te explico simple.",
+      "Un motor de induccion funciona usando electricidad para crear un campo magnetico giratorio en el estator. Ese campo induce corriente en el rotor y eso genera movimiento.",
+      "En simple: no necesita escobillas; el rotor gira porque el campo magnetico lo arrastra."
+    ].join("\n\n");
+  }
 
   if (/\bmotor(es)?\s+(a\s+)?induccion\b/.test(normalized) || /\bmotor(es)?\s+(a\s+)?induccion\b/.test(normalized.replace(/ó/g, "o"))) {
     return [
@@ -361,6 +381,7 @@ function answersUserQuestion(responseText, message, plan, mediaSummary) {
   if (isGenericFallback(responseText)) return false;
   const normalizedResponse = normalizeText(responseText);
   const normalizedMessage = normalizeText(message);
+  if (/\bmotor(es)?\s+de\s+induccion\b/.test(normalizedMessage)) return normalizedResponse.includes("campo magnetico") || normalizedResponse.includes("estator");
   if (/\bmotor(es)?\s+(a\s+)?induccion\b/.test(normalizedMessage)) return normalizedResponse.includes("campo magnetico") || normalizedResponse.includes("estator");
   if (/\bsarro|tartar\b/.test(normalizedMessage)) return normalizedResponse.includes("sarro") || normalizedResponse.includes("tartar");
   if ((plan.intent || "").includes("image") && firstSubject(mediaSummary)) return normalizedResponse.length > 20;
@@ -371,6 +392,18 @@ function hasClearQuestion(text) {
   const normalized = normalizeText(text);
   return String(text || "").includes("?") ||
     /\b(como|cómo|que|qué|por que|por qué|para que|para qué|me sirve|sirve para|cuanto|cuánto|cual|cuál)\b/.test(normalized);
+}
+
+function isGreeting(normalized) {
+  return /^(hola|buenas|buenos dias|buen dia|buenas tardes|buenas noches|hey|hello)\b/.test(normalized);
+}
+
+function asksCapabilities(normalized) {
+  return /\b(que puedes hacer|para que sirves|ayuda|comandos|help)\b/.test(normalized);
+}
+
+function asksGenericHelp(normalized) {
+  return /\b(ayudame con esto|me ayudas con esto|puedes ayudarme con esto)\b/.test(normalized);
 }
 
 function hasCommercialPriceContext(text) {

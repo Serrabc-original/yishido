@@ -84,25 +84,30 @@ export function createConversationSupervisorPlan(input) {
   const isMarketing = isMarketingIntent(normalized);
   const isOcr = isOcrIntent(normalized);
   const isMemory = isMemoryIntent(normalized);
+  const hasExplicitContinuationReference = isContinuationReference(currentText);
   const isPrice = isPriceReviewIntent(normalized) || (!hasText && hasCurrentImages && previousTask.intent === "price_review" && !hasPetMedia);
   const isProductAdvice = isProductAdviceIntent(normalized) || (hasCurrentImages && hasCommercialMedia && isImageQuestionIntent(normalized));
+  const inferredCurrentIntent = inferIntentName({
+    isReminder: isReminder,
+    isList: isList,
+    isMarketing: isMarketing,
+    isMemory: isMemory,
+    isPrice: isPrice,
+    isProductAdvice: isProductAdvice,
+    isOcr: isOcr,
+    hasCurrentImages: hasCurrentImages,
+    normalized: normalized
+  });
   const isContextSwitch = Boolean(
-    (isReminder || isList || isMarketing || isMemory) &&
+    hasText &&
+    !hasExplicitContinuationReference &&
     previousTask.intent &&
     previousTask.intent !== "general" &&
-    previousTask.intent !== inferIntentName({
-      isReminder: isReminder,
-      isList: isList,
-      isMarketing: isMarketing,
-      isMemory: isMemory,
-      isPrice: isPrice,
-      isOcr: isOcr,
-      hasCurrentImages: hasCurrentImages,
-      normalized: normalized
-    })
+    inferredCurrentIntent !== "unknown" &&
+    inferredCurrentIntent !== previousTask.intent
   );
   let intent = "general";
-  let activeTask = previousTask.intent || "general";
+  let activeTask = "general";
   let mediaScope = "none";
   let targetModules = ["general_llm"];
   let responseStrategy = "answer_now";
@@ -188,15 +193,16 @@ export function createConversationSupervisorPlan(input) {
     activeTask = intent;
     targetModules = ["vision", "general_llm"];
     mediaScope = imageCount > 1 ? "all_pending_batch" : "current_only";
-    needsClarification = !hasText && previousTask.intent === "general";
-    responseStrategy = needsClarification ? "ask_clarification" : "analyze_then_answer";
-    clarificationQuestion = needsClarification ? buildImageClarificationQuestion(mediaSubjectText) : "";
+    needsClarification = false;
+    responseStrategy = "analyze_then_answer";
+    clarificationQuestion = "";
   }
 
+  const currentTextForLegacyContinuation = hasExplicitContinuationReference ? currentText : "";
   const isContinuation = Boolean(!isContextSwitch && (
     previousTask.intent && previousTask.intent === activeTask && activeTask !== "general" ||
     !hasText && hasCurrentImages && previousTask.intent !== "general" ||
-    /\b(eso|esto|esta|este|la segunda|la primera|los precios|lo de antes|y este|y esta|cual conviene|cu[aá]l conviene)\b/i.test(currentText)
+    /\b(eso|esto|esta|este|la segunda|la primera|los precios|lo de antes|y este|y esta|cual conviene|cu[aá]l conviene)\b/i.test(currentTextForLegacyContinuation)
   ));
 
   if (isContinuation && hasCurrentImages && previousTask.intent === "price_review" && !hasPetMedia) {
@@ -370,6 +376,7 @@ function inferIntentName(flags) {
   if (flags.isMarketing) return "marketing";
   if (flags.isMemory) return "memory";
   if (flags.isPrice) return "price_review";
+  if (flags.isProductAdvice) return "product_advice";
   if (flags.isOcr) return "image_ocr";
   if (flags.hasCurrentImages) return "image_question";
   return flags.normalized ? "general" : "unknown";
@@ -419,6 +426,10 @@ function isMarketingIntent(text) {
 
 function isMemoryIntent(text) {
   return /\b(me llamo|mi nombre es|llamame|como me llamo|cual es mi nombre|prefiero que respondas|me gusta que respondas)\b/.test(text);
+}
+
+function isContinuationReference(text) {
+  return /\b(eso|esto|la segunda|la primera|la tercera|los precios|lo de antes|lo anterior|la lista anterior|y este|y esta|y este otro|y esta otra|cual conviene|cu[aá]l conviene)\b/i.test(String(text || ""));
 }
 
 function detectMemoryUpdates(text) {
