@@ -1,4 +1,5 @@
 import { composeFinalResponse } from "../ai/finalResponseComposer.js";
+import { normalizeSupervisorDecision } from "../contracts/assistantContracts.js";
 import { getSupervisorModel } from "../ai/modelRegistry.js";
 import { logEvent } from "../logger.js";
 
@@ -240,6 +241,12 @@ export function createConversationSupervisorPlan(input) {
     actions: actions,
     memoryUpdates: memoryUpdates,
     responseStrategy: responseStrategy,
+    shouldWaitForMoreInputs: responseStrategy === "wait_for_more_inputs",
+    toolPlan: { actions: actions },
+    memoryPolicy: {
+      mode: memoryUpdates.length ? "update_requested" : "read_only",
+      sensitiveDataAllowed: false
+    },
     supervisorModel: clean.supervisorConfig && clean.supervisorConfig.model || "",
     supervisorFallbackModel: clean.supervisorConfig && clean.supervisorConfig.fallbackModel || ""
   };
@@ -250,6 +257,7 @@ export function createConversationSupervisorPlan(input) {
 export function normalizeSupervisorPlan(plan) {
   const clean = plan || {};
   const intent = INTENTS.has(clean.intent) ? clean.intent : "unknown";
+  const contract = normalizeSupervisorDecision(clean);
 
   return {
     currentUserGoal: String(clean.currentUserGoal || ""),
@@ -269,7 +277,10 @@ export function normalizeSupervisorPlan(plan) {
     targetModules: Array.isArray(clean.targetModules) ? clean.targetModules.map(String).filter(Boolean) : [],
     actions: Array.isArray(clean.actions) ? clean.actions : [],
     memoryUpdates: Array.isArray(clean.memoryUpdates) ? clean.memoryUpdates : [],
-    responseStrategy: ["answer_now", "analyze_then_answer", "ask_clarification", "create_utility_then_confirm"].includes(clean.responseStrategy)
+    shouldWaitForMoreInputs: contract.shouldWaitForMoreInputs,
+    toolPlan: contract.toolPlan,
+    memoryPolicy: contract.memoryPolicy,
+    responseStrategy: ["answer_now", "analyze_then_answer", "ask_clarification", "create_utility_then_confirm", "wait_for_more_inputs"].includes(clean.responseStrategy)
       ? clean.responseStrategy
       : "answer_now",
     supervisorModel: String(clean.supervisorModel || ""),

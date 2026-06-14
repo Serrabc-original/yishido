@@ -1,4 +1,5 @@
 import { logEvent } from "../logger.js";
+import { buildResponsePlan } from "../contracts/assistantContracts.js";
 
 const GENERIC_FALLBACK_PATTERNS = [
   /entendido\.?\s*¿?que necesitas que haga con esto\??/i,
@@ -30,6 +31,11 @@ export function composeFinalResponse(input) {
     return {
       text: draft,
       repaired: false,
+      responsePlan: composeResponsePlan({
+        text: draft,
+        supervisorPlan: supervisorPlan,
+        trace: clean.trace || {}
+      }),
       sanityCheck: sanity
     };
   }
@@ -59,6 +65,11 @@ export function composeFinalResponse(input) {
     return {
       text: repaired,
       repaired: true,
+      responsePlan: composeResponsePlan({
+        text: repaired,
+        supervisorPlan: supervisorPlan,
+        trace: clean.trace || {}
+      }),
       sanityCheck: repairedSanity
     };
   }
@@ -71,8 +82,40 @@ export function composeFinalResponse(input) {
   return {
     text: buildSpecificClarification(currentUserMessage, mediaSummary),
     repaired: true,
+    responsePlan: composeResponsePlan({
+      text: buildSpecificClarification(currentUserMessage, mediaSummary),
+      supervisorPlan: supervisorPlan,
+      trace: clean.trace || {}
+    }),
     sanityCheck: repairedSanity
   };
+}
+
+export function composeResponsePlan(input) {
+  const clean = input || {};
+  const text = String(clean.text || "").trim();
+  const plan = clean.supervisorPlan || {};
+
+  return buildResponsePlan({
+    text: text,
+    requiresTemplate: Boolean(clean.requiresTemplate),
+    interactive: clean.interactive || null,
+    traceId: clean.traceId || clean.trace && clean.trace.traceId || "",
+    turnId: clean.turnId || clean.trace && clean.trace.turnId || "",
+    doName: clean.doName || clean.trace && clean.trace.doName || "",
+    messages: splitConversationalText(text, {
+      maxChars: clean.maxChars || 650
+    }).map(function (part) {
+      return {
+        type: "TEXT",
+        text: part
+      };
+    }),
+    supervisor: {
+      intent: plan.intent || "",
+      mediaScope: plan.mediaScope || ""
+    }
+  });
 }
 
 export function validateSpecialistOutputAgainstIntent(input) {

@@ -31,6 +31,12 @@ import { routeCoreUtilityIntent } from "./coreUtilityRouter.js";
 import { createReminder, listReminders, selectReminderDeliveryPath } from "./modules/reminders/index.js";
 import { addListItems, createList, listItems, markListItemDone, normalizeListState, removeListItems } from "./modules/lists/index.js";
 import { sendWhatsAppInteractiveMessage } from "./whatsapp/sendInteractiveMessage.js";
+import { buildRequestContext, buildSupervisorInput } from "./context/requestContextManager.js";
+import {
+  buildWoztellConversationIdentity,
+  buildWoztellSendAttempts as buildAdapterWoztellSendAttempts,
+  normalizeWoztellMessageEventMeta
+} from "./channels/woztellChannelAdapter.js";
 import {
   createConversationSupervisorPlan,
   generateFinalUserResponse,
@@ -503,6 +509,9 @@ export class ConversationCoordinator {
     data.phone = woztellPayload.from || data.phone || "";
     data.member = woztellPayload.member || data.member || "";
     data.app = woztellPayload.app || data.app || "";
+    data.channelIdentity = buildWoztellConversationIdentity(woztellPayload);
+    data.messageEventMeta = normalizeWoztellMessageEventMeta(woztellPayload);
+    data.lastInboundAt = data.messageEventMeta.lastInboundAt;
 
     console.log("CLIENT_PROFILE_LOADED:", JSON.stringify({
       doName: data.doName,
@@ -1269,15 +1278,26 @@ export class ConversationCoordinator {
         pendingClarification: ""
       });
       const recentConversationWindow = getRecentConversationWindow(data, 20);
-      const supervisorPlan = createConversationSupervisorPlan({
-        currentTurn: userTurn,
+      const requestContext = buildRequestContext({
+        userTurn: userTurn,
         recentConversationWindow: recentConversationWindow,
         activeContext: data.activeContext,
-        memorySummary: data.conversationSummary,
+        conversationSummary: data.conversationSummary,
+        customerMemory: data.customerMemory,
+        utilityMemory: data.utilityMemory,
+        mediaMemorySummary: data.campaignState.media_batch_summary,
+        recentLimit: 20
+      });
+      data.requestContext = requestContext;
+      const supervisorPlan = createConversationSupervisorPlan(buildSupervisorInput({
+        userTurn: userTurn,
+        requestContext: requestContext,
+        activeContext: data.activeContext,
+        conversationSummary: data.conversationSummary,
         utilityMemory: data.utilityMemory,
         mediaMemorySummary: data.campaignState.media_batch_summary,
         supervisorConfig: getSupervisorConfig(this.env)
-      });
+      }));
       applySupervisorMediaScope(userTurn, supervisorPlan, data.campaignState, messages);
       data.campaignState.supervisor_plan = supervisorPlan;
       data.activeContext = updateConversationContext(data.activeContext, {
@@ -1557,6 +1577,7 @@ export class ConversationCoordinator {
         customerMemory: data.customerMemory,
         utilityMemory: data.utilityMemory,
         activeContext: data.activeContext,
+        requestContext: requestContext,
         userTurn: userTurn
       });
 
@@ -5851,43 +5872,7 @@ function selectWoztellSendToken(env) {
 }
 
 function buildWoztellSendAttempts(params) {
-  const memberId = String(params.memberId || "");
-  const recipientId = String(params.recipientId || "");
-
-  if (memberId) {
-    return [{
-      mode: "memberId",
-      payload: buildWoztellSendPayload(params, "memberId")
-    }];
-  }
-
-  if (recipientId) {
-    return [{
-      mode: "recipientId",
-      payload: buildWoztellSendPayload(params, "recipientId")
-    }];
-  }
-
-  return [{
-    mode: "empty_recipient",
-    payload: buildWoztellSendPayload(params, "recipientId")
-  }];
-}
-
-function buildWoztellSendPayload(params, mode) {
-  const payload = {
-    channelId: params.channelId,
-    response: params.response
-  };
-
-  if (params.appId) payload.appId = params.appId;
-  if (mode === "memberId" && params.memberId) {
-    payload.memberId = params.memberId;
-  } else {
-    payload.recipientId = params.recipientId;
-  }
-
-  return payload;
+  return buildAdapterWoztellSendAttempts(params || {});
 }
 
 function logWoztellSendShape(payload, mode) {
@@ -5964,6 +5949,9 @@ function normalizeCoordinatorData(data) {
     phone: String(clean.phone || ""),
     member: String(clean.member || ""),
     app: String(clean.app || ""),
+    channelIdentity: clean.channelIdentity || clean.channel_identity || null,
+    messageEventMeta: clean.messageEventMeta || clean.message_event_meta || null,
+    lastInboundAt: String(clean.lastInboundAt || clean.last_inbound_at || ""),
     pendingMessages: Array.isArray(clean.pendingMessages) ? clean.pendingMessages : [],
     currentTurnId: String(clean.currentTurnId || ""),
     currentTraceId: String(clean.currentTraceId || ""),
@@ -5982,6 +5970,7 @@ function normalizeCoordinatorData(data) {
     userStyleProfile: clean.userStyleProfile || clean.user_style_profile || null,
     customerMemory: clean.customerMemory || clean.customer_memory || null,
     utilityMemory: clean.utilityMemory || clean.utility_memory || null,
+    requestContext: clean.requestContext || clean.request_context || null,
     coreUtilityState: normalizeCoreUtilityState(clean.coreUtilityState || clean.core_utility_state || {}),
     activeContext: normalizeConversationContext(clean.activeContext || clean.active_context || {}),
     archivedCampaigns: Array.isArray(clean.archivedCampaigns) ? clean.archivedCampaigns.slice(-5) : []
@@ -7920,8 +7909,18 @@ function buildOrchestratorInput(params) {
   const plainText = extractPlainTurnText(userTurn.current_turn_text || "");
   const allowPreviousContext = userTurn.context_policy === "use_previous_context";
   const useCampaignState = isExplicitMarketingRequest(plainText);
+  const requestContext = params.requestContext || buildRequestContext({
+    userTurn: userTurn,
+    recentConversationWindow: params.recentConversationWindow || [],
+    activeContext: params.activeContext || params.active_context || {},
+    conversationSummary: params.conversationSummary || null,
+    customerMemory: params.customerMemory || null,
+    utilityMemory: params.utilityMemory || null,
+    mediaMemorySummary: state.media_batch_summary || null
+  });
 
   return {
+    request_context: requestContext,
     current_turn_summary: buildTurnSummary(userTurn),
     current_turn_text: userTurn.current_turn_text || "",
     media_batch_summary: userTurn.media_batch_summary || null,
