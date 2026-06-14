@@ -28,9 +28,15 @@
 import { captureError, createTraceId, logEvent } from "./logger.js";
 import { getCoreFeatureFlags, updateConversationMemory } from "./conversationMemory.js";
 import { routeCoreUtilityIntent } from "./coreUtilityRouter.js";
-import { createReminder, listReminders } from "./modules/reminders/index.js";
+import { createReminder, listReminders, selectReminderDeliveryPath } from "./modules/reminders/index.js";
 import { addListItems, createList, listItems, markListItemDone, normalizeListState, removeListItems } from "./modules/lists/index.js";
 import { sendWhatsAppInteractiveMessage } from "./whatsapp/sendInteractiveMessage.js";
+import {
+  createConversationSupervisorPlan,
+  generateFinalUserResponse,
+  getRecentConversationWindow,
+  getSupervisorConfig
+} from "./supervisor/conversationSupervisor.js";
 
 let activeLogContext = {};
 
@@ -40,7 +46,7 @@ const USER_MESSAGES = {
   readyToPublish: "Listo, lo dejé marcado como listo para publicar ?\nAún no se publica automáticamente; ese será el siguiente paso cuando conectemos Meta.",
   imageReady: "Listo, te generé esta imagen.\n\n¿Quieres que haga otra versión o ajustamos el texto?",
   audioFailed: "Tuve un problema procesando tu audio. ¿Me lo puedes reenviar o escribirlo en texto?",
-  resetOk: "Contexto reiniciado. Tambien limpié media previa, campaña activa y aclaraciones pendientes.",
+  resetOk: "Limpié el contexto actual. Tus listas guardadas se mantienen. Si quieres borrar listas, usa /forget-lists.",
   help: "Puedo ayudarte como asistente general: responder preguntas, crear y actualizar listas, preparar recordatorios, leer imagenes, extraer texto de fotos, entender audios transcritos, apoyar pedidos, soporte, CRM ligero y marketing solo cuando me lo pidas explicitamente.",
   clearMediaOk: "Listo, limpié las imagenes y archivos previos sin borrar tus listas ni recordatorios.",
   requestFailed: "Tuve un problema procesando tu solicitud. Intenta nuevamente en unos minutos.",
@@ -377,6 +383,8 @@ export class ConversationCoordinator {
   async alarm() {
     let data = await this.getData();
     const now = Date.now();
+    const dueReminderResult = await this.processDueReminders(data, now);
+    data = dueReminderResult.data;
 
     if (data.processing) {
       const processingStartedAt = Number(data.processingStartedAt || 0);
@@ -421,7 +429,7 @@ export class ConversationCoordinator {
     if (!data.pendingMessages.length) {
       console.log("DO_ALARM_SKIPPED_PROCESSING:", JSON.stringify({
         doName: data.doName || "",
-        reason: "no_pending",
+        reason: dueReminderResult.handled ? "reminders_processed_no_pending" : "no_pending",
         pendingCount: 0,
         processing: data.processing,
         processingStartedAt: data.processingStartedAt || null,
@@ -431,6 +439,7 @@ export class ConversationCoordinator {
         lastMessageAt: data.lastMessageAt || 0
       }));
       await this.saveData(data);
+      await this.scheduleNextReminderAlarm(data);
       return;
     }
 
@@ -631,6 +640,131 @@ export class ConversationCoordinator {
       return jsonResponse({ status: "reminders_cleared" });
     }
 
+    if (normalizeTextForIntent(normalized.text) === "/debug-reminder") {
+      data.coreUtilityState = normalizeCoreUtilityState(data.coreUtilityState);
+      const parsed = {
+        action: "create",
+        title: "debug reminder",
+        message: "debug reminder",
+        dueAt: new Date(Date.now() + 60000).toISOString(),
+        timezone: this.env.USER_TIMEZONE || "America/Bogota",
+        confidence: 1,
+        missingFields: []
+      };
+      const reminder = buildReminderForConversation(parsed, data, this.env, normalized);
+      data.coreUtilityState.reminders = data.coreUtilityState.reminders.concat([createReminder(data.coreUtilityState.reminders, reminder)]);
+      await this.scheduleNextReminderAlarm(data);
+      data.updatedAt = new Date().toISOString();
+      await this.saveData(data);
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: "Debug reminder creado para validar scheduling local."
+      });
+
+      return jsonResponse({ status: "debug_reminder_created" });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/debug-template-reminder") {
+      const sample = createReminder([], buildReminderForConversation({
+        action: "create",
+        title: "debug template reminder",
+        message: "debug template reminder",
+        dueAt: new Date(Date.now() + 60000).toISOString(),
+        timezone: this.env.USER_TIMEZONE || "America/Bogota",
+        confidence: 1,
+        missingFields: []
+      }, Object.assign({}, data, {
+        lastMessageAt: Date.now() - 25 * 60 * 60 * 1000
+      }), Object.assign({}, this.env, { REMINDERS_DELIVERY_MODE: "alarm" }), normalized));
+      const decision = selectReminderDeliveryPath(sample, this.env, { now: new Date().toISOString() });
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: formatReminderDebugForWhatsApp(decision)
+      });
+
+      return jsonResponse({ status: "debug_template_reminder_sent", decision: decision });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/memory") {
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: formatUserMemoryForWhatsApp(data)
+      });
+
+      return jsonResponse({ status: "memory_sent" });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/forget-memory") {
+      data.customerMemory = null;
+      data.userStyleProfile = null;
+      data.conversationSummary = null;
+      data.updatedAt = new Date().toISOString();
+      await this.saveData(data);
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: "Listo, borré tu memoria de usuario guardada. Tus listas y recordatorios se mantienen."
+      });
+
+      return jsonResponse({ status: "memory_forgotten" });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/forget-lists") {
+      data.coreUtilityState = normalizeCoreUtilityState(data.coreUtilityState);
+      data.coreUtilityState.listsState = normalizeListState({});
+      data.coreUtilityState.lists = data.coreUtilityState.listsState.lists;
+      data.coreUtilityState.activeList = "";
+      data.utilityMemory = null;
+      data.updatedAt = new Date().toISOString();
+      await this.saveData(data);
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: "Listo, borré todas tus listas guardadas."
+      });
+
+      return jsonResponse({ status: "lists_forgotten" });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/forget-all" || isForgetAllText(normalized.text)) {
+      data = forgetAllConversationData(data, "manual_forget_all");
+      data.updatedAt = new Date().toISOString();
+      await this.saveData(data);
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: "Listo, borré memoria, listas, recordatorios, media y contexto de esta conversación."
+      });
+
+      return jsonResponse({ status: "all_forgotten" });
+    }
+
     if (normalizeTextForIntent(normalized.text) === "/context") {
       await sendWoztellTextMessage(this.env, {
         channelId: data.channel,
@@ -672,6 +806,8 @@ export class ConversationCoordinator {
       data.currentTraceId = "";
       data = resetCampaignState(data, "manual_reset");
       data.activeContext = createEmptyConversationContext("manual_reset");
+      data.coreUtilityState = normalizeCoreUtilityState(data.coreUtilityState);
+      data.coreUtilityState.activeList = "";
       data.updatedAt = new Date().toISOString();
 
       await this.saveData(data);
@@ -1116,6 +1252,26 @@ export class ConversationCoordinator {
         campaignState: data.campaignState,
         pendingClarification: ""
       });
+      const recentConversationWindow = getRecentConversationWindow(data, 20);
+      const supervisorPlan = createConversationSupervisorPlan({
+        currentTurn: userTurn,
+        recentConversationWindow: recentConversationWindow,
+        activeContext: data.activeContext,
+        memorySummary: data.conversationSummary,
+        utilityMemory: data.utilityMemory,
+        mediaMemorySummary: data.campaignState.media_batch_summary,
+        supervisorConfig: getSupervisorConfig(this.env)
+      });
+      applySupervisorMediaScope(userTurn, supervisorPlan, data.campaignState, messages);
+      data.campaignState.supervisor_plan = supervisorPlan;
+      data.activeContext = updateConversationContext(data.activeContext, {
+        userTurn: userTurn,
+        route: { intent: supervisorPlan.intent },
+        campaignState: data.campaignState,
+        lastUserGoal: supervisorPlan.currentUserGoal || "",
+        pendingClarification: supervisorPlan.needsClarification ? supervisorPlan.clarificationQuestion : ""
+      });
+      logSupervisorPlan(supervisorPlan, userTurn, data, recentConversationWindow);
       const mediaBatch = userTurn.media_batch;
       data.campaignState.media_batch_summary = buildMediaBatchSummary(mediaBatch);
 
@@ -1242,6 +1398,29 @@ export class ConversationCoordinator {
           transcribedCount: userTurn.audio_batch.transcribedCount,
           failedCount: userTurn.audio_batch.failedCount
         }));
+      } else if (supervisorPlan.intent === "memory") {
+        data = await this.handleMemoryUtility(data, supervisorPlan, userTurn);
+      } else if (supervisorPlan.responseStrategy === "ask_clarification" && supervisorPlan.clarificationQuestion) {
+        await sendWoztellTextMessage(this.env, {
+          channelId: data.channel,
+          recipientId: data.phone,
+          memberId: data.member,
+          appId: data.app,
+          text: supervisorPlan.clarificationQuestion
+        });
+        data.activeContext = updateConversationContext(data.activeContext, {
+          userTurn: userTurn,
+          route: { intent: supervisorPlan.intent },
+          campaignState: data.campaignState,
+          pendingClarification: supervisorPlan.clarificationQuestion
+        });
+      } else if (shouldSupervisorHandleVision(supervisorPlan, userTurn)) {
+        data = await this.handleVisionUtility(data, {
+          intent: mapSupervisorVisionIntent(supervisorPlan.intent),
+          module: "vision",
+          shouldHandleInCore: true,
+          supervisorPlan: supervisorPlan
+        }, userTurn, messages);
       } else if (shouldAskHowToUseImageOnlyTurn(userTurn, messages)) {
         const text = USER_MESSAGES.uploadedImageClarification;
 
@@ -1561,7 +1740,13 @@ export class ConversationCoordinator {
       doName: data.doName,
       intent: route.intent
     });
-    const text = formatVisionUtilityResponse(route.intent, analysisResult.summary, userTurn);
+    const supervisedText = route.supervisorPlan
+      ? generateFinalUserResponse(route.supervisorPlan, { vision: analysisResult.summary }, {
+        recentConversationWindow: getRecentConversationWindow(data, 20),
+        activeContext: data.activeContext
+      })
+      : "";
+    const text = supervisedText || formatVisionUtilityResponse(route.intent, analysisResult.summary, userTurn);
     try {
       await sendLongTextByWoztell(this.env, {
         channelId: data.channel,
@@ -1599,6 +1784,38 @@ export class ConversationCoordinator {
       type: "TEXT",
       text: text,
       at: new Date().toISOString()
+    });
+
+    return data;
+  }
+
+  async handleMemoryUtility(data, supervisorPlan, userTurn) {
+    const plan = supervisorPlan || {};
+    data.customerMemory = applySupervisorMemoryUpdates(data.customerMemory, plan.memoryUpdates);
+
+    const wantsName = (plan.actions || []).some(function (action) {
+      return action && action.type === "answer_memory_name";
+    });
+    const text = wantsName
+      ? data.customerMemory && data.customerMemory.name
+        ? "Te llamas " + data.customerMemory.name + "."
+        : "Todavia no tengo tu nombre guardado."
+      : "Listo, actualicé tu memoria de usuario.";
+
+    await sendWoztellTextMessage(this.env, {
+      channelId: data.channel,
+      recipientId: data.phone,
+      memberId: data.member,
+      appId: data.app,
+      text: text
+    });
+
+    data.activeContext = updateConversationContext(data.activeContext, {
+      userTurn: userTurn,
+      route: { intent: "memory" },
+      campaignState: data.campaignState,
+      lastUserGoal: "memoria de usuario",
+      pendingClarification: ""
     });
 
     return data;
@@ -1661,8 +1878,17 @@ export class ConversationCoordinator {
         return data;
       }
 
-      const reminder = createReminder(data.coreUtilityState.reminders, parsed);
+      const reminder = createReminder(data.coreUtilityState.reminders, buildReminderForConversation(parsed, data, this.env, userTurn));
       data.coreUtilityState.reminders = data.coreUtilityState.reminders.concat([reminder]);
+      logEvent("REMINDER_SCHEDULED", {
+        traceId: userTurn && userTurn.trace_id || "",
+        turnId: userTurn && userTurn.turn_id || "",
+        doName: data.doName,
+        reminderId: reminder.reminderId || reminder.id,
+        dueAt: reminder.dueAt,
+        deliveryMode: reminder.deliveryMode
+      });
+      await this.scheduleNextReminderAlarm(data);
       data.activeContext = updateConversationContext(data.activeContext, {
         userTurn: userTurn,
         route: route,
@@ -1774,6 +2000,120 @@ export class ConversationCoordinator {
     }
 
     return data;
+  }
+
+  async processDueReminders(data, now) {
+    const next = normalizeCoordinatorData(data || {});
+    const mode = getReminderDeliveryMode(this.env);
+    if (mode !== "alarm") return { data: next, handled: false };
+
+    next.coreUtilityState = normalizeCoreUtilityState(next.coreUtilityState);
+    const reminders = next.coreUtilityState.reminders || [];
+    let handled = false;
+
+    for (let index = 0; index < reminders.length; index++) {
+      const reminder = reminders[index];
+      const dueMs = Date.parse(reminder.dueAt || "");
+      if (!Number.isFinite(dueMs) || dueMs > now) continue;
+      if (!String(reminder.status || "").startsWith("scheduled")) continue;
+
+      handled = true;
+      logEvent("REMINDER_DUE", {
+        doName: next.doName,
+        reminderId: reminder.reminderId || reminder.id,
+        dueAt: reminder.dueAt
+      });
+      const decision = selectReminderDeliveryPath(reminder, this.env, { now: new Date(now).toISOString() });
+      logEvent("REMINDER_DELIVERY_WINDOW_CHECKED", {
+        doName: next.doName,
+        reminderId: reminder.reminderId || reminder.id,
+        within24h: decision.within24h,
+        path: decision.path
+      });
+
+      if (decision.path === "session_message") {
+        await sendWoztellTextMessage(this.env, {
+          channelId: reminder.channelId || next.channel,
+          recipientId: reminder.recipientId || next.phone,
+          memberId: reminder.memberId || next.member,
+          appId: reminder.appId || next.app,
+          text: "Recordatorio: " + (reminder.message || reminder.title)
+        });
+        reminders[index] = Object.assign({}, reminder, {
+          status: "sent_session_message",
+          deliveredAt: new Date(now).toISOString(),
+          updatedAt: new Date(now).toISOString()
+        });
+        logEvent("REMINDER_SENT_SESSION_MESSAGE", {
+          doName: next.doName,
+          reminderId: reminder.reminderId || reminder.id
+        });
+      } else if (decision.path === "template_message") {
+        try {
+          await sendWoztellTemplateMessage(this.env, {
+            channelId: reminder.channelId || next.channel,
+            recipientId: reminder.recipientId || next.phone,
+            memberId: reminder.memberId || next.member,
+            appId: reminder.appId || next.app,
+            template: decision.template,
+            message: reminder.message || reminder.title
+          });
+          reminders[index] = Object.assign({}, reminder, {
+            status: "sent_template_message",
+            deliveredAt: new Date(now).toISOString(),
+            updatedAt: new Date(now).toISOString()
+          });
+          logEvent("REMINDER_TEMPLATE_SENT", {
+            doName: next.doName,
+            reminderId: reminder.reminderId || reminder.id,
+            templateName: decision.template.name
+          });
+        } catch (error) {
+          reminders[index] = Object.assign({}, reminder, {
+            status: "template_send_failed",
+            deliveryError: summarizeErrorForLog(error),
+            updatedAt: new Date(now).toISOString()
+          });
+          logEvent("REMINDER_TEMPLATE_SEND_FAILED", {
+            doName: next.doName,
+            reminderId: reminder.reminderId || reminder.id,
+            message: summarizeErrorForLog(error)
+          }, { level: "error" });
+        }
+      } else {
+        reminders[index] = Object.assign({}, reminder, {
+          status: "blocked_template_required",
+          updatedAt: new Date(now).toISOString()
+        });
+        logEvent("REMINDER_TEMPLATE_REQUIRED", {
+          doName: next.doName,
+          reminderId: reminder.reminderId || reminder.id
+        });
+        logEvent("REMINDER_BLOCKED_NO_TEMPLATE", {
+          doName: next.doName,
+          reminderId: reminder.reminderId || reminder.id
+        });
+      }
+    }
+
+    next.coreUtilityState.reminders = reminders;
+    return { data: next, handled: handled };
+  }
+
+  async scheduleNextReminderAlarm(data) {
+    const mode = getReminderDeliveryMode(this.env);
+    if (mode !== "alarm") return;
+
+    const reminders = normalizeCoreUtilityState(data && data.coreUtilityState || {}).reminders;
+    const dueTimes = reminders
+      .filter(function (item) { return String(item.status || "").startsWith("scheduled"); })
+      .map(function (item) { return Date.parse(item.dueAt || ""); })
+      .filter(function (value) { return Number.isFinite(value) && value > Date.now(); });
+
+    if (!dueTimes.length) return;
+    const nextDueAt = Math.min.apply(null, dueTimes);
+    const processAfter = Number(data && data.processAfter || 0);
+    await this.state.storage.setAlarm(processAfter ? Math.min(processAfter, nextDueAt) : nextDueAt);
   }
 
   async executePlan(data, messages, plan, userTurn) {
@@ -5702,6 +6042,176 @@ function clearMediaState(data, reason) {
   return next;
 }
 
+function forgetAllConversationData(data, reason) {
+  let next = normalizeCoordinatorData(data || {});
+  next.pendingMessages = [];
+  next.hasMedia = false;
+  next.processing = false;
+  next.processingStartedAt = null;
+  next.firstMessageAt = 0;
+  next.lastMessageAt = 0;
+  next.processAfter = 0;
+  next.currentTraceId = "";
+  next.currentTurnId = "";
+  next = resetCampaignState(next, reason || "forget_all");
+  next.activeContext = createEmptyConversationContext(reason || "forget_all");
+  next.coreUtilityState = normalizeCoreUtilityState({});
+  next.customerMemory = null;
+  next.userStyleProfile = null;
+  next.conversationSummary = null;
+  next.utilityMemory = null;
+  next.conversationLog = [];
+  return next;
+}
+
+function isForgetAllText(text) {
+  const normalized = normalizeTextForIntent(text);
+  return /\b(resetea todo|borra todo|olvida todo|limpia todo|elimina todo)\b/.test(normalized);
+}
+
+function formatUserMemoryForWhatsApp(data) {
+  const memory = data && data.customerMemory || {};
+  const style = data && data.userStyleProfile || {};
+  const utility = data && data.utilityMemory || {};
+  const lines = [
+    "Memoria guardada",
+    "Nombre: " + (memory.name || "(no guardado)"),
+    "Idioma: " + (memory.language || style.language || "(no detectado)"),
+    "Estilo: " + (memory.response_preference || memory.style_preference || style.tone || "(sin preferencia)"),
+    "Listas: " + ((utility.list_names || []).join(", ") || "(sin listas en memoria resumida)"),
+    "Recordatorios pendientes: " + String(utility.reminder_count || 0)
+  ];
+
+  return lines.join("\n");
+}
+
+function formatReminderDebugForWhatsApp(decision) {
+  const clean = decision || {};
+  return [
+    "Debug template reminder",
+    "path: " + (clean.path || ""),
+    "within24h: " + String(Boolean(clean.within24h)),
+    "templateConfigured: " + String(Boolean(clean.templateConfigured)),
+    "templateName: " + (clean.template && clean.template.name || "(no configurado)")
+  ].join("\n");
+}
+
+function buildReminderForConversation(parsed, data, env, userTurn) {
+  const clean = parsed || {};
+  const mode = getReminderDeliveryMode(env);
+  const lastInteraction = data && data.lastMessageAt
+    ? new Date(data.lastMessageAt).toISOString()
+    : new Date().toISOString();
+
+  return Object.assign({}, clean, {
+    userId: data && (data.phone || data.doName) || "",
+    channelId: data && data.channel || "",
+    memberId: data && data.member || "",
+    appId: data && data.app || "",
+    recipientId: data && data.phone || "",
+    message: clean.message || clean.title || "",
+    sourceContext: {
+      turnId: userTurn && (userTurn.turn_id || userTurn.turnId) || "",
+      traceId: userTurn && (userTurn.trace_id || userTurn.traceId) || "",
+      currentTurnText: userTurn && userTurn.current_turn_text || clean.context || ""
+    },
+    lastUserInteractionAt: lastInteraction,
+    deliveryMode: mode,
+    requiresTemplateIfOutside24h: true,
+    status: mode === "alarm" ? "scheduled_alarm" : "scheduled_mock"
+  });
+}
+
+function applySupervisorMemoryUpdates(memory, updates) {
+  const next = Object.assign({}, memory || {});
+  for (const update of Array.isArray(updates) ? updates : []) {
+    if (!update || !update.type) continue;
+    if (update.type === "user_name") next.name = String(update.value || "").slice(0, 80);
+    if (update.type === "response_preference") {
+      next.response_preference = String(update.value || "").slice(0, 180);
+      next.style_preference = next.response_preference;
+    }
+  }
+  next.source = next.source || "safe_optional_memory_v1";
+  next.updated_at = new Date().toISOString();
+  return next;
+}
+
+function applySupervisorMediaScope(userTurn, supervisorPlan, campaignState, messages) {
+  const plan = supervisorPlan || {};
+  let selected = userTurn.media_batch || { assets: [] };
+
+  if (plan.mediaScope === "previous_relevant") {
+    selected = buildMediaBatch(campaignState, messages, { turnId: userTurn.turn_id, mode: "previous_relevant" });
+  } else if (plan.mediaScope === "current_and_previous") {
+    const current = buildMediaBatch(campaignState, messages, { turnId: userTurn.turn_id, mode: "current_turn" });
+    const previous = buildMediaBatch(campaignState, messages, { turnId: userTurn.turn_id, mode: "previous_relevant" });
+    selected = mergeMediaBatches(current, previous);
+  } else if (plan.mediaScope === "all_pending_batch" || plan.mediaScope === "current_only") {
+    selected = buildMediaBatch(campaignState, messages, { turnId: userTurn.turn_id, mode: "current_turn" });
+  }
+
+  userTurn.media_batch = selected;
+  userTurn.media_batch_summary = buildMediaBatchSummary(selected);
+  userTurn.image_count = selected.assets.filter(function (asset) {
+    return String(asset.media_type || "IMAGE").toUpperCase() === "IMAGE";
+  }).length;
+  userTurn.current_turn_media = summarizeAssetsForContext(selected.assets);
+  userTurn.currentTurnMedia = userTurn.current_turn_media;
+}
+
+function mergeMediaBatches(first, second) {
+  const byFileId = new Map();
+  for (const asset of [].concat(first && first.assets || [], second && second.assets || [])) {
+    if (!asset || !asset.file_id) continue;
+    byFileId.set(asset.file_id, asset);
+  }
+  const assets = Array.from(byFileId.values());
+  return {
+    assets: assets,
+    fileIds: assets.map(function (asset) { return asset.file_id; }).filter(Boolean),
+    assetCount: assets.length,
+    analyzedAssetCount: assets.filter(function (asset) { return asset.status === "analyzed" && asset.analysis; }).length,
+    failedAssetCount: assets.filter(function (asset) { return asset.status === "analysis_failed"; }).length
+  };
+}
+
+function shouldSupervisorHandleVision(supervisorPlan, userTurn) {
+  const plan = supervisorPlan || {};
+  return plan.responseStrategy === "analyze_then_answer" &&
+    (plan.targetModules || []).includes("vision") &&
+    userTurn && userTurn.media_batch && userTurn.media_batch.assets && userTurn.media_batch.assets.length > 0;
+}
+
+function mapSupervisorVisionIntent(intent) {
+  if (intent === "image_ocr") return "image_ocr";
+  return intent || "image_question";
+}
+
+function logSupervisorPlan(plan, userTurn, data, recentConversationWindow) {
+  const payload = {
+    traceId: userTurn && userTurn.trace_id || "",
+    turnId: userTurn && userTurn.turn_id || "",
+    doName: data && data.doName || "",
+    intent: plan.intent,
+    activeTask: plan.activeTask,
+    isContinuation: plan.isContinuation,
+    isContextSwitch: plan.isContextSwitch,
+    mediaScope: plan.mediaScope,
+    targetModules: plan.targetModules,
+    recentWindowCount: Array.isArray(recentConversationWindow) ? recentConversationWindow.length : 0
+  };
+
+  logEvent("SUPERVISOR_PLAN_CREATED", payload);
+  logEvent("SUPERVISOR_CONTEXT_WINDOW_USED", Object.assign({}, payload, {
+    recentWindowCount: payload.recentWindowCount
+  }));
+  if (plan.isContextSwitch) logEvent("SUPERVISOR_CONTEXT_SWITCH_DETECTED", payload);
+  if (plan.isContinuation) logEvent("SUPERVISOR_CONTINUATION_DETECTED", payload);
+  logEvent("SUPERVISOR_MEDIA_SCOPE_SELECTED", Object.assign({}, payload, { mediaScope: plan.mediaScope }));
+  logEvent("SUPERVISOR_MODULES_SELECTED", Object.assign({}, payload, { targetModules: plan.targetModules }));
+}
+
 function isVisionUtilityRoute(route) {
   return route && (route.intent === "image_question" || route.intent === "image_ocr");
 }
@@ -5768,6 +6278,31 @@ function clearCampaignStateForGeneralIntent(campaignState, meta) {
     publish_status: "",
     ready_to_publish: false,
     updated_at: new Date().toISOString()
+  });
+}
+
+async function sendWoztellTemplateMessage(env, params) {
+  const template = params.template || {};
+  if (!template.name) {
+    throw new Error("REMINDER_TEMPLATE_NAME_REQUIRED");
+  }
+
+  return await sendWoztellResponse(env, {
+    channelId: params.channelId,
+    recipientId: params.recipientId,
+    memberId: params.memberId,
+    appId: params.appId,
+    logPrefix: "WOZTELL_TEMPLATE_SEND",
+    response: [
+      {
+        type: "TEMPLATE",
+        templateName: template.name,
+        language: template.language || "es",
+        namespace: template.namespace || "",
+        paramMode: template.paramMode || "body_text",
+        params: [String(params.message || "")]
+      }
+    ]
   });
 }
 
@@ -7095,7 +7630,13 @@ function shouldUsePreviousContext(messages) {
     "haz otra versión",
     "segunda imagen",
     "primera imagen",
-    "tercera imagen"
+    "tercera imagen",
+    "los precios",
+    "cual conviene",
+    "cuál conviene",
+    "lo de antes",
+    "y este otro",
+    "y esta otra"
   ].some(function (pattern) {
     return text.includes(normalizeTextForIntent(pattern));
   });
@@ -7784,6 +8325,8 @@ function buildVersionDiagnostic(env) {
     build_label: String(env && env.BUILD_LABEL || "local-dev"),
     ORCHESTRATOR_PROVIDER: String(env && env.ORCHESTRATOR_PROVIDER || "openai"),
     ORCHESTRATOR_MODEL: String(env && env.ORCHESTRATOR_MODEL || "gpt-5.4-mini"),
+    SUPERVISOR_MODEL: String(env && env.SUPERVISOR_MODEL || "gpt-5.4-nano"),
+    SUPERVISOR_FALLBACK_MODEL: String(env && env.SUPERVISOR_FALLBACK_MODEL || "gpt-5.4-mini"),
     DEBUG_LOGS: String(flags.debugLogs),
     ENABLE_LISTS: String(flags.enableLists),
     ENABLE_REMINDERS: String(flags.enableReminders),
@@ -7794,6 +8337,7 @@ function buildVersionDiagnostic(env) {
     ENABLE_CUSTOMER_MEMORY: String(flags.enableCustomerMemory),
     CORE_UTILITIES_SANDBOX: String(flags.coreUtilitiesSandbox),
     REMINDERS_DELIVERY_MODE: remindersMode,
+    REMINDER_TEMPLATE_CONFIGURED: String(Boolean(env && env.REMINDER_TEMPLATE_NAME)),
     INTERACTIVE_DELIVERY_MODE: interactiveMode,
     MEMORY_RETENTION_MODE: String(flags.memoryRetentionMode || "summarized"),
     LOG_CAPTURE_MODE: String(flags.logCaptureMode || "console_and_file"),
@@ -7814,6 +8358,8 @@ function formatVersionDiagnosticForWhatsApp(diagnostic) {
     "build_label: " + (data.build_label || ""),
     "ORCHESTRATOR_PROVIDER: " + (data.ORCHESTRATOR_PROVIDER || ""),
     "ORCHESTRATOR_MODEL: " + (data.ORCHESTRATOR_MODEL || ""),
+    "SUPERVISOR_MODEL: " + (data.SUPERVISOR_MODEL || ""),
+    "SUPERVISOR_FALLBACK_MODEL: " + (data.SUPERVISOR_FALLBACK_MODEL || ""),
     "DEBUG_LOGS: " + (data.DEBUG_LOGS || ""),
     "ENABLE_LISTS: " + (data.ENABLE_LISTS || ""),
     "ENABLE_REMINDERS: " + (data.ENABLE_REMINDERS || ""),
@@ -7824,6 +8370,7 @@ function formatVersionDiagnosticForWhatsApp(diagnostic) {
     "ENABLE_CUSTOMER_MEMORY: " + (data.ENABLE_CUSTOMER_MEMORY || ""),
     "CORE_UTILITIES_SANDBOX: " + (data.CORE_UTILITIES_SANDBOX || ""),
     "REMINDERS_DELIVERY_MODE: " + (data.REMINDERS_DELIVERY_MODE || ""),
+    "REMINDER_TEMPLATE_CONFIGURED: " + (data.REMINDER_TEMPLATE_CONFIGURED || ""),
     "REMINDERS_STATUS: " + (data.REMINDERS_STATUS || ""),
     "INTERACTIVE_DELIVERY_MODE: " + (data.INTERACTIVE_DELIVERY_MODE || ""),
     "INTERACTIVE_STATUS: " + (data.INTERACTIVE_STATUS || ""),
@@ -7892,6 +8439,7 @@ export {
   buildOrchestratorInput,
   buildContextSnapshot,
   clearMediaState,
+  forgetAllConversationData,
   createEmptyConversationContext,
   formatContextForWhatsApp,
   formatVisionUtilityResponse,

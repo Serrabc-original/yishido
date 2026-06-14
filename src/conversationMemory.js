@@ -139,12 +139,23 @@ export function buildCustomerMemory(conversationLog, previousMemory) {
   const turns = Array.isArray(conversationLog) ? conversationLog : [];
   const text = turns.map(function (turn) { return turn.textPreview || ""; }).join(" ");
   const keywords = extractKeywords(text);
+  const previous = previousMemory && typeof previousMemory === "object" ? previousMemory : {};
+  const name = extractUserName(text) || previous.name || "";
+  const responsePreference = extractResponsePreference(text) || previous.response_preference || "";
 
   return {
+    name: name,
+    language: detectLanguage(text) !== "unknown" ? detectLanguage(text) : previous.language || "unknown",
+    response_preference: responsePreference,
+    shopping_preferences: previous.shopping_preferences || {},
+    lists_note: previous.lists_note || "",
+    reminders_note: previous.reminders_note || "",
+    useful_notes: previous.useful_notes || [],
+    style_preference: responsePreference || previous.style_preference || "",
     known_business_terms: keywords.filter(function (word) {
       return !["hazme", "quiero", "necesito", "para", "con"].includes(word);
     }).slice(0, MAX_KEYWORDS),
-    preferences: previousMemory && previousMemory.preferences || {},
+    preferences: previous.preferences || {},
     open_questions: inferOpenQuestions(text),
     source: "safe_optional_memory_v1",
     updated_at: new Date().toISOString()
@@ -251,4 +262,18 @@ function inferOpenQuestions(text) {
   return questions.slice(-5).map(function (line) {
     return sanitizeMemoryText(line).slice(0, 300);
   });
+}
+
+function extractUserName(text) {
+  const match = String(text || "").match(/\b(?:me llamo|mi nombre es|llamame)\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s.'-]{0,60})/i);
+  if (!match) return "";
+  return sanitizeMemoryText(match[1])
+    .replace(/[.!,;:].*$/, "")
+    .trim()
+    .slice(0, 80);
+}
+
+function extractResponsePreference(text) {
+  const match = String(text || "").match(/\bprefiero que respondas\s+([^.\n]{3,180})/i);
+  return match ? sanitizeMemoryText(match[1]).trim().slice(0, 180) : "";
 }

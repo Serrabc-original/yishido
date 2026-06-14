@@ -83,18 +83,27 @@ function inferReminderAction(normalized) {
 export function createReminder(reminders, reminder) {
   try {
     const item = normalizeReminder(reminder);
+    const reminderId = item.reminderId || item.id || "rem_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
     const created = Object.assign({}, item, {
-      id: item.id || "rem_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
-      status: item.status || "scheduled_mock",
+      id: reminderId,
+      reminderId: reminderId,
+      status: item.status || (item.deliveryMode === "alarm" ? "scheduled_alarm" : "scheduled_mock"),
       createdAt: item.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString()
     });
 
+    logEvent("REMINDER_CREATED", {
+      reminderId: created.reminderId || created.id,
+      userId: created.userId,
+      dueAt: created.dueAt,
+      deliveryMode: created.deliveryMode,
+      requiresTemplateIfOutside24h: created.requiresTemplateIfOutside24h
+    });
     logEvent("REMINDER_CREATE_OK", {
       reminderId: created.id,
       dueAt: created.dueAt,
       title: created.title,
-      sendsRealReminders: false
+      sendsRealReminders: created.deliveryMode === "alarm"
     });
 
     return created;
@@ -152,17 +161,78 @@ export function markReminderDone(reminders, reminderId) {
 function normalizeReminder(reminder) {
   const clean = reminder || {};
   if (!clean.title) throw new Error("REMINDER_TITLE_REQUIRED");
+  const deliveryMode = String(clean.deliveryMode || clean.delivery_mode || "mock").toLowerCase();
+  const message = String(clean.message || clean.title || "").trim();
 
   return {
     id: String(clean.id || ""),
+    reminderId: String(clean.reminderId || clean.reminder_id || clean.id || ""),
+    userId: String(clean.userId || clean.user_id || ""),
+    channelId: String(clean.channelId || clean.channel_id || ""),
+    memberId: String(clean.memberId || clean.member_id || ""),
+    appId: String(clean.appId || clean.app_id || ""),
+    recipientId: String(clean.recipientId || clean.recipient_id || ""),
     title: String(clean.title || "").trim(),
+    message: message,
     dueAt: String(clean.dueAt || ""),
     timezone: String(clean.timezone || "UTC"),
     context: String(clean.context || ""),
+    sourceContext: clean.sourceContext || clean.source_context || null,
+    lastUserInteractionAt: String(clean.lastUserInteractionAt || clean.last_user_interaction_at || clean.createdAt || new Date().toISOString()),
+    deliveryMode: deliveryMode,
+    requiresTemplateIfOutside24h: clean.requiresTemplateIfOutside24h !== false,
     reminderOffsets: Array.isArray(clean.reminderOffsets) ? clean.reminderOffsets.map(String) : [],
     recurrence: clean.recurrence || null,
     confidence: Number(clean.confidence || 0),
-    missingFields: Array.isArray(clean.missingFields) ? clean.missingFields.map(String) : []
+    missingFields: Array.isArray(clean.missingFields) ? clean.missingFields.map(String) : [],
+    status: String(clean.status || "")
+  };
+}
+
+export function selectReminderDeliveryPath(reminder, env, options) {
+  const clean = reminder || {};
+  const now = options && options.now ? new Date(options.now) : new Date();
+  const lastInteraction = clean.lastUserInteractionAt ? new Date(clean.lastUserInteractionAt) : now;
+  const within24h = Number.isFinite(lastInteraction.getTime())
+    ? now.getTime() - lastInteraction.getTime() <= 24 * 60 * 60 * 1000
+    : false;
+  const template = getReminderTemplateConfig(env || {});
+
+  if (within24h) {
+    return {
+      path: "session_message",
+      within24h: true,
+      templateConfigured: Boolean(template.name),
+      status: "ready_session_message",
+      template: template
+    };
+  }
+
+  if (!template.name) {
+    return {
+      path: "blocked_template_required",
+      within24h: false,
+      templateConfigured: false,
+      status: "blocked_template_required",
+      template: template
+    };
+  }
+
+  return {
+    path: "template_message",
+    within24h: false,
+    templateConfigured: true,
+    status: "ready_template_message",
+    template: template
+  };
+}
+
+export function getReminderTemplateConfig(env) {
+  return {
+    name: String(env && env.REMINDER_TEMPLATE_NAME || ""),
+    language: String(env && env.REMINDER_TEMPLATE_LANGUAGE || "es"),
+    namespace: String(env && env.REMINDER_TEMPLATE_NAMESPACE || ""),
+    paramMode: String(env && env.REMINDER_TEMPLATE_PARAM_MODE || "body_text")
   };
 }
 
