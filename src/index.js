@@ -63,6 +63,7 @@ import {
   validateSpecialistOutputAgainstIntent
 } from "./ai/finalResponseComposer.js";
 import { composeCustomerReply } from "./ai/customerReplyComposer.js";
+import { getConversationPromptGuidance } from "./ai/conversationStyleProfile.js";
 import {
   getCustomerReplyModel,
   getFinalResponseModel,
@@ -4197,8 +4198,10 @@ function buildNeutralOrchestratorPayload(env, params, context) {
       "For general list, reminder, support, order, CRM or question requests, do not ask whether the user wants text or image.",
       "For image_question or image_ocr, use vision analysis only; do not generate marketing copy unless the user explicitly asks for a post, ad, campaign, Instagram, copy, or content calendar.",
       "If the request is unclear, ask one brief clarification question.",
+      "Use the customer conversation profile: answer clear requests directly, ask one missing detail at a time, and never return a generic meta-menu for clear user intent.",
       "Never publish to Meta. Never call unavailable modules as if they were active."
     ].join(" "),
+    customer_conversation_profile: getConversationPromptGuidance(),
     plan_schema: ORCHESTRATOR_PLAN_SCHEMA,
     available_intents: ["general", "marketing", "reminder", "list", "image_question", "image_ocr", "crm", "orders", "support", "elderly", "unknown"],
     available_actions: getAllowedOrchestratorActions(),
@@ -4337,8 +4340,10 @@ async function callClaudeOrchestratorPlan(env, params) {
       "First classify intent as general, marketing, reminder, list, image_question, image_ocr, crm, orders, support, elderly, or unknown.",
       "Only use marketing actions when intent is marketing.",
       "Do not ask whether the user wants text or image for ordinary lists, reminders, support, orders, CRM, or general questions.",
+      "Use the customer conversation profile: answer clear requests directly, ask one missing detail at a time, and never return a generic meta-menu for clear user intent.",
       "If intent is unclear, ask one brief clarification question."
     ].join(" "),
+    customer_conversation_profile: getConversationPromptGuidance(),
     plan_schema: ORCHESTRATOR_PLAN_SCHEMA,
     available_intents: ["general", "marketing", "reminder", "list", "image_question", "image_ocr", "crm", "orders", "support", "elderly", "unknown"],
     available_actions: getAllowedOrchestratorActions(),
@@ -6293,7 +6298,8 @@ async function sendConversationalResponse(env, params) {
     traceId: params && params.traceId || "",
     turnId: params && params.turnId || ""
   }, env || {});
-  if (shouldBlockBadGenericReply(reply.text, params && params.userTurn || {})) {
+  if (shouldBlockBadGenericReply(params && params.text || "", params && params.userTurn || {}) ||
+    shouldBlockBadGenericReply(reply.text, params && params.userTurn || {})) {
     const forcedText = buildForcedDirectGeneralAnswer(params && params.userTurn || {}, params && params.text || "");
     logEvent("BAD_GENERIC_REPLY_BLOCKED", {
       traceId: params && params.traceId || "",
@@ -6391,12 +6397,11 @@ async function sendConversationalResponse(env, params) {
 }
 
 function shouldBlockBadGenericReply(replyText, userTurn) {
-  const text = normalizeTextForIntent(replyText);
   const userText = cleanUserVisibleText(userTurn && (userTurn.combinedUserText || userTurn.current_turn_text) || "");
 
   if (!isClearUserRequestText(userText)) return false;
 
-  return [
+  return containsAssistantStancePattern(replyText, [
     "quieres que lo explique",
     "quieres que lo resuma",
     "revise algun detalle puntual",
@@ -6404,25 +6409,53 @@ function shouldBlockBadGenericReply(replyText, userTurn) {
     "que quieres que haga con esto",
     "qué quieres que haga con esto",
     "dime si quieres que"
-  ].some(function (pattern) {
-    return text.includes(normalizeTextForIntent(pattern));
-  });
+  ]);
 }
 
 function shouldBlockFalseNoImageReply(replyText, userTurn) {
-  const text = normalizeTextForIntent(replyText);
-  if (!text) return false;
-  const deniesImage = [
+  const deniesImage = containsAssistantStancePattern(replyText, [
     "no veo la imagen",
     "no veo ninguna imagen",
+    "no puedo ver la imagen",
+    "no puedo ver ninguna imagen",
     "no hay imagen",
     "no encuentro la imagen",
     "no tengo la imagen",
     "no veo imagen"
-  ].some(function (pattern) {
-    return text.includes(normalizeTextForIntent(pattern));
-  });
+  ]);
   return Boolean(deniesImage && countUserTurnImages(userTurn) > 0);
+}
+
+function containsAssistantStancePattern(replyText, patterns) {
+  const raw = String(replyText || "").trim();
+  const text = normalizeTextForIntent(raw);
+  if (!text) return false;
+
+  const normalizedPatterns = (patterns || []).map(function (pattern) {
+    return normalizeTextForIntent(pattern);
+  }).filter(Boolean);
+  const matches = normalizedPatterns.map(function (pattern) {
+    return { pattern: pattern, index: text.indexOf(pattern) };
+  }).filter(function (match) {
+    return match.index >= 0;
+  }).sort(function (first, second) {
+    return first.index - second.index;
+  });
+
+  if (!matches.length) return false;
+
+  const first = matches[0];
+  if (isPatternQuotedOrVisibleText(text, first.index)) return false;
+
+  const firstSentence = text.split(/[.!?\n]/)[0] || text;
+  if (firstSentence.includes(first.pattern)) return true;
+
+  return first.index <= 80;
+}
+
+function isPatternQuotedOrVisibleText(normalizedText, patternIndex) {
+  const before = normalizedText.slice(Math.max(0, patternIndex - 120), patternIndex);
+  return /\b(texto visible|visible text|visible_text|texto detectado|ocr|se lee|dice|aparece|captura|pantalla|imagen muestra|en la imagen|en la captura|texto de la imagen)\b/.test(before);
 }
 
 function countUserTurnImages(userTurn) {

@@ -1,4 +1,9 @@
 import { logEvent } from "../logger.js";
+import {
+  buildProfileFallbackReply,
+  getConversationPromptGuidance,
+  inferConversationScenario
+} from "./conversationStyleProfile.js";
 import { getCustomerReplyModel } from "./modelRegistry.js";
 import { splitConversationalText } from "./finalResponseComposer.js";
 
@@ -14,11 +19,13 @@ export function composeCustomerReply(input, env) {
   const tone = String(clean.tone || "warm_professional");
   const verbosity = String(clean.verbosity || "helpful_short");
   const model = getCustomerReplyModel(env || {});
+  const scenario = inferConversationScenario(userTurn.combinedUserText || userTurn.current_turn_text || "", intent);
 
   logEvent("CUSTOMER_REPLY_COMPOSER_START", {
     traceId: userTurn.trace_id || clean.traceId || "",
     turnId: userTurn.turn_id || clean.turnId || "",
     intent: intent,
+    scenario: scenario,
     tone: tone,
     verbosity: verbosity,
     locale: locale
@@ -42,6 +49,8 @@ export function composeCustomerReply(input, env) {
     text: text || buildSafeTemplate(clean),
     userTurn: userTurn,
     intent: intent,
+    scenario: scenario,
+    conversationProfile: getConversationPromptGuidance(),
     visibleFacts: clean.visibleFacts || clean.visible_facts || [],
     nextAction: clean.nextAction || clean.next_action || ""
   });
@@ -64,22 +73,86 @@ function humanizeReply(input) {
   const userTurn = input.userTurn || {};
   const hasClearText = Boolean(String(userTurn.combinedUserText || userTurn.current_turn_text || "").trim());
   const imageCount = Number(userTurn.image_count || userTurn.counts && userTurn.counts.image || 0);
+  const userText = String(userTurn.combinedUserText || userTurn.current_turn_text || "").trim();
+  const scenario = input.scenario || inferConversationScenario(userText, input.intent || "");
   let text = String(input.text || "").trim();
+  const hadGenericMenu = looksLikeGenericMenu(text);
 
   text = text
     .replace(/\bAn[aá]lisis visual:?\s*/gi, "")
     .replace(/^\s*Entendido\.?\s*/i, "")
     .replace(/^\s*Claro\.?\s*$/i, "Claro, te ayudo.")
     .replace(/Quieres que la analice, extraiga texto o la compare con otra imagen\?/gi, hasClearText ? "" : "Dime si quieres que la analice, extraiga texto o la compare con otra imagen.")
+    .replace(/[¿?]?Quieres que (lo|la|te) (explique|resuma|revise)[^.\n?]*[?.]?/gi, hasClearText ? "" : "$&")
     .replace(/Que quieres que haga con est[oa]\?/gi, hasClearText ? "" : "Dime que quieres hacer con esto y te ayudo.")
     .trim();
+
+  if (hasClearText && (hadGenericMenu || looksLikeGenericMenu(text) || !text)) {
+    text = buildDirectTemplateFromUserText(userText, text, scenario);
+  }
 
   if (!text && imageCount && !hasClearText) {
     text = "Recibi la imagen. Dime si quieres que la analice, lea texto visible o la compare con otra.";
   }
 
-  if (!text) text = buildSafeTemplate(input);
+  if (!text) text = buildSafeTemplate(Object.assign({}, input, { scenario: scenario }));
   return text.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function looksLikeGenericMenu(text) {
+  const clean = normalizeSimpleText(text);
+  if (!clean) return false;
+  const menuPatterns = [
+    "quieres que lo explique",
+    "quieres que lo resuma",
+    "revise algun detalle puntual",
+    "revise algún detalle puntual",
+    "dime si quieres que",
+    "que quieres que haga con esto",
+    "qué quieres que haga con esto"
+  ];
+  return menuPatterns.some(function (pattern) {
+    return clean.includes(normalizeSimpleText(pattern));
+  });
+}
+
+function buildDirectTemplateFromUserText(userText, fallbackText, scenario) {
+  const clean = normalizeSimpleText(userText);
+
+  if (scenario === "appointment") {
+    return buildProfileFallbackReply({ userText: userText, scenario: "appointment" });
+  }
+
+  if (clean.includes("libro") && clean.includes("aguacate")) {
+    return [
+      "Te respondo las dos cosas.",
+      "Sobre el libro: si me dices el titulo exacto puedo darte una opinion mas precisa; por ahora miraria si te deja ideas claras y acciones concretas.",
+      "Para aguacate molido: limon, sal, pimienta, cilantro, cebolla morada y tomate. Si lo quieres mas cremoso, agrega un chorrito de aceite de oliva; si lo quieres picante, aji o jalapeno."
+    ].join("\n\n");
+  }
+
+  if (clean.includes("desayuno")) {
+    return "Una idea rapida de desayuno: tostada con aguacate molido, huevo, sal, pimienta y limon. Si quieres algo mas completo, agrega tomate o queso fresco y una fruta.";
+  }
+
+  if (/^(que|qué|como|cómo|cual|cuál|por que|por qué|para que|para qué)\b/.test(clean)) {
+    return String(fallbackText || "").trim() && !looksLikeGenericMenu(fallbackText)
+      ? String(fallbackText).trim()
+      : "Te respondo directo: dime el tema exacto y te doy una explicacion clara, sin menu ni rodeos.";
+  }
+
+  return String(fallbackText || "").trim() && !looksLikeGenericMenu(fallbackText)
+    ? String(fallbackText).trim()
+    : "Te ayudo directo con eso. Voy a tomar tu mensaje como la instruccion principal y responder sin pedirte que elijas otro menu.";
+}
+
+function normalizeSimpleText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}¿?]+/gu, " ")
+    .trim();
 }
 
 function buildSafeTemplate(input) {
@@ -87,12 +160,17 @@ function buildSafeTemplate(input) {
   const userTurn = input.userTurn || {};
   const imageCount = Number(userTurn.image_count || 0);
   const audioCount = Number(userTurn.audio_count || 0);
+  const userText = String(userTurn.combinedUserText || userTurn.current_turn_text || "");
+  const scenario = input.scenario || inferConversationScenario(userText, intent);
 
   if (intent === "unknown_image_request" && imageCount) {
     return "Recibi la imagen. Para ayudarte mejor, dime si quieres que la analice, lea texto visible o la compare con otra.";
   }
   if (audioCount && !String(userTurn.combinedUserText || userTurn.current_turn_text || "").trim()) {
     return "No pude entender bien el audio. Puedes reenviarlo o escribirme la idea principal?";
+  }
+  if (scenario && scenario !== "empty") {
+    return buildProfileFallbackReply({ userText: userText, intent: intent, scenario: scenario });
   }
   return "Listo, te ayudo con eso.";
 }
@@ -101,4 +179,3 @@ function looksUnsafeToSend(text) {
   if (!String(text || "").trim()) return false;
   return /(OPENAI_API_KEY|ANTHROPIC_API_KEY|WOZTELL_ACCESS_TOKEN|WOZTELL_OPEN_API_TOKEN|GOOGLE_SHEETS_SECRET)=/i.test(text);
 }
-

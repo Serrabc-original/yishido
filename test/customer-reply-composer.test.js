@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { composeCustomerReply } from "../src/ai/customerReplyComposer.js";
 import { getCustomerReplyModel } from "../src/ai/modelRegistry.js";
 
@@ -45,3 +46,47 @@ test("Customer Reply Composer blocks secret-like output", () => {
   assert.equal(reply.shouldSend, false);
 });
 
+test("Customer Reply Composer replaces generic menu when user request is clear", () => {
+  const reply = composeCustomerReply({
+    userTurn: {
+      turn_id: "turn_clear",
+      combinedUserText: "Que opinas de este libro y que ingredientes le pongo al aguacate molido?"
+    },
+    intent: "general",
+    systemResult: {
+      text: "¿Quieres que lo explique, lo resuma o revise algún detalle puntual?"
+    }
+  }, {});
+
+  assert.equal(reply.shouldSend, true);
+  assert.match(reply.text, /libro/i);
+  assert.match(reply.text, /aguacate/i);
+  assert.doesNotMatch(reply.text, /quieres que lo explique|revise/i);
+});
+
+test("Customer Reply Composer uses reception style for appointment requests", () => {
+  const reply = composeCustomerReply({
+    userTurn: {
+      turn_id: "turn_cita",
+      combinedUserText: "Hola buenas, quiero agendar una cita para manana"
+    },
+    intent: "general",
+    systemResult: {
+      text: "¿Quieres que lo explique, lo resuma o revise algún detalle puntual?"
+    }
+  }, {});
+
+  assert.equal(reply.shouldSend, true);
+  assert.match(reply.text, /cita/i);
+  assert.match(reply.text, /dia|hora|nombre|servicio/i);
+  assert.doesNotMatch(reply.text, /quieres que lo explique|resuma/i);
+});
+
+test("Conversation style profile JSON is visible and product-editable", () => {
+  const profile = JSON.parse(readFileSync(new URL("../docs/CONVERSATION_STYLE_PROFILE.json", import.meta.url), "utf8"));
+
+  assert.equal(profile.id, "whatsapp_reception_v1");
+  assert.equal(profile.source.conversationFiles, 9);
+  assert.equal(profile.priorities.includes("answer_the_clear_request_first"), true);
+  assert.equal(profile.replyRules.some((rule) => /appointment|cita|date|time/i.test(rule)), true);
+});

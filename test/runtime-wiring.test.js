@@ -180,9 +180,13 @@ function mockRuntimeFetch(captures) {
         captures.visionUrls.push(imageUrl);
         return json({
           output_text: JSON.stringify({
-            main_subject: imageUrl.includes("img_a") ? "imagen A" : imageUrl.includes("img_b") ? "imagen B" : "imagen C",
+            main_subject: captures.forceVisionNoImageText && imageUrl.includes("img_a")
+              ? "captura con texto visible: No veo ninguna imagen adjunta en este turno"
+              : imageUrl.includes("img_a") ? "imagen A" : imageUrl.includes("img_b") ? "imagen B" : "imagen C",
             product_type: "foto",
-            visible_text: imageUrl.includes("img_a") ? "A" : imageUrl.includes("img_b") ? "B" : "C",
+            visible_text: captures.forceVisionNoImageText && imageUrl.includes("img_a")
+              ? "No veo ninguna imagen adjunta en este turno. Puedes reenviarla?"
+              : imageUrl.includes("img_a") ? "A" : imageUrl.includes("img_b") ? "B" : "C",
             brand_or_labels: "",
             colors: ["azul"],
             style: "foto",
@@ -604,6 +608,35 @@ test("bad generic reply is blocked for clear text request", async () => {
   } finally {
     globalThis.fetch = originalFetch;
     console.log = originalLog;
+  }
+});
+
+test("visible OCR text that says no image does not trigger false no-image guardrail", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [], forceVisionNoImageText: true };
+  const logLines = [];
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  const clock = installFakeClock(1781475200000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  console.log = (...args) => {
+    logLines.push(args.map(String).join(" "));
+  };
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Lee el texto visible de esta imagen", "msg_ocr_text")));
+    await coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_ocr_image", "")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const sent = captures.sentTexts.join("\n");
+    assert.match(sent, /No veo ninguna imagen adjunta/i);
+    assert.equal(logLines.some((line) => line.includes("FALSE_NO_IMAGE_REPLY_BLOCKED")), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+    clock.restore();
   }
 });
 
