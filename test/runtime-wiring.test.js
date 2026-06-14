@@ -210,7 +210,7 @@ function mockRuntimeFetch(captures) {
           needs_clarification: false,
           clarification_question: "",
           actions: [],
-          user_facing_ack: captures.forceNoImage ? "No veo la imagen en este turno." : captures.forceBadGeneric
+          user_facing_ack: captures.forceNoImage ? "No veo la imagen en este turno." : captures.forceOnlyOneImage ? "Me llego solo una imagen, reenviame la otra." : captures.forceBadGeneric
             ? "¿Quieres que lo explique, lo resuma o revise algún detalle puntual?"
             : "La respuesta general queda unida y clara.",
           state_updates: {}
@@ -389,6 +389,166 @@ test("audio reply to a quoted image carries referenced media into UserTurn", asy
     assert.equal(captures.sentTexts.join("\n").includes("No veo la imagen"), false);
   } finally {
     globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("three images across different turnIds plus listo use recent media fallback", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781471500000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    for (const item of [
+      ["img_a", "msg_split_a"],
+      ["img_b", "msg_split_b"],
+      ["img_c", "msg_split_c"]
+    ]) {
+      await coordinator.fetch(localMessageRequest(imageMessage(item[0], item[1], "")));
+      clock.tick(100);
+      await coordinator.processBuffer();
+      clock.tick(1000);
+    }
+
+    let saved = await state.storage.get("data");
+    assert.equal(saved.recentMediaAssets.length, 3);
+    assert.equal(new Set(saved.recentMediaAssets.map((asset) => asset.turnId)).size, 3);
+
+    captures.visionUrls.length = 0;
+    captures.sentTexts.length = 0;
+    await coordinator.fetch(localMessageRequest(textMessage("Listo", "msg_split_done")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+    saved = await state.storage.get("data");
+
+    assert.equal(saved.campaignState.active_turn.counts.image, 3);
+    assert.deepEqual(saved.campaignState.active_turn.images.map((image) => image.fileId).sort(), ["img_a", "img_b", "img_c"]);
+    assert.deepEqual(captures.visionUrls.sort(), ["https://cdn.test/img_a.jpg", "https://cdn.test/img_b.jpg", "https://cdn.test/img_c.jpg"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("unsupported 131051 plus split image turns still use recent media fallback", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781471600000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    const unsupported = await coordinator.fetch(localMessageRequest(unsupportedMediaContainer("msg_split_album_hint")));
+    assert.equal((await unsupported.json()).status, "ignored");
+
+    for (const item of [
+      ["img_a", "msg_split_album_a"],
+      ["img_b", "msg_split_album_b"],
+      ["img_c", "msg_split_album_c"]
+    ]) {
+      await coordinator.fetch(localMessageRequest(imageMessage(item[0], item[1], "")));
+      clock.tick(100);
+      await coordinator.processBuffer();
+      clock.tick(1000);
+    }
+
+    captures.visionUrls.length = 0;
+    await coordinator.fetch(localMessageRequest(textMessage("esas son", "msg_split_album_done")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const saved = await state.storage.get("data");
+    assert.equal(saved.campaignState.active_turn.counts.image, 3);
+    assert.deepEqual(captures.visionUrls.sort(), ["https://cdn.test/img_a.jpg", "https://cdn.test/img_b.jpg", "https://cdn.test/img_c.jpg"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("audio that refers to recent image uses recent media fallback", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781471700000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_recent_img", "")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    captures.visionUrls.length = 0;
+    await coordinator.fetch(localMessageRequest(audioMessage("aud_recent", "msg_recent_audio")));
+    await coordinator.fetch(toolResultRequest({
+      type: "audio_transcribed",
+      messageId: "msg_recent_audio",
+      transcript: "Revisa esta imagen y dime lo importante."
+    }));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const saved = await state.storage.get("data");
+    assert.equal(saved.campaignState.active_turn.counts.audio, 1);
+    assert.equal(saved.campaignState.active_turn.counts.image, 1);
+    assert.deepEqual(captures.visionUrls, ["https://cdn.test/img_a.jpg"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("false no-image and only-one replies are blocked when recent media exists", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [], forceNoImage: true };
+  const logLines = [];
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  const clock = installFakeClock(1781471800000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  console.log = (...args) => {
+    logLines.push(args.map(String).join(" "));
+  };
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_guard_a", "")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+    captures.sentTexts.length = 0;
+
+    await coordinator.fetch(localMessageRequest(textMessage("Dame una opinion corta", "msg_guard_text")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    let sent = captures.sentTexts.join("\n");
+    assert.equal(/No veo la imagen/i.test(sent), false);
+    assert.equal(logLines.some((line) => line.includes("FALSE_NO_IMAGE_REPLY_BLOCKED")), true);
+    assert.equal(logLines.some((line) => line.includes("RECENT_MEDIA_USED_TO_REPAIR_IMAGE_REPLY")), true);
+
+    captures.forceNoImage = false;
+    captures.forceOnlyOneImage = true;
+    captures.sentTexts.length = 0;
+    await coordinator.fetch(localMessageRequest(imageMessage("img_b", "msg_guard_b", "")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+    captures.sentTexts.length = 0;
+
+    await coordinator.fetch(localMessageRequest(textMessage("Dame otra opinion corta", "msg_guard_two")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    sent = captures.sentTexts.join("\n");
+    assert.equal(/solo una imagen|reenviame la otra/i.test(sent), false);
+    assert.equal(logLines.some((line) => line.includes("FALSE_ONLY_ONE_IMAGE_REPLY_BLOCKED")), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
     clock.restore();
   }
 });
@@ -644,6 +804,7 @@ test("runtime commands /version and /reset keep short-circuit behavior", async (
   const state = createMemoryState();
   const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
   const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781471900000);
   globalThis.fetch = mockRuntimeFetch(captures);
   const coordinator = new ConversationCoordinator(state, env());
 
@@ -657,15 +818,29 @@ test("runtime commands /version and /reset keep short-circuit behavior", async (
     let saved = await state.storage.get("data");
     assert.equal(saved.pendingMessages.length, 1);
 
+    await coordinator.fetch(localMessageRequest(imageMessage("img_debug_media", "msg_debug_media", "")));
+    saved = await state.storage.get("data");
+    assert.equal(saved.recentMediaAssets.length, 1);
+
+    const debugResponse = await coordinator.fetch(localMessageRequest(textMessage("/debug-media", "msg_debug_media_cmd")));
+    const debugBody = await debugResponse.json();
+    const debugText = captures.sentTexts[captures.sentTexts.length - 1] || "";
+    assert.equal(debugBody.status, "debug_media_sent");
+    assert.match(debugText, /recentMediaAssets count: 1/);
+    assert.match(debugText, /img_d...edia|img_debug_media/);
+    assert.equal(debugText.includes("https://cdn.test"), false);
+
     const resetResponse = await coordinator.fetch(localMessageRequest(textMessage("/reset", "msg_reset")));
     const resetBody = await resetResponse.json();
     saved = await state.storage.get("data");
 
     assert.equal(resetBody.status, "reset_done");
     assert.equal(saved.pendingMessages.length, 0);
+    assert.equal(saved.recentMediaAssets.length, 0);
     assert.equal(saved.currentTurnId, "");
   } finally {
     globalThis.fetch = originalFetch;
+    clock.restore();
   }
 });
 

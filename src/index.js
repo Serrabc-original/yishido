@@ -873,6 +873,7 @@ export class ConversationCoordinator {
 
     if (normalizeTextForIntent(normalized.text) === "/reset") {
       data.pendingMessages = [];
+      data.recentMediaAssets = [];
       data.hasMedia = false;
       data.processing = false;
       data.processingStartedAt = null;
@@ -896,6 +897,19 @@ export class ConversationCoordinator {
       });
 
       return jsonResponse({ status: "reset_done" });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/debug-media") {
+      const debugText = formatDebugMediaForWhatsApp(data, Date.now());
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        text: debugText
+      });
+
+      return jsonResponse({ status: "debug_media_sent" });
     }
 
     const atomicAppend = await this.appendInboundEventAtomically({
@@ -1241,6 +1255,26 @@ export class ConversationCoordinator {
             message_id: message.messageId,
             caption: mediaItem.caption || message.text || ""
           }));
+          data.recentMediaAssets = addRecentMediaAsset(data.recentMediaAssets, {
+            messageId: message.messageId,
+            fileId: mediaItem.fileId,
+            url: "",
+            mediaType: mediaItem.type,
+            mimeType: mediaItem.mimeType,
+            caption: mediaItem.caption || message.text || "",
+            receivedAt: message.receivedAt,
+            turnId: message.turnId,
+            traceId: message.traceId
+          });
+          logEvent("RECENT_MEDIA_ASSET_STORED", {
+            traceId: message.traceId,
+            turnId: message.turnId,
+            doName: data.doName,
+            messageId: message.messageId,
+            fileId: mediaItem.fileId,
+            mediaType: mediaItem.type,
+            hasUrl: false
+          });
           latestUploadedImage = {
             fileId: mediaItem.fileId,
             url: "",
@@ -1261,6 +1295,12 @@ export class ConversationCoordinator {
           ? "bulk_from_assets"
           : data.campaignState.campaign_type || "single_post";
         data.campaignState.workflow_status = explicitMarketingMediaRequest ? "collecting_assets" : "media_received";
+        logEvent("RECENT_MEDIA_COUNT", {
+          traceId: message.traceId,
+          turnId: message.turnId,
+          doName: data.doName,
+          count: normalizeRecentMediaAssets(data.recentMediaAssets).length
+        });
       }
 
       message = attachReferencedMediaToMessage(message, data, now);
@@ -1416,6 +1456,25 @@ export class ConversationCoordinator {
           message_id: clean.message && clean.message.messageId || asset.message_id || "",
           caption: clean.message && clean.message.text || asset.caption || ""
         }));
+        data.recentMediaAssets = addRecentMediaAsset(data.recentMediaAssets, {
+          messageId: clean.message && clean.message.messageId || asset.message_id || "",
+          fileId: asset.file_id || "",
+          url: asset.url || "",
+          mediaType: asset.media_type || "IMAGE",
+          mimeType: asset.mime_type || "",
+          caption: clean.message && clean.message.text || asset.caption || "",
+          receivedAt: asset.received_at || clean.message && clean.message.receivedAt || new Date().toISOString(),
+          turnId: asset.turn_id || clean.turnId || "",
+          traceId: clean.traceId || ""
+        });
+      }
+      if (assets.length) {
+        logEvent("RECENT_MEDIA_COUNT", {
+          traceId: clean.traceId || "",
+          turnId: clean.turnId || "",
+          doName: data.doName,
+          count: normalizeRecentMediaAssets(data.recentMediaAssets).length
+        });
       }
       if (clean.latestUploadedImage) {
         data.campaignState.last_uploaded_image = clean.latestUploadedImage;
@@ -1766,6 +1825,13 @@ export class ConversationCoordinator {
       userTurn.task_media_assets = userTurn.taskMediaAssets;
       userTurn.expected_media_count = userTurn.activeTask && userTurn.activeTask.expectedInputs === "images" ? "unknown" : 0;
       userTurn.received_media_count = userTurn.activeTask ? userTurn.activeTask.receivedMediaCount : userTurn.image_count;
+      const relevantMediaBatch = collectRelevantMediaForTurn(userTurn, data, messages, {
+        now: Date.now(),
+        maxAgeMs: 180000
+      });
+      if (relevantMediaBatch.assets.length && relevantMediaBatch.assets.length >= (userTurn.media_batch && userTurn.media_batch.assets && userTurn.media_batch.assets.length || 0)) {
+        applyRelevantMediaToUserTurn(userTurn, relevantMediaBatch, messages);
+      }
       const mediaRecount = handleUserClaimedMoreImages(userTurn.current_turn_text || "", data.campaignState, messages);
       if (mediaRecount.claimed && mediaRecount.shouldReanalyze) {
         userTurn.media_batch = mediaRecount.mediaBatch;
@@ -1822,6 +1888,13 @@ export class ConversationCoordinator {
         supervisorConfig: getSupervisorConfig(this.env)
       }));
       applySupervisorMediaScope(userTurn, supervisorPlan, data.campaignState, messages);
+      const supervisorRelevantMediaBatch = collectRelevantMediaForTurn(userTurn, data, messages, {
+        now: Date.now(),
+        maxAgeMs: 180000
+      });
+      if (supervisorRelevantMediaBatch.assets.length && supervisorRelevantMediaBatch.assets.length >= (userTurn.media_batch && userTurn.media_batch.assets && userTurn.media_batch.assets.length || 0)) {
+        applyRelevantMediaToUserTurn(userTurn, supervisorRelevantMediaBatch, messages);
+      }
       data.campaignState.supervisor_plan = supervisorPlan;
       data.activeContext = updateConversationContext(data.activeContext, {
         userTurn: userTurn,
@@ -1987,6 +2060,7 @@ export class ConversationCoordinator {
           turnId: userTurn.turn_id,
           doName: data.doName,
           userTurn: userTurn,
+          recentMediaAssets: data.recentMediaAssets,
           supervisorPlan: supervisorPlan,
           intent: supervisorPlan.intent,
           text: composed.text
@@ -2443,6 +2517,7 @@ export class ConversationCoordinator {
         turnId: userTurn && userTurn.turn_id || "",
         doName: data.doName,
         userTurn: userTurn,
+        recentMediaAssets: data.recentMediaAssets,
         supervisorPlan: route.supervisorPlan || { intent: route.intent || "image_question" },
         intent: route.supervisorPlan && route.supervisorPlan.intent || route.intent || "image_question",
         text: text
@@ -2948,6 +3023,7 @@ export class ConversationCoordinator {
             turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
             doName: data.doName,
             userTurn: userTurn,
+            recentMediaAssets: data.recentMediaAssets,
             intent: plan.intent,
             text: text,
             visibleFacts: [analysisResult.summary],
@@ -3021,6 +3097,7 @@ export class ConversationCoordinator {
         turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
         doName: data.doName,
         userTurn: userTurn,
+        recentMediaAssets: data.recentMediaAssets,
         intent: plan.intent || "image_action",
         text: plan.user_facing_ack,
         visibleFacts: [],
@@ -3377,6 +3454,7 @@ export class ConversationCoordinator {
         turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
         doName: data.doName,
         userTurn: userTurn,
+        recentMediaAssets: data.recentMediaAssets,
         intent: plan.intent || "general",
         text: fallbackText,
         visibleFacts: [],
@@ -6331,7 +6409,7 @@ async function sendConversationalResponse(env, params) {
       textLength: reply.text.length
     });
   }
-  if (shouldBlockFalseNoImageReply(reply.text, params && params.userTurn || {})) {
+  if (shouldBlockFalseNoImageReply(reply.text, params && params.userTurn || {}, params && params.recentMediaAssets || [])) {
     logEvent("FALSE_NO_IMAGE_REPLY_BLOCKED", {
       traceId: params && params.traceId || "",
       turnId: params && params.turnId || "",
@@ -6342,12 +6420,46 @@ async function sendConversationalResponse(env, params) {
       traceId: params && params.traceId || "",
       turnId: params && params.turnId || "",
       doName: params && params.doName || "",
-      imageCount: countUserTurnImages(params && params.userTurn || {})
+      imageCount: countUserTurnImages(params && params.userTurn || {}) || countRecentMediaImages(params && params.recentMediaAssets || [])
+    });
+    logEvent("RECENT_MEDIA_USED_TO_REPAIR_IMAGE_REPLY", {
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || "",
+      doName: params && params.doName || "",
+      imageCount: countUserTurnImages(params && params.userTurn || {}) || countRecentMediaImages(params && params.recentMediaAssets || []),
+      reason: "false_no_image_reply"
     });
     reply = composeCustomerReply({
       userTurn: params && params.userTurn || {},
       intent: params && params.intent || params && params.supervisorPlan && params.supervisorPlan.intent || "image_review",
-      systemResult: { text: params && params.text || "Si tengo la imagen de referencia en este turno. La uso como evidencia para responderte." },
+      systemResult: { text: "Si tengo imagenes recientes de la conversacion. Las uso como evidencia para responderte." },
+      visibleFacts: params && params.visibleFacts || [],
+      nextAction: params && params.nextAction || "",
+      locale: "es",
+      maxChars: maxChars,
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || ""
+    }, env || {});
+  }
+  if (shouldBlockFalseOnlyOneImageReply(reply.text, params && params.userTurn || {}, params && params.recentMediaAssets || [])) {
+    logEvent("FALSE_ONLY_ONE_IMAGE_REPLY_BLOCKED", {
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || "",
+      doName: params && params.doName || "",
+      textPreview: String(reply.text || "").slice(0, 240),
+      imageCount: countUserTurnImages(params && params.userTurn || {}) || countRecentMediaImages(params && params.recentMediaAssets || [])
+    });
+    logEvent("RECENT_MEDIA_USED_TO_REPAIR_IMAGE_REPLY", {
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || "",
+      doName: params && params.doName || "",
+      imageCount: countUserTurnImages(params && params.userTurn || {}) || countRecentMediaImages(params && params.recentMediaAssets || []),
+      reason: "false_only_one_image_reply"
+    });
+    reply = composeCustomerReply({
+      userTurn: params && params.userTurn || {},
+      intent: params && params.intent || params && params.supervisorPlan && params.supervisorPlan.intent || "image_review",
+      systemResult: { text: "Si tengo las imagenes recientes de la conversacion. Las uso juntas para responderte." },
       visibleFacts: params && params.visibleFacts || [],
       nextAction: params && params.nextAction || "",
       locale: "es",
@@ -6412,7 +6524,7 @@ function shouldBlockBadGenericReply(replyText, userTurn) {
   ]);
 }
 
-function shouldBlockFalseNoImageReply(replyText, userTurn) {
+function shouldBlockFalseNoImageReply(replyText, userTurn, recentMediaAssets) {
   const deniesImage = containsAssistantStancePattern(replyText, [
     "no veo la imagen",
     "no veo ninguna imagen",
@@ -6423,7 +6535,30 @@ function shouldBlockFalseNoImageReply(replyText, userTurn) {
     "no tengo la imagen",
     "no veo imagen"
   ]);
-  return Boolean(deniesImage && countUserTurnImages(userTurn) > 0);
+  return Boolean(deniesImage && (countUserTurnImages(userTurn) > 0 || countRecentMediaImages(recentMediaAssets) > 0));
+}
+
+function shouldBlockFalseOnlyOneImageReply(replyText, userTurn, recentMediaAssets) {
+  const onlyOne = containsAssistantStancePattern(replyText, [
+    "me llego solo una imagen",
+    "me llegó solo una imagen",
+    "solo me llego una imagen",
+    "solo me llegó una imagen",
+    "solo veo una imagen",
+    "me llego una sola imagen",
+    "me llegó una sola imagen",
+    "reenviame la otra",
+    "reenvíame la otra",
+    "reenvia la otra",
+    "reenvía la otra"
+  ]);
+  return Boolean(onlyOne && Math.max(countUserTurnImages(userTurn), countRecentMediaImages(recentMediaAssets)) > 1);
+}
+
+function countRecentMediaImages(recentMediaAssets) {
+  return normalizeRecentMediaAssets(recentMediaAssets || []).filter(function (asset) {
+    return String(asset.mediaType || "IMAGE").toUpperCase() === "IMAGE";
+  }).length;
 }
 
 function containsAssistantStancePattern(replyText, patterns) {
@@ -6830,6 +6965,7 @@ function normalizeCoordinatorData(data) {
     utilityMemory: clean.utilityMemory || clean.utility_memory || null,
     requestContext: clean.requestContext || clean.request_context || null,
     recentMedia: normalizeRecentMedia(clean.recentMedia || clean.recent_media || []),
+    recentMediaAssets: normalizeRecentMediaAssets(clean.recentMediaAssets || clean.recent_media_assets || []),
     coreUtilityState: normalizeCoreUtilityState(clean.coreUtilityState || clean.core_utility_state || {}),
     activeContext: normalizeConversationContext(clean.activeContext || clean.active_context || {}),
     archivedCampaigns: Array.isArray(clean.archivedCampaigns) ? clean.archivedCampaigns.slice(-5) : []
@@ -6871,6 +7007,76 @@ function addRecentMedia(items, item) {
     return list.slice(-30);
   }
   return list.concat([incoming]).slice(-30);
+}
+
+function normalizeRecentMediaAssets(items) {
+  return (Array.isArray(items) ? items : []).map(function (item) {
+    return {
+      messageId: String(item.messageId || item.message_id || ""),
+      fileId: String(item.fileId || item.file_id || ""),
+      url: String(item.url || ""),
+      mediaType: String(item.mediaType || item.media_type || "IMAGE").toUpperCase(),
+      mimeType: String(item.mimeType || item.mime_type || ""),
+      caption: String(item.caption || ""),
+      receivedAt: String(item.receivedAt || item.received_at || new Date().toISOString()),
+      turnId: String(item.turnId || item.turn_id || item.request_id || ""),
+      traceId: String(item.traceId || item.trace_id || "")
+    };
+  }).filter(function (item) {
+    return item.fileId || item.messageId || item.url;
+  }).slice(-60);
+}
+
+function addRecentMediaAsset(items, item) {
+  const list = normalizeRecentMediaAssets(items);
+  const incoming = normalizeRecentMediaAssets([item])[0];
+  if (!incoming) return list;
+  const existing = list.find(function (candidate) {
+    return incoming.fileId && candidate.fileId === incoming.fileId ||
+      incoming.messageId && candidate.messageId === incoming.messageId;
+  });
+  if (existing) {
+    existing.url = incoming.url || existing.url;
+    existing.mediaType = incoming.mediaType || existing.mediaType;
+    existing.mimeType = incoming.mimeType || existing.mimeType;
+    existing.caption = incoming.caption || existing.caption;
+    existing.receivedAt = incoming.receivedAt || existing.receivedAt;
+    existing.turnId = incoming.turnId || existing.turnId;
+    existing.traceId = incoming.traceId || existing.traceId;
+    return list.slice(-60);
+  }
+  return list.concat([incoming]).slice(-60);
+}
+
+function recentMediaAssetToCampaignAsset(item) {
+  const asset = normalizeRecentMediaAssets([item])[0];
+  if (!asset) return null;
+  return normalizeCampaignAssets([{
+    file_id: asset.fileId,
+    url: asset.url,
+    media_type: asset.mediaType || "IMAGE",
+    mime_type: asset.mimeType || "",
+    message_id: asset.messageId,
+    caption: asset.caption,
+    turn_id: asset.turnId,
+    request_id: asset.turnId,
+    received_at: asset.receivedAt,
+    status: asset.url ? "received" : "url_pending"
+  }])[0] || null;
+}
+
+function getRecentMediaAssets(data, now, maxAgeMs) {
+  const current = Number(now || Date.now());
+  return normalizeRecentMediaAssets(data && data.recentMediaAssets || []).filter(function (asset) {
+    const at = Date.parse(asset.receivedAt || "") || 0;
+    return asset.fileId && (!at || current - at <= maxAgeMs);
+  });
+}
+
+function shortMediaId(value) {
+  const text = String(value || "");
+  if (text.length <= 10) return text;
+  return text.slice(0, 5) + "..." + text.slice(-4);
 }
 
 function attachReferencedMediaToMessage(message, data, now) {
@@ -6968,15 +7174,21 @@ function findReferencedMediaAsset(data, ref) {
   const messageId = String(ref && ref.messageId || "");
   const fileId = String(ref && ref.fileId || "");
   const recent = normalizeRecentMedia(data && data.recentMedia || []);
+  const recentAssets = normalizeRecentMediaAssets(data && data.recentMediaAssets || [])
+    .map(recentMediaAssetToCampaignAsset)
+    .filter(Boolean);
   const campaignAssets = normalizeCampaignAssets(data && data.campaignState && data.campaignState.campaign_assets || []);
-  return recent.concat(campaignAssets).find(function (asset) {
+  return recentAssets.concat(recent, campaignAssets).find(function (asset) {
     return fileId && asset.file_id === fileId || messageId && asset.message_id === messageId;
   }) || null;
 }
 
 function findRecentMediaAsset(data, now, maxAgeMs) {
   const current = Number(now || Date.now());
-  const recent = normalizeRecentMedia(data && data.recentMedia || []);
+  const recentAssets = normalizeRecentMediaAssets(data && data.recentMediaAssets || [])
+    .map(recentMediaAssetToCampaignAsset)
+    .filter(Boolean);
+  const recent = recentAssets.concat(normalizeRecentMedia(data && data.recentMedia || []));
   return recent.slice().reverse().find(function (asset) {
     const at = Date.parse(asset.received_at || "") || 0;
     return asset.file_id && (!at || current - at <= maxAgeMs);
@@ -7153,8 +7365,33 @@ function formatContextForWhatsApp(data) {
   ].join("\n");
 }
 
+function formatDebugMediaForWhatsApp(data, now) {
+  const current = Number(now || Date.now());
+  const recent = normalizeRecentMediaAssets(data && data.recentMediaAssets || []);
+  const pending = Array.isArray(data && data.pendingMessages) ? data.pendingMessages : [];
+  const rows = recent.slice(-8).map(function (asset, index) {
+    const at = Date.parse(asset.receivedAt || "") || current;
+    const ageSeconds = Math.max(0, Math.round((current - at) / 1000));
+    return [
+      String(index + 1) + ".",
+      "fileId=" + shortMediaId(asset.fileId),
+      "turnId=" + shortMediaId(asset.turnId),
+      "age=" + ageSeconds + "s"
+    ].join(" ");
+  });
+
+  return [
+    "Debug media",
+    "recentMediaAssets count: " + recent.length,
+    "pendingCount: " + pending.length,
+    "currentTurnId: " + shortMediaId(data && data.currentTurnId || ""),
+    rows.length ? rows.join("\n") : "(sin media reciente)"
+  ].join("\n");
+}
+
 function clearMediaState(data, reason) {
   const next = normalizeCoordinatorData(data || {});
+  next.recentMediaAssets = [];
   next.campaignState.campaign_assets = [];
   next.campaignState.media_batch_summary = null;
   next.campaignState.last_uploaded_image = null;
@@ -7192,6 +7429,7 @@ function forgetAllConversationData(data, reason) {
   next.processAfter = 0;
   next.currentTraceId = "";
   next.currentTurnId = "";
+  next.recentMediaAssets = [];
   next = resetCampaignState(next, reason || "forget_all");
   next.activeContext = createEmptyConversationContext(reason || "forget_all");
   next.coreUtilityState = normalizeCoreUtilityState({});
@@ -7297,6 +7535,130 @@ function applySupervisorMediaScope(userTurn, supervisorPlan, campaignState, mess
   }).length;
   userTurn.current_turn_media = summarizeAssetsForContext(selected.assets);
   userTurn.currentTurnMedia = userTurn.current_turn_media;
+}
+
+function shouldUseRecentMediaAssetsForTurn(userTurn, messages) {
+  const text = normalizeTextForIntent([
+    userTurn && (userTurn.combinedUserText || userTurn.current_turn_text) || "",
+    consolidatedMessagesText(messages || [])
+  ].filter(Boolean).join("\n"));
+  if (!text) return false;
+  return /\b(listo|ya|eso es todo|esas son|dale|revisa|te mande \d+ imagenes|te mandé \d+ imágenes|te mande imagenes|te mandé imágenes|como no puedes ver|esta imagen|esa imagen|la imagen|esta parte|esta foto|esa foto|esto)\b/.test(text) ||
+    isUserClaimingMoreImages(text);
+}
+
+function collectRelevantMediaForTurn(userTurn, data, messages, options) {
+  const turn = userTurn || {};
+  const cleanData = normalizeCoordinatorData(data || {});
+  const now = Number(options && options.now || Date.now());
+  const maxAgeMs = Number(options && options.maxAgeMs || 180000);
+  const traceId = turn.trace_id || cleanData.currentTraceId || "";
+  const turnId = turn.turn_id || cleanData.currentTurnId || "";
+  const doName = cleanData.doName || "";
+  const selected = [];
+
+  logEvent("RELEVANT_MEDIA_COLLECT_START", {
+    traceId: traceId,
+    turnId: turnId,
+    doName: doName,
+    currentImageCount: countUserTurnImages(turn)
+  });
+
+  for (const asset of normalizeCampaignAssets(turn.media_batch && turn.media_batch.assets || [])) {
+    selected.push(asset);
+  }
+
+  for (const message of messages || []) {
+    for (const reference of message.referencedMedia || []) {
+      const asset = findReferencedMediaAsset(cleanData, {
+        messageId: reference.messageId || "",
+        fileId: reference.fileId || ""
+      });
+      if (asset) selected.push(asset);
+    }
+  }
+
+  const wantsRecent = shouldUseRecentMediaAssetsForTurn(turn, messages) ||
+    countUserTurnImages(turn) > 0 && getRecentMediaAssets(cleanData, now, maxAgeMs).length > countUserTurnImages(turn);
+  if (wantsRecent) {
+    const recent = getRecentMediaAssets(cleanData, now, maxAgeMs)
+      .map(recentMediaAssetToCampaignAsset)
+      .filter(Boolean);
+    if (recent.length) {
+      logEvent("RELEVANT_MEDIA_FROM_RECENT", {
+        traceId: traceId,
+        turnId: turnId,
+        doName: doName,
+        count: recent.length,
+        fileIds: recent.map(function (asset) { return asset.file_id; }).filter(Boolean)
+      });
+      selected.push.apply(selected, recent);
+    }
+
+    const recentCampaignAssets = normalizeCampaignAssets(cleanData.campaignState.campaign_assets || []).filter(function (asset) {
+      const at = Date.parse(asset.received_at || "") || 0;
+      return asset.file_id && (!at || now - at <= maxAgeMs);
+    });
+    selected.push.apply(selected, recentCampaignAssets);
+  }
+
+  const beforeDedupe = selected.length;
+  const assets = normalizeCampaignAssets(selected).filter(function (asset, index, list) {
+    const id = asset.file_id || asset.message_id || "";
+    return id && list.findIndex(function (candidate) {
+      return (candidate.file_id || candidate.message_id || "") === id;
+    }) === index;
+  });
+  if (beforeDedupe !== assets.length) {
+    logEvent("MEDIA_BATCH_DEDUPED", {
+      traceId: traceId,
+      turnId: turnId,
+      before: beforeDedupe,
+      after: assets.length,
+      reason: "relevant_media_collection"
+    });
+  }
+
+  logEvent("RELEVANT_MEDIA_FINAL_COUNT", {
+    traceId: traceId,
+    turnId: turnId,
+    doName: doName,
+    count: assets.length,
+    imageCount: assets.filter(function (asset) { return String(asset.media_type || "IMAGE").toUpperCase() === "IMAGE"; }).length
+  });
+  logEvent("RELEVANT_MEDIA_FINAL_FILE_IDS", {
+    traceId: traceId,
+    turnId: turnId,
+    doName: doName,
+    fileIds: assets.map(function (asset) { return asset.file_id; }).filter(Boolean)
+  });
+
+  return {
+    assets: assets,
+    fileIds: assets.map(function (asset) { return asset.file_id; }).filter(Boolean),
+    assetCount: assets.length,
+    analyzedAssetCount: assets.filter(function (asset) { return asset.status === "analyzed" && asset.analysis; }).length,
+    failedAssetCount: assets.filter(function (asset) { return asset.status === "analysis_failed"; }).length
+  };
+}
+
+function applyRelevantMediaToUserTurn(userTurn, mediaBatch, messages) {
+  const batch = mediaBatch || { assets: [] };
+  userTurn.media_batch = batch;
+  userTurn.media_batch_summary = buildMediaBatchSummary(batch);
+  userTurn.image_count = batch.assets.filter(function (asset) {
+    return String(asset.media_type || "IMAGE").toUpperCase() === "IMAGE";
+  }).length;
+  userTurn.video_count = Math.max(userTurn.video_count || 0, batch.assets.filter(function (asset) {
+    return String(asset.media_type || "").toUpperCase() === "VIDEO";
+  }).length);
+  userTurn.file_count = Math.max(userTurn.file_count || 0, batch.assets.filter(function (asset) {
+    return String(asset.media_type || "").toUpperCase() === "FILE";
+  }).length);
+  userTurn.current_turn_media = summarizeAssetsForContext(batch.assets);
+  userTurn.currentTurnMedia = userTurn.current_turn_media;
+  attachUserTurnContract(userTurn, messages || userTurn.messages || [], batch);
+  return userTurn;
 }
 
 function mergeMediaBatches(first, second) {
