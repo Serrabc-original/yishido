@@ -15,7 +15,7 @@
 // - CLAUDE_ORCHESTRATOR_AGENT_ID
 // - CLAUDE_ORCHESTRATOR_ENVIRONMENT_ID
 // - OPENAI_API_KEY
-// - COPY_MODEL = gpt-5-nano
+// - COPY_MODEL = gpt-5.4-nano
 // - OPENAI_IMAGE_MODEL = gpt-image-2
 // - R2_PUBLIC_BASE_URL
 // - GOOGLE_SHEETS_WEBHOOK_URL
@@ -37,6 +37,22 @@ import {
   getRecentConversationWindow,
   getSupervisorConfig
 } from "./supervisor/conversationSupervisor.js";
+import {
+  buildFastAckText,
+  composeFinalResponse,
+  composeGeneralTextAnswer,
+  shouldSendFastAck,
+  splitConversationalText,
+  validateSpecialistOutputAgainstIntent
+} from "./ai/finalResponseComposer.js";
+import {
+  getFinalResponseModel,
+  getImageGenerationModel,
+  getRouterModel,
+  getSpecialistModel,
+  getTranscriptionModel,
+  getVisionModel
+} from "./ai/modelRegistry.js";
 
 let activeLogContext = {};
 
@@ -52,12 +68,12 @@ const USER_MESSAGES = {
   requestFailed: "Tuve un problema procesando tu solicitud. Intenta nuevamente en unos minutos.",
   uploadedImageMissing: "No pude encontrar la imagen subida. ¿Puedes reenviarla o describirme brevemente qué aparece en la imagen?",
   imageAnalysisFailed: "No pude leer bien la imagen. ¿Me puedes describir el producto o reenviarla con una breve descripción?",
-  uploadedImageClarification: "Recibí la imagen. ¿Quieres que la explique, extraiga el texto, la use como referencia o prepare algo de marketing?",
+  uploadedImageClarification: "Veo la imagen. ¿Quieres que la describa, extraiga texto o revise algún detalle específico?",
   changesAck: "Perfecto, hago los ajustes y te envío una nueva versión.",
   imageGenerationAck: "Perfecto. Voy a generar la imagen y te la envío apenas esté lista.",
   imageRevisionAck: "Listo. Voy a preparar una nueva versión de la imagen con ese cambio.",
   imageProcessing: "La imagen queda en proceso. Te la envío por aquí apenas esté lista.",
-  genericClarification: "Entendido. ¿Qué necesitas que haga con esto?",
+  genericClarification: "¿Quieres que lo explique, lo resuma o revise algún detalle puntual?",
   imageFailed: "Tuve un problema al generar o enviar la imagen. ¿Quieres que lo intente nuevamente?",
   imageQueueFallback: "Tuve un problema generando la imagen. Puedes intentar de nuevo con una descripción más específica.",
   assetsCollected: "Ya recibí {count} imagenes. ¿Quieres que extraiga texto, las analice, las convierta en una lista o las use para marketing?",
@@ -1398,6 +1414,29 @@ export class ConversationCoordinator {
           transcribedCount: userTurn.audio_batch.transcribedCount,
           failedCount: userTurn.audio_batch.failedCount
         }));
+      } else if (supervisorPlan.intent === "general" && composeGeneralTextAnswer(userTurn.current_turn_text || "")) {
+        const composed = composeFinalResponse({
+          supervisorPlan: supervisorPlan,
+          specialistResults: { text: composeGeneralTextAnswer(userTurn.current_turn_text || "") },
+          currentUserMessage: userTurn.current_turn_text || "",
+          currentMediaSummary: userTurn.media_batch_summary || {}
+        });
+        await sendConversationalResponse(this.env, {
+          channelId: data.channel,
+          recipientId: data.phone,
+          memberId: data.member,
+          appId: data.app,
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName,
+          text: composed.text
+        });
+        data.activeContext = updateConversationContext(data.activeContext, {
+          userTurn: userTurn,
+          route: { intent: "general", targetModule: "general_explainer" },
+          campaignState: data.campaignState,
+          pendingClarification: ""
+        });
       } else if (supervisorPlan.intent === "memory") {
         data = await this.handleMemoryUtility(data, supervisorPlan, userTurn);
       } else if (supervisorPlan.responseStrategy === "ask_clarification" && supervisorPlan.clarificationQuestion) {
@@ -1415,6 +1454,7 @@ export class ConversationCoordinator {
           pendingClarification: supervisorPlan.clarificationQuestion
         });
       } else if (shouldSupervisorHandleVision(supervisorPlan, userTurn)) {
+        await this.maybeSendFastAck(data, supervisorPlan, userTurn);
         data = await this.handleVisionUtility(data, {
           intent: mapSupervisorVisionIntent(supervisorPlan.intent),
           module: "vision",
@@ -1683,6 +1723,41 @@ export class ConversationCoordinator {
     }
   }
 
+  async maybeSendFastAck(data, supervisorPlan, userTurn) {
+    if (!shouldSendFastAck({
+      env: this.env,
+      supervisorPlan: supervisorPlan,
+      userTurn: userTurn
+    })) {
+      logEvent("FAST_ACK_SKIPPED", {
+        traceId: userTurn && userTurn.trace_id || "",
+        turnId: userTurn && userTurn.turn_id || "",
+        doName: data && data.doName || "",
+        intent: supervisorPlan && supervisorPlan.intent || ""
+      });
+      return false;
+    }
+
+    await sleep(getFastAckDelayMs(this.env));
+    await sendWoztellTextMessage(this.env, {
+      channelId: data.channel,
+      recipientId: data.phone,
+      memberId: data.member,
+      appId: data.app,
+      traceId: userTurn && userTurn.trace_id || "",
+      turnId: userTurn && userTurn.turn_id || "",
+      doName: data.doName || "",
+      text: buildFastAckText(supervisorPlan, userTurn)
+    });
+    logEvent("FAST_ACK_SENT", {
+      traceId: userTurn && userTurn.trace_id || "",
+      turnId: userTurn && userTurn.turn_id || "",
+      doName: data && data.doName || "",
+      intent: supervisorPlan && supervisorPlan.intent || ""
+    });
+    return true;
+  }
+
   async handleVisionUtility(data, utilityRoute, userTurn, messages) {
     const route = utilityRoute || {};
     const mediaBatch = userTurn && userTurn.media_batch || { assets: [] };
@@ -1742,15 +1817,31 @@ export class ConversationCoordinator {
     });
     const supervisedText = route.supervisorPlan
       ? generateFinalUserResponse(route.supervisorPlan, { vision: analysisResult.summary }, {
+        currentUserMessage: userTurn && userTurn.current_turn_text || "",
         recentConversationWindow: getRecentConversationWindow(data, 20),
-        activeContext: data.activeContext
+        activeContext: data.activeContext,
+        memorySummary: data.conversationSummary
       })
       : "";
-    const text = supervisedText || formatVisionUtilityResponse(route.intent, analysisResult.summary, userTurn);
+    const legacyText = formatVisionUtilityResponse(route.intent, analysisResult.summary, userTurn);
+    const finalResponse = composeFinalResponse({
+      supervisorPlan: route.supervisorPlan || { intent: route.intent || "image_question" },
+      specialistResults: { vision: analysisResult.summary, text: supervisedText || legacyText },
+      currentUserMessage: userTurn && userTurn.current_turn_text || "",
+      currentMediaSummary: analysisResult.summary,
+      recentHistorySummary: getRecentConversationWindow(data, 20),
+      memorySummary: data.conversationSummary
+    });
+    const text = finalResponse.text || supervisedText || legacyText;
     try {
-      await sendLongTextByWoztell(this.env, {
+      await sendConversationalResponse(this.env, {
         channelId: data.channel,
         recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        traceId: userTurn && userTurn.trace_id || "",
+        turnId: userTurn && userTurn.turn_id || "",
+        doName: data.doName,
         text: text
       });
       logEvent("VISION_FINAL_RESPONSE_SENT", {
@@ -2903,7 +2994,7 @@ async function transcribeAudioWithOpenAI(env, audioUrl, metadata) {
     byteLength: bytes.byteLength
   }));
 
-  const model = env.AUDIO_TRANSCRIPTION_MODEL || "whisper-1";
+  const model = getTranscriptionModel(env);
 
   console.log("AUDIO_TRANSCRIPTION_START:", JSON.stringify({
     model: model,
@@ -3461,8 +3552,8 @@ function buildNeutralOrchestratorPayload(env, params, context) {
     constraints: {
       no_meta_publish_yet: true,
       openai_images_quality: "low",
-      copy_model: env.COPY_MODEL || "gpt-5-nano",
-      image_model: env.OPENAI_IMAGE_MODEL || "gpt-image-2"
+      copy_model: getSpecialistModel(env, "copywriter"),
+      image_model: getImageGenerationModel(env)
     },
     module_notes: {
       reminders: "Core utility. Do not schedule real production reminders unless the runtime module is enabled.",
@@ -3639,8 +3730,8 @@ async function callClaudeOrchestratorPlan(env, params) {
     constraints: {
       no_meta_publish_yet: true,
       openai_images_quality: "low",
-      copy_model: env.COPY_MODEL || "gpt-5-nano",
-      image_model: env.OPENAI_IMAGE_MODEL || "gpt-image-2"
+      copy_model: getSpecialistModel(env, "copywriter"),
+      image_model: getImageGenerationModel(env)
     }
   };
 
@@ -4130,7 +4221,7 @@ async function generateCopyWithOpenAI(env, params) {
     throw new Error("Missing OPENAI_API_KEY");
   }
 
-  const model = env.COPY_MODEL || "gpt-5-nano";
+  const model = getSpecialistModel(env, "copywriter");
   const reasoningEffort = normalizeOpenAIReasoningEffort(env.OPENAI_REASONING_EFFORT, {
     model: model,
     source: "copy"
@@ -4241,8 +4332,10 @@ async function analyzeUploadedImageWithOpenAI(env, params) {
     captionPreview: String(params.caption || "").slice(0, 500)
   }));
 
-  const primaryModel = env.VISION_MODEL || "gpt-4o-mini";
-  const fallbackModel = env.VISION_FALLBACK_MODEL || "gpt-5-mini";
+  const primaryModel = getVisionModel(env);
+  const fallbackModel = getVisionModel(Object.assign({}, env, {
+    VISION_MODEL: env.VISION_FALLBACK_MODEL || env.VISION_MODEL
+  }));
 
   try {
     const primary = await callVisionModel(env, {
@@ -4631,7 +4724,7 @@ async function generateImageWithOpenAI(env, prompt) {
     throw new Error("Missing OPENAI_API_KEY");
   }
 
-  const model = env.OPENAI_IMAGE_MODEL || "gpt-image-2";
+  const model = getImageGenerationModel(env);
   const requestBody = {
     model: model,
     prompt: prompt,
@@ -4681,7 +4774,7 @@ async function generateImageEditWithOpenAI(env, params) {
 
   const source = await downloadImageBytes(params.sourceUrl);
   const formData = new FormData();
-  const model = env.OPENAI_IMAGE_MODEL || "gpt-image-2";
+  const model = getImageGenerationModel(env);
 
   formData.append("model", model);
   formData.append("prompt", params.prompt);
@@ -5096,7 +5189,7 @@ async function transcribeAudioBytesOnce(env, bytes, metadata, attempt) {
   }
 
   const contentType = metadata && metadata.contentType || metadata && metadata.fileType || "audio/ogg";
-  const model = env.AUDIO_TRANSCRIPTION_MODEL || "whisper-1";
+  const model = getTranscriptionModel(env);
 
   console.log("AUDIO_TRANSCRIPTION_START:", JSON.stringify({
     attempt: attempt || 1,
@@ -5492,6 +5585,49 @@ async function sendLongTextByWoztell(env, params) {
     });
     await sleep(500);
   }
+}
+
+async function sendConversationalResponse(env, params) {
+  const enabled = String(env && env.CONVERSATIONAL_SPLIT_ENABLED || "true").toLowerCase() !== "false";
+  const maxChars = getNumberEnv(env && env.CONVERSATIONAL_SPLIT_MAX_CHARS, 650);
+  const delayMs = getNumberEnv(env && env.CONVERSATIONAL_SPLIT_DELAY_MS, 750);
+  const text = String(params && params.text || "").trim();
+  const parts = enabled ? splitConversationalText(text, { maxChars: maxChars }) : [text].filter(Boolean);
+
+  if (parts.length > 1) {
+    logEvent("CONVERSATIONAL_SPLIT_APPLIED", {
+      traceId: params.traceId || "",
+      turnId: params.turnId || "",
+      doName: params.doName || "",
+      partCount: parts.length,
+      maxChars: maxChars
+    });
+  }
+
+  for (let index = 0; index < parts.length; index++) {
+    await sendWoztellTextMessage(env, {
+      channelId: params.channelId,
+      recipientId: params.recipientId,
+      memberId: params.memberId,
+      appId: params.appId,
+      traceId: params.traceId || "",
+      turnId: params.turnId || "",
+      doName: params.doName || "",
+      text: parts[index]
+    });
+    logEvent("CONVERSATIONAL_MESSAGE_PART_SENT", {
+      traceId: params.traceId || "",
+      turnId: params.turnId || "",
+      doName: params.doName || "",
+      index: index + 1,
+      total: parts.length
+    });
+    if (index < parts.length - 1) await sleep(delayMs);
+  }
+
+  return {
+    partCount: parts.length
+  };
 }
 
 async function sendWoztellTextMessage(env, params) {
@@ -8325,8 +8461,13 @@ function buildVersionDiagnostic(env) {
     build_label: String(env && env.BUILD_LABEL || "local-dev"),
     ORCHESTRATOR_PROVIDER: String(env && env.ORCHESTRATOR_PROVIDER || "openai"),
     ORCHESTRATOR_MODEL: String(env && env.ORCHESTRATOR_MODEL || "gpt-5.4-mini"),
-    SUPERVISOR_MODEL: String(env && env.SUPERVISOR_MODEL || "gpt-5.4-nano"),
+    SUPERVISOR_MODEL: getSupervisorConfig(env || {}).model,
     SUPERVISOR_FALLBACK_MODEL: String(env && env.SUPERVISOR_FALLBACK_MODEL || "gpt-5.4-mini"),
+    ROUTER_MODEL: getRouterModel(env || {}),
+    SPECIALIST_DEFAULT_MODEL: getSpecialistModel(env || {}, "default"),
+    SPECIALIST_CHEAP_MODEL: String(env && env.SPECIALIST_CHEAP_MODEL || "gpt-5.4-nano"),
+    FINAL_RESPONSE_MODEL: getFinalResponseModel(env || {}),
+    VISION_MODEL: getVisionModel(env || {}),
     DEBUG_LOGS: String(flags.debugLogs),
     ENABLE_LISTS: String(flags.enableLists),
     ENABLE_REMINDERS: String(flags.enableReminders),
@@ -8360,6 +8501,11 @@ function formatVersionDiagnosticForWhatsApp(diagnostic) {
     "ORCHESTRATOR_MODEL: " + (data.ORCHESTRATOR_MODEL || ""),
     "SUPERVISOR_MODEL: " + (data.SUPERVISOR_MODEL || ""),
     "SUPERVISOR_FALLBACK_MODEL: " + (data.SUPERVISOR_FALLBACK_MODEL || ""),
+    "ROUTER_MODEL: " + (data.ROUTER_MODEL || ""),
+    "SPECIALIST_DEFAULT_MODEL: " + (data.SPECIALIST_DEFAULT_MODEL || ""),
+    "SPECIALIST_CHEAP_MODEL: " + (data.SPECIALIST_CHEAP_MODEL || ""),
+    "FINAL_RESPONSE_MODEL: " + (data.FINAL_RESPONSE_MODEL || ""),
+    "VISION_MODEL: " + (data.VISION_MODEL || ""),
     "DEBUG_LOGS: " + (data.DEBUG_LOGS || ""),
     "ENABLE_LISTS: " + (data.ENABLE_LISTS || ""),
     "ENABLE_REMINDERS: " + (data.ENABLE_REMINDERS || ""),
@@ -8400,6 +8546,10 @@ function getAudioTurnWaitConfig(env) {
     maxAudioTurnWaitMs: getNumberEnv(env && env.AUDIO_TURN_WAIT_SECONDS, 75) * 1000,
     retryWaitMs: getNumberEnv(env && env.AUDIO_TURN_RETRY_SECONDS, 3) * 1000
   };
+}
+
+function getFastAckDelayMs(env) {
+  return getNumberEnv(env && env.FAST_ACK_DELAY_MS, 1200);
 }
 
 function sanitizeKeyPart(value) {

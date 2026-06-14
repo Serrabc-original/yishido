@@ -1,10 +1,19 @@
+import { composeFinalResponse } from "../ai/finalResponseComposer.js";
+import { getSupervisorModel } from "../ai/modelRegistry.js";
+import { logEvent } from "../logger.js";
+
 const INTENTS = new Set([
   "general",
+  "product_advice",
   "price_review",
   "multi_image_price_review",
   "multi_image_review",
+  "image_description",
+  "pet_photo",
+  "unknown_image_request",
   "image_question",
   "image_ocr",
+  "mechanic",
   "list",
   "reminder",
   "marketing",
@@ -16,7 +25,7 @@ const INTENTS = new Set([
 
 export function getSupervisorConfig(env) {
   return {
-    model: String(env && env.SUPERVISOR_MODEL || "gpt-5.4-nano"),
+    model: getSupervisorModel(env || {}),
     fallbackModel: String(env && env.SUPERVISOR_FALLBACK_MODEL || "gpt-5.4-mini")
   };
 }
@@ -63,6 +72,9 @@ export function createConversationSupervisorPlan(input) {
   const previousTask = findPreviousTask(previousWindow, activeContext);
   const imageCount = getImageCount(currentTurn);
   const hasCurrentImages = imageCount > 0;
+  const mediaSubjectText = getTurnMediaSubjectText(currentTurn);
+  const hasPetMedia = isPetMedia(mediaSubjectText);
+  const hasCommercialMedia = isCommercialMedia(mediaSubjectText);
   const currentOnlyMedia = currentTurn.current_turn_media || currentTurn.currentTurnMedia || {};
   const previousRelevantMedia = currentTurn.previous_relevant_media || currentTurn.previousRelevantMedia || {};
   const hasPreviousRelevantMedia = Number(previousRelevantMedia.asset_count || previousRelevantMedia.image_count || 0) > 0;
@@ -72,7 +84,8 @@ export function createConversationSupervisorPlan(input) {
   const isMarketing = isMarketingIntent(normalized);
   const isOcr = isOcrIntent(normalized);
   const isMemory = isMemoryIntent(normalized);
-  const isPrice = isPriceReviewIntent(normalized) || (!hasText && hasCurrentImages && previousTask.intent === "price_review");
+  const isPrice = isPriceReviewIntent(normalized) || (!hasText && hasCurrentImages && previousTask.intent === "price_review" && !hasPetMedia);
+  const isProductAdvice = isProductAdviceIntent(normalized) || (hasCurrentImages && hasCommercialMedia && isImageQuestionIntent(normalized));
   const isContextSwitch = Boolean(
     (isReminder || isList || isMarketing || isMemory) &&
     previousTask.intent &&
@@ -122,6 +135,15 @@ export function createConversationSupervisorPlan(input) {
     targetModules = hasCurrentImages ? ["vision", "marketing", "general_llm"] : ["marketing", "general_llm"];
     mediaScope = hasCurrentImages ? "all_pending_batch" : "none";
     responseStrategy = hasCurrentImages ? "analyze_then_answer" : "answer_now";
+  } else if (hasPetMedia && hasCurrentImages && !isPriceReviewIntent(normalized)) {
+    intent = "pet_photo";
+    activeTask = "pet_photo";
+    targetModules = ["vision", "general_llm"];
+    mediaScope = imageCount > 1 ? "all_pending_batch" : "current_only";
+    responseStrategy = "analyze_then_answer";
+    if (previousTask.intent === "price_review") {
+      logIntentLeakagePrevented("price_review", "pet_photo", "pet_media_current_turn");
+    }
   } else if (isPrice) {
     intent = imageCount > 1 ? "multi_image_price_review" : "price_review";
     activeTask = "price_review";
@@ -132,7 +154,17 @@ export function createConversationSupervisorPlan(input) {
     if (mediaScope === "none") {
       needsClarification = true;
       clarificationQuestion = "Enviame las fotos con los precios o dime cual imagen anterior quieres comparar.";
+      logEvent("PRICE_REVIEW_CONTEXT_REQUIRED", {
+        reason: "price_intent_without_media",
+        hasPreviousRelevantMedia: hasPreviousRelevantMedia
+      });
     }
+  } else if (isProductAdvice && hasCurrentImages) {
+    intent = "product_advice";
+    activeTask = "product_advice";
+    targetModules = ["vision", "general_llm"];
+    mediaScope = imageCount > 1 ? "all_pending_batch" : "current_only";
+    responseStrategy = "analyze_then_answer";
   } else if (isOcr && hasCurrentImages) {
     intent = "image_ocr";
     activeTask = "image_ocr";
@@ -146,19 +178,19 @@ export function createConversationSupervisorPlan(input) {
     mediaScope = imageCount > 1 ? "all_pending_batch" : "current_only";
     responseStrategy = "analyze_then_answer";
   } else if (!hasText && hasCurrentImages && previousTask.intent && previousTask.intent !== "general") {
-    intent = previousTask.intent === "price_review" ? (imageCount > 1 ? "multi_image_price_review" : "price_review") : "image_question";
+    intent = previousTask.intent === "price_review" && !hasPetMedia ? (imageCount > 1 ? "multi_image_price_review" : "price_review") : hasPetMedia ? "pet_photo" : "image_question";
     activeTask = previousTask.intent;
     targetModules = ["vision", "general_llm"];
     mediaScope = imageCount > 1 ? "all_pending_batch" : "current_only";
     responseStrategy = "analyze_then_answer";
   } else if (hasCurrentImages) {
-    intent = imageCount > 1 ? "multi_image_review" : "image_question";
+    intent = hasPetMedia ? "pet_photo" : imageCount > 1 ? "multi_image_review" : "unknown_image_request";
     activeTask = intent;
     targetModules = ["vision", "general_llm"];
     mediaScope = imageCount > 1 ? "all_pending_batch" : "current_only";
     needsClarification = !hasText && previousTask.intent === "general";
     responseStrategy = needsClarification ? "ask_clarification" : "analyze_then_answer";
-    clarificationQuestion = needsClarification ? "¿Quieres que analice la imagen, extraiga texto o la use para marketing?" : "";
+    clarificationQuestion = needsClarification ? buildImageClarificationQuestion(mediaSubjectText) : "";
   }
 
   const isContinuation = Boolean(!isContextSwitch && (
@@ -167,7 +199,7 @@ export function createConversationSupervisorPlan(input) {
     /\b(eso|esto|esta|este|la segunda|la primera|los precios|lo de antes|y este|y esta|cual conviene|cu[aá]l conviene)\b/i.test(currentText)
   ));
 
-  if (isContinuation && hasCurrentImages && previousTask.intent === "price_review") {
+  if (isContinuation && hasCurrentImages && previousTask.intent === "price_review" && !hasPetMedia) {
     intent = imageCount > 1 ? "multi_image_price_review" : "price_review";
     activeTask = "price_review";
     targetModules = ["vision", "general_llm"];
@@ -175,6 +207,14 @@ export function createConversationSupervisorPlan(input) {
     responseStrategy = "analyze_then_answer";
     needsClarification = false;
     clarificationQuestion = "";
+  }
+  if (isContinuation && hasCurrentImages && previousTask.intent === "price_review" && hasPetMedia) {
+    intent = "pet_photo";
+    activeTask = "pet_photo";
+    targetModules = ["vision", "general_llm"];
+    mediaScope = imageCount > 1 ? "all_pending_batch" : "current_only";
+    responseStrategy = "analyze_then_answer";
+    logIntentLeakagePrevented("price_review", "pet_photo", "pet_media_continuation_blocked");
   }
 
   const plan = {
@@ -234,16 +274,16 @@ export function normalizeSupervisorPlan(plan) {
 export function generateFinalUserResponse(supervisorPlan, moduleResults, recentContext) {
   const plan = normalizeSupervisorPlan(supervisorPlan || {});
   const results = moduleResults || {};
+  const composed = composeFinalResponse({
+    supervisorPlan: plan,
+    specialistResults: results,
+    currentUserMessage: recentContext && recentContext.currentUserMessage || plan.currentUserGoal || "",
+    currentMediaSummary: results.vision || results.summary || {},
+    recentHistorySummary: recentContext && recentContext.recentConversationWindow || [],
+    memorySummary: recentContext && recentContext.memorySummary || null
+  });
 
-  if (plan.intent === "price_review" || plan.intent === "multi_image_price_review") {
-    return formatPriceReviewResponse(results.vision || results.summary || {}, plan);
-  }
-
-  if (plan.intent === "image_question" || plan.intent === "multi_image_review") {
-    return formatImageQuestionResponse(results.vision || results.summary || {}, recentContext || {});
-  }
-
-  return "";
+  return composed.text || "";
 }
 
 export function formatPriceReviewResponse(summary, plan) {
@@ -295,7 +335,7 @@ function formatImageQuestionResponse(summary) {
   return [
     subjects.length ? "Veo " + subjects.join(" | ") + "." : "Puedo ayudarte con lo visible en la imagen.",
     visibleTexts.length ? "Texto visible: " + visibleTexts.join(" | ") : "",
-    "Si es para compra, revisaria modelo exacto, garantia y condiciones antes de decidir."
+    "Si quieres, puedo ayudarte a describirla, sacar un caption o revisar un detalle específico."
   ].filter(Boolean).join("\n");
 }
 
@@ -349,6 +389,10 @@ function getImageCount(turn) {
 
 function isPriceReviewIntent(text) {
   return /\b(precio|precios|caro|cara|caros|caras|barato|barata|conviene|cotiza|cotizacion|cotizaci[oó]n|vale la pena|cuanto cuesta|cu[aá]l sale mejor|mejor precio)\b/.test(text);
+}
+
+function isProductAdviceIntent(text) {
+  return /\b(producto|marca|modelo|garantia|garantía|caracteristicas|características|me sirve|sirve para|saludable|comprar|compra|vale la pena|conviene)\b/.test(text);
 }
 
 function isImageQuestionIntent(text) {
@@ -488,4 +532,50 @@ function inferCurrency(text) {
   if (clean.includes("usd") || clean.includes("$")) return "USD";
   if (clean.includes("dolar")) return "USD";
   return "";
+}
+
+function getTurnMediaSubjectText(turn) {
+  const pieces = [];
+  const batch = turn && turn.media_batch || {};
+  const summary = turn && turn.media_batch_summary || {};
+  const assets = []
+    .concat(Array.isArray(batch.assets) ? batch.assets : [])
+    .concat(Array.isArray(summary.assets) ? summary.assets : []);
+
+  for (const asset of assets) {
+    const analysis = asset.analysis || asset;
+    pieces.push(analysis.main_subject, analysis.product_type, analysis.visible_text, analysis.brand_or_labels, analysis.marketing_notes);
+    if (Array.isArray(analysis.objects_detected)) pieces.push(analysis.objects_detected.join(" "));
+  }
+
+  pieces.push(summary.summary, summary.main_subject, summary.product_type);
+  return pieces.filter(Boolean).join(" ");
+}
+
+function isPetMedia(text) {
+  return /\b(gato|gatito|gata|perro|perrito|mascota|animal)\b/i.test(String(text || ""));
+}
+
+function isCommercialMedia(text) {
+  return /\b(producto|empaque|caja|marca|precio|tienda|pasta|dental|parlante|audifono|audífono|cargador|jbl|sony|anker)\b/i.test(String(text || "")) && !isPetMedia(text);
+}
+
+function buildImageClarificationQuestion(mediaSubjectText) {
+  if (isPetMedia(mediaSubjectText)) {
+    return "Veo una mascota en la foto. ¿Quieres que haga una descripción, un caption o una edición de la imagen?";
+  }
+  return "Veo la imagen. ¿Quieres que la describa, extraiga texto o revise algún detalle específico?";
+}
+
+function logIntentLeakagePrevented(fromIntent, toIntent, reason) {
+  console.log("INTENT_LEAKAGE_PREVENTED:", JSON.stringify({
+    fromIntent: fromIntent,
+    toIntent: toIntent,
+    reason: reason
+  }));
+  logEvent("INTENT_LEAKAGE_PREVENTED", {
+    fromIntent: fromIntent,
+    toIntent: toIntent,
+    reason: reason
+  });
 }

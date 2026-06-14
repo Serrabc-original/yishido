@@ -108,6 +108,38 @@ test("image plus caption is an image question, not generic visual analysis", () 
   assert.equal(plan.responseStrategy, "analyze_then_answer");
 });
 
+test("cat image with analyzed media blocks stale price context", () => {
+  const messages = [imageMessage("cat_1")];
+  const campaignState = {
+    campaign_assets: [
+      {
+        asset_id: "asset_1",
+        asset_index: 1,
+        file_id: "cat_1",
+        url: "https://cdn/cat.jpg",
+        media_type: "IMAGE",
+        turn_id: "turn_cat",
+        status: "analyzed",
+        analysis: {
+          main_subject: "gatito gris acostado en una cama",
+          product_type: "",
+          objects_detected: ["gato", "cama"],
+          confidence: 0.9
+        }
+      }
+    ]
+  };
+  const turn = buildUserTurn(messages, campaignState, { turnId: "turn_cat" });
+  const plan = createConversationSupervisorPlan({
+    currentTurn: turn,
+    recentConversationWindow: [{ turnId: "old", type: "text", summary: "revisa estos precios", mediaRefs: {} }],
+    activeContext: { activeIntent: "price_review" }
+  });
+
+  assert.equal(plan.intent, "pet_photo");
+  assert.notEqual(plan.intent, "price_review");
+});
+
 test("topic switch from prices to reminder does not keep price intent", () => {
   const turn = buildUserTurn([textMessage("Recuerdame manana comprar leche", "reminder")], {}, { turnId: "turn_reminder" });
   const plan = createConversationSupervisorPlan({
@@ -247,7 +279,7 @@ test("marketing is only explicit and general product image stays evaluation", ()
   });
 
   assert.equal(marketing.intent, "marketing");
-  assert.equal(general.intent, "image_question");
+  assert.equal(general.intent, "product_advice");
 });
 
 test("recent conversation window normalizes the last 20 turns", () => {
