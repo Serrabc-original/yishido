@@ -389,6 +389,7 @@ export class ConversationCoordinator {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    this.storageLock = Promise.resolve();
   }
 
   async fetch(request) {
@@ -556,6 +557,20 @@ export class ConversationCoordinator {
     })));
     const ignoreInbound = shouldIgnoreInboundEvent(inboundEvent, seenMessageIds, { traceId: incomingTraceId });
     if (ignoreInbound.ignore) {
+      if (inboundEvent && inboundEvent.isUnsupported && String(inboundEvent.errorCode || "") === "131051") {
+        logEvent("UNSUPPORTED_MEDIA_CONTAINER_IGNORED", {
+          traceId: incomingTraceId,
+          doName: data.doName,
+          messageId: inboundEvent.messageId || "",
+          errorCode: inboundEvent.errorCode || ""
+        });
+        logEvent("UNSUPPORTED_MEDIA_CONTAINER_BATCH_HINT", {
+          traceId: incomingTraceId,
+          doName: data.doName,
+          messageId: inboundEvent.messageId || "",
+          hintWindowMs: getTurnAggregationTiming(this.env || {}).minWaitMs
+        });
+      }
       return jsonResponse({ status: "ignored", reason: ignoreInbound.reason, messageId: messageId });
     }
 
@@ -571,7 +586,7 @@ export class ConversationCoordinator {
       return jsonResponse({ status: "duplicate_ignored", messageId: messageId });
     }
 
-    const normalized = normalizeIncomingMessage(parsedMessage, woztellPayload, {
+    let normalized = normalizeIncomingMessage(parsedMessage, woztellPayload, {
       messageId: messageId,
       receivedAt: new Date(now).toISOString()
     });
@@ -882,48 +897,21 @@ export class ConversationCoordinator {
       return jsonResponse({ status: "reset_done" });
     }
 
-    const startsNewCampaign = isNewCampaignRequest(normalized.text);
+    const atomicAppend = await this.appendInboundEventAtomically({
+      dataSeed: data,
+      normalized: normalized,
+      inboundEvent: inboundEvent,
+      incomingTraceId: incomingTraceId,
+      messageId: messageId,
+      now: now
+    });
 
-    if (startsNewCampaign) {
-      console.log("NEW_CAMPAIGN_DETECTED:", JSON.stringify({
-        doName: data.doName,
-        previousCampaignId: data.campaignState.campaign_id,
-        text: normalized.text.slice(0, 300)
-      }));
-
-      data = resetCampaignState(data, "new_campaign_request");
-      data.pendingMessages = [];
-      data.hasMedia = false;
-      data.firstMessageAt = now;
-      data.currentTurnId = "";
+    if (atomicAppend.duplicate) {
+      return jsonResponse({ status: "duplicate_ignored", messageId: messageId });
     }
 
-    if (!data.pendingMessages.length) {
-      data.firstMessageAt = now;
-      data.currentTurnId = "turn_" + now + "_" + randomId(6);
-      data.currentTraceId = incomingTraceId || createTraceId([data.doName, data.currentTurnId, messageId]);
-      logEvent("TURN_NEW_CREATED_FOR_EVENT", {
-        traceId: data.currentTraceId,
-        turnId: data.currentTurnId,
-        doName: data.doName,
-        messageId: messageId,
-        type: normalized.type || ""
-      });
-    } else {
-      logEvent("TURN_REUSED_FOR_EVENT", {
-        traceId: data.currentTraceId || incomingTraceId || "",
-        turnId: data.currentTurnId || "",
-        doName: data.doName,
-        messageId: messageId,
-        type: normalized.type || "",
-        pendingCount: data.pendingMessages.length
-      });
-    }
-
-    data.lastMessageAt = now;
-    normalized.turnId = data.currentTurnId || "turn_" + now + "_" + randomId(6);
-    normalized.traceId = data.currentTraceId || incomingTraceId || createTraceId([data.doName, normalized.turnId, messageId]);
-    data = appendPendingEvent(data, normalized, { traceId: normalized.traceId });
+    data = atomicAppend.data;
+    normalized = atomicAppend.message;
 
     if (normalized.video.length) {
       logEvent("VIDEO_RECEIVED", {
@@ -960,7 +948,6 @@ export class ConversationCoordinator {
     });
 
     if (normalized.media.length || ["IMAGE", "VIDEO"].includes(normalized.type)) {
-      data.hasMedia = true;
       let latestUploadedImage = null;
       const resolvedAssets = [];
 
@@ -1004,7 +991,6 @@ export class ConversationCoordinator {
           status: uploadedImageUrl ? "received" : "url_pending"
         };
 
-        data.campaignState.campaign_assets = addCampaignAsset(data.campaignState.campaign_assets, assetPatch);
         resolvedAssets.push(assetPatch);
         latestUploadedImage = {
           fileId: mediaItem.fileId,
@@ -1017,15 +1003,13 @@ export class ConversationCoordinator {
         };
       }
 
-      const explicitMarketingMediaRequest = isExplicitMarketingRequest(normalized.text);
-      data.campaignState.last_uploaded_image = latestUploadedImage || data.campaignState.last_uploaded_image;
-      data.campaignState.current_asset_source = "uploaded_image";
-      data.campaignState.uploaded_image_analysis = null;
-      data.campaignState.collecting_assets = explicitMarketingMediaRequest;
-      data.campaignState.campaign_type = explicitMarketingMediaRequest && data.campaignState.campaign_assets.length > 1
-        ? "bulk_from_assets"
-        : data.campaignState.campaign_type || "single_post";
-      data.campaignState.workflow_status = explicitMarketingMediaRequest ? "collecting_assets" : "media_received";
+      data = await this.mergeResolvedMediaAssetsAtomically({
+        traceId: normalized.traceId,
+        turnId: normalized.turnId,
+        message: normalized,
+        assets: resolvedAssets,
+        latestUploadedImage: latestUploadedImage
+      });
       logEvent("IMAGE_PREBUFFER_ANALYSIS_BLOCKED", {
         traceId: normalized.traceId,
         turnId: normalized.turnId,
@@ -1054,134 +1038,18 @@ export class ConversationCoordinator {
       });
     }
 
-    data.campaignState.history = appendHistory(data.campaignState.history, {
-      role: "user",
-      type: normalized.type,
-      text: normalized.text || (normalized.fileId ? "[media enviada]" : ""),
-      fileId: normalized.fileId,
-      at: normalized.receivedAt
-    });
-
-    const taskTiming = getTaskIntakeTimingConfig(this.env);
-    const existingTask = normalizeActiveTask(data.campaignState.active_task);
-    const hadActiveTask = Boolean(existingTask && existingTask.status === "awaiting_media");
-    const openedTask = hadActiveTask ? null : createTaskIntakeFromText(normalized.text, {
-      now: now,
-      waitSeconds: taskTiming.waitSeconds,
-      maxWaitSeconds: taskTiming.maxWaitSeconds,
-      silenceSeconds: taskTiming.silenceSeconds
-    });
-
-    if (openedTask) {
-      data.campaignState.active_task = updateTaskIntakeWithMessage(openedTask, normalized, { now: now });
-      logEvent("TASK_INTAKE_WINDOW_OPENED", {
-        traceId: normalized.traceId,
-        turnId: normalized.turnId,
-        doName: data.doName,
-        type: data.campaignState.active_task.type,
-        expectedInputs: data.campaignState.active_task.expectedInputs,
-        waitSeconds: taskTiming.waitSeconds,
-        maxWaitSeconds: taskTiming.maxWaitSeconds,
-        silenceSeconds: taskTiming.silenceSeconds
-      });
-    } else if (hadActiveTask) {
-      data.campaignState.active_task = updateTaskIntakeWithMessage(existingTask, normalized, { now: now });
-      const activeTask = data.campaignState.active_task;
-      const addedMedia = extractImageFileIdsFromMessage(normalized);
-
-      logEvent(addedMedia.length ? "TASK_INTAKE_MEDIA_ADDED" : "TASK_INTAKE_MESSAGE_ADDED", {
-        traceId: normalized.traceId,
-        turnId: normalized.turnId,
-        doName: data.doName,
-        type: activeTask.type,
-        receivedMediaCount: activeTask.receivedMediaCount,
-        fileIds: addedMedia
-      });
-      if (addedMedia.length) {
-        logEvent(activeTask.receivedMediaCount === addedMedia.length ? "MULTI_IMAGE_BATCH_STARTED" : "MULTI_IMAGE_BATCH_ASSET_ADDED", {
-          traceId: normalized.traceId,
-          turnId: normalized.turnId,
-          doName: data.doName,
-          receivedMediaCount: activeTask.receivedMediaCount,
-          fileIds: activeTask.taskMediaFileIds
-        });
-      }
-    }
-
-    const timing = getBufferTimingConfig(this.env);
-    const waitReason = data.hasMedia ? "media_message" : "text_or_audio_transcript";
-    const waitSeconds = data.hasMedia
-      ? timing.imageMessageWaitSeconds
-      : timing.bufferWaitSeconds;
-    const maxWaitSeconds = timing.bufferMaxWaitSeconds;
-    const desiredProcessAt = data.lastMessageAt + waitSeconds * 1000;
-    const maxProcessAt = data.firstMessageAt + maxWaitSeconds * 1000;
-    const activeTaskForTiming = normalizeActiveTask(data.campaignState.active_task);
-    if (activeTaskForTiming && activeTaskForTiming.taskMediaFileIds.length) {
-      const taskFileIds = new Set(activeTaskForTiming.taskMediaFileIds);
-      data.campaignState.task_media_assets = normalizeCampaignAssets(data.campaignState.campaign_assets).filter(function (asset) {
-        return taskFileIds.has(asset.file_id);
-      });
-    }
-    const taskDecision = activeTaskForTiming
-      ? buildTaskIntakeDecision(activeTaskForTiming, {
-        now: now,
-        hasMedia: activeTaskForTiming.receivedMediaCount > 0,
-        userDone: isTaskDoneSignal(normalized.text)
-      })
-      : null;
-
-    data.processAfter = taskDecision && activeTaskForTiming && activeTaskForTiming.status === "awaiting_media"
-      ? taskDecision.nextProcessAt || Math.min(desiredProcessAt, maxProcessAt)
-      : Math.min(desiredProcessAt, maxProcessAt);
-    const mediaHoldAfterAppend = shouldHoldMediaTurnForMoreEvents(data, data.pendingMessages, this.env);
-    if (mediaHoldAfterAppend.hold) {
-      data.processAfter = mediaHoldAfterAppend.nextProcessAt;
-    }
-    data.updatedAt = new Date().toISOString();
-
-    await this.saveData(data);
-    await this.state.storage.setAlarm(data.processAfter);
-    logTurnTimerReset(data, {
-      traceId: normalized.traceId,
-      turnId: normalized.turnId,
-      reason: waitReason,
-      processAfter: data.processAfter,
-      processAfterIso: new Date(data.processAfter).toISOString()
-    });
-
-    if (activeTaskForTiming && activeTaskForTiming.status === "awaiting_media") {
-      logEvent("TASK_INTAKE_TIMER_RESET", {
-        traceId: normalized.traceId,
-        turnId: normalized.turnId,
-        doName: data.doName,
-        reason: taskDecision && taskDecision.reason || "",
-        processAfter: data.processAfter,
-        processAfterIso: new Date(data.processAfter).toISOString(),
-        receivedMediaCount: activeTaskForTiming.receivedMediaCount
-      });
-      if (taskDecision && taskDecision.ready && taskDecision.reason === "user_done") {
-        logEvent("TASK_INTAKE_READY_BY_USER_DONE", {
-          traceId: normalized.traceId,
-          turnId: normalized.turnId,
-          doName: data.doName,
-          receivedMediaCount: activeTaskForTiming.receivedMediaCount
-        });
-      }
-    }
-
-    console.log("BUFFER_TIMING_CONFIG:", JSON.stringify(timing));
+    console.log("BUFFER_TIMING_CONFIG:", JSON.stringify(atomicAppend.timing));
     console.log("BUFFER_WAIT_REASON:", JSON.stringify({
       doName: data.doName,
-      reason: waitReason,
+      reason: atomicAppend.waitReason,
       pendingCount: data.pendingMessages.length,
       hasMedia: data.hasMedia
     }));
     console.log("BUFFER_PROCESS_AFTER_SET:", JSON.stringify({
       doName: data.doName,
       pendingCount: data.pendingMessages.length,
-      desiredProcessAt: desiredProcessAt,
-      maxProcessAt: maxProcessAt,
+      desiredProcessAt: atomicAppend.desiredProcessAt,
+      maxProcessAt: atomicAppend.maxProcessAt,
       processAfter: data.processAfter,
       processAfterIso: new Date(data.processAfter).toISOString()
     }));
@@ -1203,10 +1071,357 @@ export class ConversationCoordinator {
       processAfter: new Date(data.processAfter).toISOString()
     }));
 
+    if (atomicAppend.readyByUserDone) {
+      logEvent("TURN_READY_BY_USER_DONE", {
+        traceId: normalized.traceId,
+        turnId: normalized.turnId,
+        doName: data.doName,
+        pendingCount: data.pendingMessages.length
+      });
+      await this.processBuffer();
+      data = await this.getData();
+    }
+
     return jsonResponse({
       status: "buffered",
       pendingCount: data.pendingMessages.length,
       processAfter: data.processAfter
+    });
+  }
+
+  async runStorageCriticalSection(callback) {
+    if (this.state && typeof this.state.blockConcurrencyWhile === "function") {
+      return await this.state.blockConcurrencyWhile(callback);
+    }
+
+    const previous = this.storageLock || Promise.resolve();
+    let release = function () {};
+    this.storageLock = previous.then(function () {
+      return new Promise(function (resolve) {
+        release = resolve;
+      });
+    });
+    await previous;
+    try {
+      return await callback();
+    } finally {
+      release();
+    }
+  }
+
+  async appendInboundEventAtomically(params) {
+    const clean = params || {};
+    const now = Number(clean.now || Date.now());
+    const incomingTraceId = clean.incomingTraceId || "";
+
+    return await this.runStorageCriticalSection(async () => {
+      let data = await this.getData();
+      const seed = clean.dataSeed || {};
+      data.doName = seed.doName || data.doName || "";
+      data.channel = seed.channel || data.channel || "";
+      data.phone = seed.phone || data.phone || "";
+      data.member = seed.member || data.member || "";
+      data.app = seed.app || data.app || "";
+      data.channelIdentity = seed.channelIdentity || data.channelIdentity || null;
+      data.messageEventMeta = seed.messageEventMeta || data.messageEventMeta || null;
+      data.lastInboundAt = seed.lastInboundAt || data.lastInboundAt || "";
+
+      let message = Object.assign({}, clean.normalized || {});
+      const messageId = clean.messageId || message.messageId || randomId(12);
+      logEvent("ATOMIC_APPEND_START", {
+        traceId: incomingTraceId || data.currentTraceId || "",
+        turnId: data.currentTurnId || "",
+        doName: data.doName,
+        messageId: messageId,
+        type: message.type || "",
+        pendingCount: data.pendingMessages.length
+      });
+
+      const seenMessageIds = new Set([].concat(data.processedMessageIds || []).concat((data.pendingMessages || []).map(function (msg) {
+        return msg.messageId;
+      })));
+      if (seenMessageIds.has(messageId)) {
+        logEvent("INBOUND_EVENT_DEDUPED", {
+          traceId: incomingTraceId || data.currentTraceId || "",
+          turnId: data.currentTurnId || "",
+          doName: data.doName,
+          messageId: messageId,
+          type: message.type || ""
+        });
+        return { duplicate: true, data: data, message: message };
+      }
+
+      if (isNewCampaignRequest(message.text)) {
+        console.log("NEW_CAMPAIGN_DETECTED:", JSON.stringify({
+          doName: data.doName,
+          previousCampaignId: data.campaignState.campaign_id,
+          text: String(message.text || "").slice(0, 300)
+        }));
+        data = resetCampaignState(data, "new_campaign_request");
+        data.pendingMessages = [];
+        data.hasMedia = false;
+        data.firstMessageAt = now;
+        data.currentTurnId = "";
+      }
+
+      const timing = getBufferTimingConfig(this.env);
+      const existingOpen = hasOpenPendingTurn(data, now, this.env);
+      const userDone = isUserDoneSignal(message.text || "");
+
+      if (!existingOpen) {
+        data.firstMessageAt = now;
+        data.currentTurnId = "turn_" + now + "_" + randomId(6);
+        data.currentTraceId = incomingTraceId || createTraceId([data.doName, data.currentTurnId, messageId]);
+        logEvent("ATOMIC_APPEND_CREATED_NEW_TURN", {
+          traceId: data.currentTraceId,
+          turnId: data.currentTurnId,
+          doName: data.doName,
+          messageId: messageId,
+          type: message.type || ""
+        });
+        logEvent("TURN_NEW_CREATED_FOR_EVENT", {
+          traceId: data.currentTraceId,
+          turnId: data.currentTurnId,
+          doName: data.doName,
+          messageId: messageId,
+          type: message.type || ""
+        });
+      } else {
+        logEvent("ATOMIC_APPEND_FOUND_EXISTING_TURN", {
+          traceId: data.currentTraceId || incomingTraceId || "",
+          turnId: data.currentTurnId || "",
+          doName: data.doName,
+          messageId: messageId,
+          type: message.type || "",
+          pendingCount: data.pendingMessages.length
+        });
+        logEvent("TURN_REUSED_FOR_EVENT", {
+          traceId: data.currentTraceId || incomingTraceId || "",
+          turnId: data.currentTurnId || "",
+          doName: data.doName,
+          messageId: messageId,
+          type: message.type || "",
+          pendingCount: data.pendingMessages.length
+        });
+        if (userDone) {
+          logEvent("USER_DONE_REUSED_PENDING_TURN", {
+            traceId: data.currentTraceId || incomingTraceId || "",
+            turnId: data.currentTurnId || "",
+            doName: data.doName,
+            messageId: messageId,
+            pendingCount: data.pendingMessages.length
+          });
+        }
+      }
+
+      data.lastMessageAt = now;
+      message.turnId = data.currentTurnId || "turn_" + now + "_" + randomId(6);
+      message.traceId = data.currentTraceId || incomingTraceId || createTraceId([data.doName, message.turnId, messageId]);
+      data = appendPendingEvent(data, message, { traceId: message.traceId });
+
+      if (message.media && message.media.length || ["IMAGE", "VIDEO"].includes(message.type || "")) {
+        data.hasMedia = true;
+        const explicitMarketingMediaRequest = isExplicitMarketingRequest(message.text);
+        let latestUploadedImage = null;
+        for (const mediaItem of message.media || []) {
+          const assetPatch = {
+            file_id: mediaItem.fileId,
+            url: "",
+            media_type: mediaItem.type,
+            mime_type: mediaItem.mimeType,
+            turn_id: message.turnId,
+            request_id: message.turnId,
+            analysis: null,
+            received_at: message.receivedAt,
+            status: "url_pending"
+          };
+          data.campaignState.campaign_assets = addCampaignAsset(data.campaignState.campaign_assets, assetPatch);
+          data.recentMedia = addRecentMedia(data.recentMedia, Object.assign({}, assetPatch, {
+            message_id: message.messageId,
+            caption: mediaItem.caption || message.text || ""
+          }));
+          latestUploadedImage = {
+            fileId: mediaItem.fileId,
+            url: "",
+            type: mediaItem.type,
+            mimeType: mediaItem.mimeType,
+            app: message.app,
+            text: message.text,
+            receivedAt: message.receivedAt,
+            messageId: message.messageId,
+            turnId: message.turnId
+          };
+        }
+        data.campaignState.last_uploaded_image = latestUploadedImage || data.campaignState.last_uploaded_image;
+        data.campaignState.current_asset_source = "uploaded_image";
+        data.campaignState.uploaded_image_analysis = null;
+        data.campaignState.collecting_assets = explicitMarketingMediaRequest;
+        data.campaignState.campaign_type = explicitMarketingMediaRequest && data.campaignState.campaign_assets.length > 1
+          ? "bulk_from_assets"
+          : data.campaignState.campaign_type || "single_post";
+        data.campaignState.workflow_status = explicitMarketingMediaRequest ? "collecting_assets" : "media_received";
+      }
+
+      message = attachReferencedMediaToMessage(message, data, now);
+      if (message.media && message.media.length) {
+        data.hasMedia = true;
+      }
+      data.pendingMessages = data.pendingMessages.map(function (pending) {
+        return pending.messageId === message.messageId ? message : pending;
+      });
+
+      data.campaignState.history = appendHistory(data.campaignState.history, {
+        role: "user",
+        type: message.type,
+        text: message.text || (message.fileId ? "[media enviada]" : ""),
+        fileId: message.fileId,
+        at: message.receivedAt
+      });
+
+      const taskTiming = getTaskIntakeTimingConfig(this.env);
+      const existingTask = normalizeActiveTask(data.campaignState.active_task);
+      const hadActiveTask = Boolean(existingTask && existingTask.status === "awaiting_media");
+      const openedTask = hadActiveTask ? null : createTaskIntakeFromText(message.text, {
+        now: now,
+        waitSeconds: taskTiming.waitSeconds,
+        maxWaitSeconds: taskTiming.maxWaitSeconds,
+        silenceSeconds: taskTiming.silenceSeconds
+      });
+
+      if (openedTask) {
+        data.campaignState.active_task = updateTaskIntakeWithMessage(openedTask, message, { now: now });
+        logEvent("TASK_INTAKE_WINDOW_OPENED", {
+          traceId: message.traceId,
+          turnId: message.turnId,
+          doName: data.doName,
+          type: data.campaignState.active_task.type,
+          expectedInputs: data.campaignState.active_task.expectedInputs,
+          waitSeconds: taskTiming.waitSeconds,
+          maxWaitSeconds: taskTiming.maxWaitSeconds,
+          silenceSeconds: taskTiming.silenceSeconds
+        });
+      } else if (hadActiveTask) {
+        data.campaignState.active_task = updateTaskIntakeWithMessage(existingTask, message, { now: now });
+        const activeTask = data.campaignState.active_task;
+        const addedMedia = extractImageFileIdsFromMessage(message);
+
+        logEvent(addedMedia.length ? "TASK_INTAKE_MEDIA_ADDED" : "TASK_INTAKE_MESSAGE_ADDED", {
+          traceId: message.traceId,
+          turnId: message.turnId,
+          doName: data.doName,
+          type: activeTask.type,
+          receivedMediaCount: activeTask.receivedMediaCount,
+          fileIds: addedMedia
+        });
+        if (addedMedia.length) {
+          logEvent(activeTask.receivedMediaCount === addedMedia.length ? "MULTI_IMAGE_BATCH_STARTED" : "MULTI_IMAGE_BATCH_ASSET_ADDED", {
+            traceId: message.traceId,
+            turnId: message.turnId,
+            doName: data.doName,
+            receivedMediaCount: activeTask.receivedMediaCount,
+            fileIds: activeTask.taskMediaFileIds
+          });
+        }
+      }
+
+      const waitReason = data.hasMedia ? "media_message" : "text_or_audio_transcript";
+      const waitSeconds = data.hasMedia ? timing.imageMessageWaitSeconds : timing.bufferWaitSeconds;
+      const desiredProcessAt = data.lastMessageAt + waitSeconds * 1000;
+      const maxProcessAt = data.firstMessageAt + timing.bufferMaxWaitSeconds * 1000;
+      const activeTaskForTiming = normalizeActiveTask(data.campaignState.active_task);
+      if (activeTaskForTiming && activeTaskForTiming.taskMediaFileIds.length) {
+        const taskFileIds = new Set(activeTaskForTiming.taskMediaFileIds);
+        data.campaignState.task_media_assets = normalizeCampaignAssets(data.campaignState.campaign_assets).filter(function (asset) {
+          return taskFileIds.has(asset.file_id);
+        });
+      }
+      const taskDecision = activeTaskForTiming
+        ? buildTaskIntakeDecision(activeTaskForTiming, {
+          now: now,
+          hasMedia: activeTaskForTiming.receivedMediaCount > 0,
+          userDone: isTaskDoneSignal(message.text)
+        })
+        : null;
+
+      data.processAfter = taskDecision && activeTaskForTiming && activeTaskForTiming.status === "awaiting_media"
+        ? taskDecision.nextProcessAt || Math.min(desiredProcessAt, maxProcessAt)
+        : Math.min(desiredProcessAt, maxProcessAt);
+      const mediaHoldAfterAppend = shouldHoldMediaTurnForMoreEvents(data, data.pendingMessages, this.env);
+      if (mediaHoldAfterAppend.hold) {
+        data.processAfter = mediaHoldAfterAppend.nextProcessAt;
+      }
+      if (userDone && existingOpen) {
+        data.processAfter = now;
+      }
+      data.updatedAt = new Date().toISOString();
+
+      await this.saveData(data);
+      await this.state.storage.setAlarm(data.processAfter);
+      logEvent("ATOMIC_APPEND_STORED", {
+        traceId: message.traceId,
+        turnId: message.turnId,
+        doName: data.doName,
+        messageId: messageId,
+        pendingCount: data.pendingMessages.length,
+        processAfter: data.processAfter
+      });
+      logEvent("ATOMIC_APPEND_PENDING_COUNT", {
+        traceId: message.traceId,
+        turnId: message.turnId,
+        doName: data.doName,
+        pendingCount: data.pendingMessages.length
+      });
+      logTurnTimerReset(data, {
+        traceId: message.traceId,
+        turnId: message.turnId,
+        reason: waitReason,
+        processAfter: data.processAfter,
+        processAfterIso: new Date(data.processAfter).toISOString()
+      });
+
+      if (activeTaskForTiming && activeTaskForTiming.status === "awaiting_media") {
+        logEvent("TASK_INTAKE_TIMER_RESET", {
+          traceId: message.traceId,
+          turnId: message.turnId,
+          doName: data.doName,
+          reason: taskDecision && taskDecision.reason || "",
+          processAfter: data.processAfter,
+          processAfterIso: new Date(data.processAfter).toISOString(),
+          receivedMediaCount: activeTaskForTiming.receivedMediaCount
+        });
+      }
+
+      return {
+        duplicate: false,
+        data: data,
+        message: message,
+        timing: timing,
+        waitReason: waitReason,
+        desiredProcessAt: desiredProcessAt,
+        maxProcessAt: maxProcessAt,
+        readyByUserDone: Boolean(userDone && existingOpen)
+      };
+    });
+  }
+
+  async mergeResolvedMediaAssetsAtomically(params) {
+    const clean = params || {};
+    return await this.runStorageCriticalSection(async () => {
+      let data = await this.getData();
+      const assets = Array.isArray(clean.assets) ? clean.assets : [];
+      for (const asset of assets) {
+        data.campaignState.campaign_assets = addCampaignAsset(data.campaignState.campaign_assets, asset);
+        data.recentMedia = addRecentMedia(data.recentMedia, Object.assign({}, asset, {
+          message_id: clean.message && clean.message.messageId || asset.message_id || "",
+          caption: clean.message && clean.message.text || asset.caption || ""
+        }));
+      }
+      if (clean.latestUploadedImage) {
+        data.campaignState.last_uploaded_image = clean.latestUploadedImage;
+      }
+      data.updatedAt = new Date().toISOString();
+      await this.saveData(data);
+      return data;
     });
   }
 
@@ -6110,6 +6325,31 @@ async function sendConversationalResponse(env, params) {
       textLength: reply.text.length
     });
   }
+  if (shouldBlockFalseNoImageReply(reply.text, params && params.userTurn || {})) {
+    logEvent("FALSE_NO_IMAGE_REPLY_BLOCKED", {
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || "",
+      doName: params && params.doName || "",
+      textPreview: String(reply.text || "").slice(0, 240)
+    });
+    logEvent("RECENT_MEDIA_FOUND_BEFORE_NO_IMAGE_REPLY", {
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || "",
+      doName: params && params.doName || "",
+      imageCount: countUserTurnImages(params && params.userTurn || {})
+    });
+    reply = composeCustomerReply({
+      userTurn: params && params.userTurn || {},
+      intent: params && params.intent || params && params.supervisorPlan && params.supervisorPlan.intent || "image_review",
+      systemResult: { text: params && params.text || "Si tengo la imagen de referencia en este turno. La uso como evidencia para responderte." },
+      visibleFacts: params && params.visibleFacts || [],
+      nextAction: params && params.nextAction || "",
+      locale: "es",
+      maxChars: maxChars,
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || ""
+    }, env || {});
+  }
   if (!reply.shouldSend) return { partCount: 0 };
   const text = reply.text;
   const parts = enabled ? reply.splitMessages : [text].filter(Boolean);
@@ -6167,6 +6407,34 @@ function shouldBlockBadGenericReply(replyText, userTurn) {
   ].some(function (pattern) {
     return text.includes(normalizeTextForIntent(pattern));
   });
+}
+
+function shouldBlockFalseNoImageReply(replyText, userTurn) {
+  const text = normalizeTextForIntent(replyText);
+  if (!text) return false;
+  const deniesImage = [
+    "no veo la imagen",
+    "no veo ninguna imagen",
+    "no hay imagen",
+    "no encuentro la imagen",
+    "no tengo la imagen",
+    "no veo imagen"
+  ].some(function (pattern) {
+    return text.includes(normalizeTextForIntent(pattern));
+  });
+  return Boolean(deniesImage && countUserTurnImages(userTurn) > 0);
+}
+
+function countUserTurnImages(userTurn) {
+  const turn = userTurn || {};
+  if (turn.counts && Number(turn.counts.image || 0)) return Number(turn.counts.image || 0);
+  if (Array.isArray(turn.images) && turn.images.length) return turn.images.length;
+  if (turn.media_batch && Array.isArray(turn.media_batch.assets)) {
+    return turn.media_batch.assets.filter(function (asset) {
+      return String(asset.media_type || "").toUpperCase() === "IMAGE";
+    }).length;
+  }
+  return 0;
 }
 
 function isClearUserRequestText(text) {
@@ -6528,10 +6796,166 @@ function normalizeCoordinatorData(data) {
     customerMemory: clean.customerMemory || clean.customer_memory || null,
     utilityMemory: clean.utilityMemory || clean.utility_memory || null,
     requestContext: clean.requestContext || clean.request_context || null,
+    recentMedia: normalizeRecentMedia(clean.recentMedia || clean.recent_media || []),
     coreUtilityState: normalizeCoreUtilityState(clean.coreUtilityState || clean.core_utility_state || {}),
     activeContext: normalizeConversationContext(clean.activeContext || clean.active_context || {}),
     archivedCampaigns: Array.isArray(clean.archivedCampaigns) ? clean.archivedCampaigns.slice(-5) : []
   };
+}
+
+function normalizeRecentMedia(items) {
+  return (Array.isArray(items) ? items : []).map(function (item) {
+    return {
+      file_id: String(item.file_id || item.fileId || ""),
+      url: String(item.url || ""),
+      media_type: String(item.media_type || item.mediaType || "IMAGE").toUpperCase(),
+      mime_type: String(item.mime_type || item.mimeType || ""),
+      message_id: String(item.message_id || item.messageId || ""),
+      turn_id: String(item.turn_id || item.turnId || ""),
+      caption: String(item.caption || ""),
+      received_at: String(item.received_at || item.receivedAt || new Date().toISOString()),
+      status: String(item.status || "received")
+    };
+  }).filter(function (item) {
+    return item.file_id || item.message_id || item.url;
+  }).slice(-30);
+}
+
+function addRecentMedia(items, item) {
+  const list = normalizeRecentMedia(items);
+  const incoming = normalizeRecentMedia([item])[0];
+  if (!incoming) return list;
+  const existing = list.find(function (candidate) {
+    return incoming.file_id && candidate.file_id === incoming.file_id ||
+      incoming.message_id && candidate.message_id === incoming.message_id;
+  });
+  if (existing) {
+    existing.url = incoming.url || existing.url;
+    existing.status = incoming.status || existing.status;
+    existing.caption = incoming.caption || existing.caption;
+    existing.turn_id = incoming.turn_id || existing.turn_id;
+    existing.received_at = incoming.received_at || existing.received_at;
+    return list.slice(-30);
+  }
+  return list.concat([incoming]).slice(-30);
+}
+
+function attachReferencedMediaToMessage(message, data, now) {
+  const clean = Object.assign({}, message || {});
+  if (clean.media && clean.media.length) return clean;
+
+  const quotedId = String(clean.quotedMessageId || clean.replyToMessageId || "").trim();
+  const quotedFileId = String(clean.quotedFileId || "").trim();
+  const traceId = clean.traceId || data && data.currentTraceId || "";
+  const turnId = clean.turnId || data && data.currentTurnId || "";
+  const doName = data && data.doName || "";
+
+  if (quotedId || quotedFileId) {
+    logEvent("QUOTED_MEDIA_REFERENCE_DETECTED", {
+      traceId: traceId,
+      turnId: turnId,
+      doName: doName,
+      messageId: clean.messageId || "",
+      quotedMessageId: quotedId,
+      quotedFileId: quotedFileId
+    });
+    const quotedAsset = findReferencedMediaAsset(data, { messageId: quotedId, fileId: quotedFileId });
+    if (quotedAsset) {
+      logEvent("QUOTED_MEDIA_RESOLVED", {
+        traceId: traceId,
+        turnId: turnId,
+        doName: doName,
+        messageId: clean.messageId || "",
+        quotedMessageId: quotedId,
+        fileId: quotedAsset.file_id || ""
+      });
+      return attachAssetAsReferencedMedia(clean, quotedAsset, "quoted");
+    }
+    logEvent("QUOTED_MEDIA_NOT_FOUND", {
+      traceId: traceId,
+      turnId: turnId,
+      doName: doName,
+      messageId: clean.messageId || "",
+      quotedMessageId: quotedId,
+      quotedFileId: quotedFileId
+    });
+  }
+
+  if (shouldUseRecentMediaFallbackForMessage(clean)) {
+    const recentAsset = findRecentMediaAsset(data, now, 90000);
+    if (recentAsset) {
+      logEvent("RECENT_MEDIA_FALLBACK_USED", {
+        traceId: traceId,
+        turnId: turnId,
+        doName: doName,
+        messageId: clean.messageId || "",
+        fileId: recentAsset.file_id || ""
+      });
+      return attachAssetAsReferencedMedia(clean, recentAsset, "recent_fallback");
+    }
+  }
+
+  return clean;
+}
+
+function attachAssetAsReferencedMedia(message, asset, source) {
+  const clean = Object.assign({}, message || {});
+  const mediaItem = {
+    type: String(asset.media_type || "IMAGE").toUpperCase(),
+    fileId: String(asset.file_id || ""),
+    mimeType: String(asset.mime_type || ""),
+    fileName: "",
+    caption: String(asset.caption || ""),
+    referenced: true,
+    referenceSource: source
+  };
+  clean.media = (clean.media || []).concat([mediaItem]).filter(function (item) {
+    return item && item.fileId;
+  });
+  clean.referencedMedia = (clean.referencedMedia || []).concat([{
+    fileId: mediaItem.fileId,
+    messageId: String(asset.message_id || ""),
+    source: source,
+    url: String(asset.url || "")
+  }]);
+  if (["TEXT", "AUDIO"].includes(String(clean.type || "").toUpperCase())) {
+    logEvent("AUDIO_TEXT_WITH_REFERENCED_MEDIA", {
+      traceId: clean.traceId || "",
+      turnId: clean.turnId || "",
+      messageId: clean.messageId || "",
+      type: clean.type || "",
+      fileId: mediaItem.fileId,
+      source: source
+    });
+  }
+  return clean;
+}
+
+function findReferencedMediaAsset(data, ref) {
+  const messageId = String(ref && ref.messageId || "");
+  const fileId = String(ref && ref.fileId || "");
+  const recent = normalizeRecentMedia(data && data.recentMedia || []);
+  const campaignAssets = normalizeCampaignAssets(data && data.campaignState && data.campaignState.campaign_assets || []);
+  return recent.concat(campaignAssets).find(function (asset) {
+    return fileId && asset.file_id === fileId || messageId && asset.message_id === messageId;
+  }) || null;
+}
+
+function findRecentMediaAsset(data, now, maxAgeMs) {
+  const current = Number(now || Date.now());
+  const recent = normalizeRecentMedia(data && data.recentMedia || []);
+  return recent.slice().reverse().find(function (asset) {
+    const at = Date.parse(asset.received_at || "") || 0;
+    return asset.file_id && (!at || current - at <= maxAgeMs);
+  }) || null;
+}
+
+function shouldUseRecentMediaFallbackForMessage(message) {
+  const type = String(message && message.type || "").toUpperCase();
+  if (!["TEXT", "AUDIO"].includes(type)) return false;
+  const text = normalizeTextForIntent(message && (message.text || message.audioTranscript) || "");
+  if (!text) return false;
+  return /\b(esta imagen|esa imagen|la imagen|esta foto|esa foto|esto|esta parte|esta|esa)\b/.test(text);
 }
 
 function normalizeCoreUtilityState(state) {
@@ -7351,6 +7775,8 @@ function normalizeCampaignAssets(assets) {
       url: String(asset.url || ""),
       media_type: String(asset.media_type || asset.mediaType || "IMAGE"),
       mime_type: String(asset.mime_type || asset.mimeType || ""),
+      message_id: String(asset.message_id || asset.messageId || ""),
+      caption: String(asset.caption || ""),
       turn_id: String(asset.turn_id || asset.turnId || ""),
       request_id: String(asset.request_id || asset.requestId || asset.turn_id || asset.turnId || ""),
       analysis: asset.analysis || null,
@@ -7425,6 +7851,8 @@ function addCampaignAsset(assets, asset) {
     url: url,
     media_type: String(asset.media_type || asset.mediaType || "IMAGE"),
     mime_type: String(asset.mime_type || asset.mimeType || ""),
+    message_id: String(asset.message_id || asset.messageId || ""),
+    caption: String(asset.caption || ""),
     turn_id: String(asset.turn_id || asset.turnId || ""),
     request_id: String(asset.request_id || asset.requestId || asset.turn_id || asset.turnId || ""),
     analysis: asset.analysis || null,
@@ -8103,11 +8531,72 @@ function getLastUploadedImage(state) {
   return state && (state.last_uploaded_image || state.lastUploadedImage) || {};
 }
 
+function extractQuotedMessageReference(parsedMessage, woztellPayload) {
+  const parsed = parsedMessage || {};
+  const payload = woztellPayload || {};
+  const data = payload.data || {};
+  const directRefs = [{
+    quotedMessageId: parsed.quotedMessageId || payload.quotedMessageId || data.quotedMessageId,
+    replyToMessageId: parsed.replyToMessageId || payload.replyToMessageId || data.replyToMessageId,
+    fileId: parsed.quotedFileId || payload.quotedFileId || data.quotedFileId,
+    type: parsed.quotedType || payload.quotedType || data.quotedType
+  }];
+  const containers = directRefs.concat([
+    parsed.context,
+    payload.context,
+    data.context,
+    parsed.quotedMessage,
+    payload.quotedMessage,
+    data.quotedMessage,
+    parsed.quoted,
+    payload.quoted,
+    data.quoted,
+    parsed.replyTo,
+    payload.replyTo,
+    data.replyTo,
+    parsed.reply_to,
+    payload.reply_to,
+    data.reply_to
+  ]).filter(function (item) {
+    return item && typeof item === "object";
+  });
+
+  for (const item of containers) {
+    const messageId = String(
+      item.quotedMessageId ||
+      item.replyToMessageId ||
+      item.messageId ||
+      item.message_id ||
+      item.id ||
+      item.mid ||
+      item.stanzaId ||
+      item.stanza_id ||
+      ""
+    ).trim();
+    const fileId = String(
+      item.fileId ||
+      item.file_id ||
+      item.mediaId ||
+      item.media_id ||
+      item.attachment && (item.attachment.fileId || item.attachment.file_id) ||
+      item.file && (item.file.fileId || item.file.file_id) ||
+      ""
+    ).trim();
+    const type = String(item.type || item.messageType || item.message_type || "").toUpperCase();
+    if (messageId || fileId) {
+      return { messageId: messageId, fileId: fileId, type: type };
+    }
+  }
+
+  return { messageId: "", fileId: "", type: "" };
+}
+
 function normalizeIncomingMessage(parsedMessage, woztellPayload, options) {
   const parsed = parsedMessage || {};
   const payload = woztellPayload || {};
   const type = String(parsed.type || normalizeEventType(payload.type || payload.data && payload.data.type || "", payload) || "UNSUPPORTED").toUpperCase();
   const fileId = String(parsed.fileId || "");
+  const quoted = extractQuotedMessageReference(parsed, payload);
   const media = extractMediaFromPayload(parsed, payload);
   const audio = isAudioMessage(parsed) && fileId ? [{
     type: type,
@@ -8140,6 +8629,10 @@ function normalizeIncomingMessage(parsedMessage, woztellPayload, options) {
     fileName: String(parsed.fileName || ""),
     originalType: parsed.originalType || (type === "AUDIO" ? "AUDIO" : ""),
     originalFileId: parsed.originalFileId || "",
+    quotedMessageId: quoted.messageId,
+    replyToMessageId: quoted.messageId,
+    quotedFileId: quoted.fileId,
+    quotedType: quoted.type,
     audioStatus: parsed.audioStatus || (audio.length ? "pending" : ""),
     audioTranscript: parsed.audioTranscript || "",
     awaitingTranscription: Boolean(audio.length && !parsed.audioTranscript && parsed.audioStatus !== "failed"),
@@ -9462,6 +9955,17 @@ function shouldHoldMediaTurnForMoreEvents(data, messages, env) {
     ageMs: ageMs,
     nextProcessAt: nextProcessAt
   };
+}
+
+function hasOpenPendingTurn(data, now, env) {
+  const state = data || {};
+  const pending = Array.isArray(state.pendingMessages) ? state.pendingMessages : [];
+  if (!state.currentTurnId || !pending.length) return false;
+
+  const timing = getTurnAggregationTiming(env || {});
+  const firstAt = Number(state.firstMessageAt || now || Date.now());
+  const ageMs = Number(now || Date.now()) - firstAt;
+  return ageMs <= timing.maxWaitMs;
 }
 
 function getAudioTurnWaitConfig(env) {

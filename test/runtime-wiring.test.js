@@ -95,6 +95,13 @@ function audioMessage(fileId, messageId) {
   };
 }
 
+function audioReplyMessage(fileId, messageId, quotedMessageId) {
+  const message = audioMessage(fileId, messageId);
+  message.payload.data.context = { messageId: quotedMessageId };
+  message.parsedMessage.context = { messageId: quotedMessageId };
+  return message;
+}
+
 function textMessage(text, messageId) {
   const payload = basePayload("TEXT", {
     messageId: messageId,
@@ -111,6 +118,19 @@ function textMessage(text, messageId) {
       messageId: messageId,
       text: text
     }
+  };
+}
+
+function unsupportedMediaContainer(messageId) {
+  return {
+    type: "woztell_message",
+    doName: "channel_runtime:593995660220",
+    traceId: "trace_runtime",
+    payload: basePayload("", {
+      messageId: messageId,
+      errorCode: "131051",
+      error: { code: "131051", message: "Message type unknown" }
+    })
   };
 }
 
@@ -186,7 +206,7 @@ function mockRuntimeFetch(captures) {
           needs_clarification: false,
           clarification_question: "",
           actions: [],
-          user_facing_ack: captures.forceBadGeneric
+          user_facing_ack: captures.forceNoImage ? "No veo la imagen en este turno." : captures.forceBadGeneric
             ? "¿Quieres que lo explique, lo resuma o revise algún detalle puntual?"
             : "La respuesta general queda unida y clara.",
           state_updates: {}
@@ -236,6 +256,169 @@ function installFakeClock(start) {
     }
   };
 }
+
+test("concurrent WhatsApp images append atomically into one pending turn", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const logLines = [];
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  const clock = installFakeClock(1781471000000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  console.log = (...args) => {
+    logLines.push(args.map(String).join(" "));
+    originalLog(...args);
+  };
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await Promise.all([
+      coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_conc_a", "a"))),
+      coordinator.fetch(localMessageRequest(imageMessage("img_b", "msg_conc_b", "b"))),
+      coordinator.fetch(localMessageRequest(imageMessage("img_c", "msg_conc_c", "c")))
+    ]);
+
+    let saved = await state.storage.get("data");
+    assert.equal(saved.pendingMessages.length, 3);
+    assert.equal(new Set(saved.pendingMessages.map((message) => message.turnId)).size, 1);
+    assert.equal(logLines.filter((line) => line.includes("TURN_REUSED_FOR_EVENT")).length >= 2, true);
+
+    clock.tick(100);
+    await coordinator.processBuffer();
+    saved = await state.storage.get("data");
+
+    assert.equal(saved.campaignState.active_turn.counts.image, 3);
+    assert.deepEqual(captures.visionUrls.sort(), ["https://cdn.test/img_a.jpg", "https://cdn.test/img_b.jpg", "https://cdn.test/img_c.jpg"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+    clock.restore();
+  }
+});
+
+test("three images plus listo closes the same pending turn", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781471100000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await Promise.all([
+      coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_done_a", ""))),
+      coordinator.fetch(localMessageRequest(imageMessage("img_b", "msg_done_b", ""))),
+      coordinator.fetch(localMessageRequest(imageMessage("img_c", "msg_done_c", "")))
+    ]);
+    let saved = await state.storage.get("data");
+    const turnId = saved.currentTurnId;
+
+    await coordinator.fetch(localMessageRequest(textMessage("Listo", "msg_done_text")));
+    saved = await state.storage.get("data");
+
+    assert.equal(saved.campaignState.active_turn.turn_id, turnId);
+    assert.equal(saved.campaignState.active_turn.counts.image, 3);
+    assert.equal(saved.pendingMessages.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("unsupported 131051 before concurrent images does not contaminate batch", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781471200000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    const unsupported = await coordinator.fetch(localMessageRequest(unsupportedMediaContainer("msg_album_hint")));
+    const unsupportedBody = await unsupported.json();
+    assert.equal(unsupportedBody.status, "ignored");
+
+    await Promise.all([
+      coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_album_a", ""))),
+      coordinator.fetch(localMessageRequest(imageMessage("img_b", "msg_album_b", ""))),
+      coordinator.fetch(localMessageRequest(imageMessage("img_c", "msg_album_c", "")))
+    ]);
+
+    let saved = await state.storage.get("data");
+    assert.equal(saved.pendingMessages.length, 3);
+    assert.equal(saved.pendingMessages.some((message) => message.type === "UNSUPPORTED"), false);
+    clock.tick(100);
+    await coordinator.processBuffer();
+    saved = await state.storage.get("data");
+    assert.equal(saved.campaignState.active_turn.counts.image, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("audio reply to a quoted image carries referenced media into UserTurn", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [], forceNoImage: true };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781471300000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_ref_img", "referencia")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    await coordinator.fetch(localMessageRequest(audioReplyMessage("aud_ref", "msg_ref_audio", "msg_ref_img")));
+    await coordinator.fetch(toolResultRequest({
+      type: "audio_transcribed",
+      messageId: "msg_ref_audio",
+      transcript: "Revisa esta imagen y dime lo importante."
+    }));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const saved = await state.storage.get("data");
+    assert.equal(saved.campaignState.active_turn.counts.audio, 1);
+    assert.equal(saved.campaignState.active_turn.counts.image, 1);
+    assert.equal(captures.sentTexts.join("\n").includes("No veo la imagen"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("concurrent audio messages share one pending turn and combine transcripts", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781471400000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await Promise.all([
+      coordinator.fetch(localMessageRequest(audioMessage("aud_a", "msg_conc_aud_a"))),
+      coordinator.fetch(localMessageRequest(audioMessage("aud_b", "msg_conc_aud_b")))
+    ]);
+
+    let saved = await state.storage.get("data");
+    assert.equal(saved.pendingMessages.length, 2);
+    assert.equal(new Set(saved.pendingMessages.map((message) => message.turnId)).size, 1);
+
+    await coordinator.fetch(toolResultRequest({ type: "audio_transcribed", messageId: "msg_conc_aud_a", transcript: "Primera pregunta." }));
+    await coordinator.fetch(toolResultRequest({ type: "audio_transcribed", messageId: "msg_conc_aud_b", transcript: "Segunda pregunta." }));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    saved = await state.storage.get("data");
+    assert.deepEqual(saved.campaignState.active_turn.audioTranscripts, ["Primera pregunta.", "Segunda pregunta."]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
 
 test("conversation.local/message batches three images only after turn max wait", async () => {
   const state = createMemoryState();
