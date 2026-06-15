@@ -45,6 +45,7 @@ import { sendWhatsAppInteractiveMessage } from "./whatsapp/sendInteractiveMessag
 import { buildRequestContext, buildSupervisorInput } from "./context/requestContextManager.js";
 import {
   buildWoztellConversationIdentity,
+  buildWoztellEventSummary,
   buildWoztellSendAttempts as buildAdapterWoztellSendAttempts,
   normalizeWoztellMessageEventMeta
 } from "./channels/woztellChannelAdapter.js";
@@ -93,7 +94,7 @@ const USER_MESSAGES = {
   imageGenerationAck: "Perfecto. Voy a generar la imagen y te la envío apenas esté lista.",
   imageRevisionAck: "Listo. Voy a preparar una nueva versión de la imagen con ese cambio.",
   imageProcessing: "La imagen queda en proceso. Te la envío por aquí apenas esté lista.",
-  genericClarification: "¿Quieres que lo explique, lo resuma o revise algún detalle puntual?",
+  genericClarification: "Entendido. ¿Qué necesitas que haga con esto?",
   imageFailed: "Tuve un problema al generar o enviar la imagen. ¿Quieres que lo intente nuevamente?",
   imageQueueFallback: "Tuve un problema generando la imagen. Puedes intentar de nuevo con una descripción más específica.",
   assetsCollected: "Ya recibí {count} imagenes. ¿Quieres que las analice, extraiga texto, las compare o las convierta en una lista?",
@@ -129,7 +130,7 @@ export default {
       return jsonResponse({ status: "error", message: "Invalid JSON" }, 400);
     }
 
-    console.log("WOZTELL_WEBHOOK_PAYLOAD:", JSON.stringify(body));
+    logEvent("WOZTELL_WEBHOOK_SUMMARY", buildWoztellEventSummary(body));
 
     if (body.eventType && body.eventType !== "INBOUND") {
       return jsonResponse({
@@ -6663,6 +6664,16 @@ function parseCustomerReplyModelOutput(outputText) {
   const raw = String(outputText || "").trim();
   if (!raw) return { text: "", shouldSend: false };
 
+  const parsedReply = parseCustomerReplyJson(raw);
+  if (parsedReply) return parsedReply;
+
+  if (!raw.startsWith("{") && !raw.startsWith("```")) {
+    return {
+      text: raw,
+      shouldSend: true
+    };
+  }
+
   try {
     const parsed = parseJsonFromText(raw);
     return {
@@ -6677,6 +6688,33 @@ function parseCustomerReplyModelOutput(outputText) {
       shouldSend: true
     };
   }
+}
+
+function parseCustomerReplyJson(text) {
+  const raw = String(text || "").trim();
+  const candidates = [raw];
+  const fenced = raw.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenced) candidates.unshift(fenced[1].trim());
+
+  for (const candidate of candidates) {
+    if (!candidate || !candidate.startsWith("{")) continue;
+
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && ("text" in parsed || "shouldSend" in parsed)) {
+        return {
+          text: String(parsed.text || "").trim(),
+          shouldSend: Object.prototype.hasOwnProperty.call(parsed, "shouldSend")
+            ? Boolean(parsed.shouldSend)
+            : true
+        };
+      }
+    } catch (_) {
+      // Keep the fallback path for non-JSON or malformed model text.
+    }
+  }
+
+  return null;
 }
 
 function looksUnsafeCustomerReply(text) {
@@ -6820,7 +6858,23 @@ function buildForcedDirectGeneralAnswer(userTurn, fallbackText) {
 }
 
 async function sendWoztellTextMessage(env, params) {
-  const cleanText = fixMojibake(params.text);
+  const parsedReply = parseCustomerReplyModelOutput(params.text);
+  const cleanText = fixMojibake(parsedReply.text || params.text);
+
+  if (parsedReply.text !== String(params.text || "").trim() || parsedReply.shouldSend === false) {
+    logEvent("USER_RESPONSE_JSON_UNWRAPPED", {
+      textLength: cleanText.length,
+      shouldSend: parsedReply.shouldSend
+    });
+  }
+
+  if (!parsedReply.shouldSend || !cleanText.trim()) {
+    logEvent("USER_RESPONSE_BLOCKED_EMPTY", {
+      channelId: params.channelId || "",
+      recipientId: params.recipientId || ""
+    });
+    return { ok: true, blocked: true };
+  }
 
   console.log("WOZTELL_TEXT_SEND_PREVIEW:", JSON.stringify({
     channelId: params.channelId || "",
@@ -10606,7 +10660,8 @@ export {
   handleUserClaimedMoreImages,
   buildVersionDiagnostic,
   formatVersionDiagnosticForWhatsApp,
-  consolidatedMessagesText
+  consolidatedMessagesText,
+  parseCustomerReplyModelOutput
 };
 
 

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { buildCustomerReplyPromptPayload, composeCustomerReply } from "../src/ai/customerReplyComposer.js";
 import { getCustomerReplyModel } from "../src/ai/modelRegistry.js";
+import { parseCustomerReplyModelOutput } from "../src/index.js";
 
 test("Customer Reply Composer humanizes without inventing", () => {
   const reply = composeCustomerReply({
@@ -20,6 +21,13 @@ test("Customer Reply Composer humanizes without inventing", () => {
   assert.equal(reply.shouldSend, true);
   assert.match(reply.text, /motor de induccion/);
   assert.doesNotMatch(reply.text, /Análisis visual|Analisis visual|que quieres hacer/i);
+});
+
+test("Customer reply model JSON output is parsed as visible text", () => {
+  const parsed = parseCustomerReplyModelOutput('{"text":"Claro, reviso las imagenes.","shouldSend":true}');
+
+  assert.equal(parsed.text, "Claro, reviso las imagenes.");
+  assert.equal(parsed.shouldSend, true);
 });
 
 test("Customer Reply Composer asks useful clarification only when image has no intent", () => {

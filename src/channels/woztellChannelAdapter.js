@@ -35,6 +35,27 @@ export function normalizeWoztellMessageEventMeta(payload) {
   });
 }
 
+export function buildWoztellEventSummary(payload) {
+  const clean = payload || {};
+  const data = clean.data || {};
+  const media = Array.isArray(clean.media || data.media) ? clean.media || data.media : [];
+  const fileId = String(clean.fileId || data.fileId || data.file_id || "");
+
+  return redactForLog({
+    eventType: clean.eventType || "",
+    type: clean.type || data.type || "",
+    messageId: clean.messageId || data.messageId || data.message_id || "",
+    channel: clean.channel || clean.channelId || "",
+    app: clean.app || clean.appId || "",
+    from: clean.from || "",
+    hasText: Boolean(clean.text || data.text || data.caption),
+    textLength: String(clean.text || data.text || data.caption || "").length,
+    hasFileId: Boolean(fileId),
+    fileIdPreview: fileId ? fileId.slice(0, 6) + "***" + fileId.slice(-4) : "",
+    mediaCount: media.length || (fileId ? 1 : 0)
+  });
+}
+
 export function buildWoztellSendAttempts(params) {
   const clean = params || {};
   const memberId = String(clean.memberId || "");
