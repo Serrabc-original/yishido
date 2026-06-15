@@ -225,9 +225,11 @@ export function createConversationSupervisorPlan(input) {
     activeTask = intent;
     targetModules = ["vision", "general_llm"];
     mediaScope = imageCount > 1 ? "all_pending_batch" : "current_only";
-    needsClarification = false;
-    responseStrategy = "analyze_then_answer";
-    clarificationQuestion = "";
+    needsClarification = intent === "unknown_image_request";
+    responseStrategy = intent === "unknown_image_request" ? "ask_clarification" : "analyze_then_answer";
+    clarificationQuestion = intent === "unknown_image_request"
+      ? "Recibi la imagen. Dime si quieres que la analice, lea texto visible, la compare con otra o la use para algo puntual."
+      : "";
     if (intent === "unknown_image_request") {
       logEvent("SUPERVISOR_UNKNOWN_IMAGE_ALLOWED", {
         imageCount: imageCount,

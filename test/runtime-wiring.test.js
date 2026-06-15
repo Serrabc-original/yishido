@@ -361,6 +361,34 @@ test("unsupported 131051 before concurrent images does not contaminate batch", a
   }
 });
 
+test("single image without user intent asks what to do without vision description", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781471250000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(imageMessage("img_lonely", "msg_lonely_img", "")));
+    assert.equal(captures.visionUrls.length, 0);
+    assert.equal(captures.sentTexts.length, 0);
+
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const saved = await state.storage.get("data");
+    const sent = captures.sentTexts.join("\n");
+    assert.equal(saved.campaignState.active_turn.counts.image, 1);
+    assert.equal(captures.visionUrls.length, 0);
+    assert.match(sent, /Recibi la imagen|analice|texto visible|compare|puntual/i);
+    assert.doesNotMatch(sent, /imagen A|objeto A|captura de/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
 test("audio reply to a quoted image carries referenced media into UserTurn", async () => {
   const state = createMemoryState();
   const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [], forceNoImage: true };

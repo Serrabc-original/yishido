@@ -88,7 +88,7 @@ const USER_MESSAGES = {
   requestFailed: "Tuve un problema procesando tu solicitud. Intenta nuevamente en unos minutos.",
   uploadedImageMissing: "No pude encontrar la imagen subida. ¿Puedes reenviarla o describirme brevemente qué aparece en la imagen?",
   imageAnalysisFailed: "No pude leer bien la imagen. ¿Me puedes describir el producto o reenviarla con una breve descripción?",
-  uploadedImageClarification: "Veo la imagen. ¿Quieres que la analice, extraiga texto o la compare con otra imagen?",
+  uploadedImageClarification: "Recibi la imagen. Dime si quieres que la analice, lea texto visible, la compare con otra o la use para algo puntual.",
   changesAck: "Perfecto, hago los ajustes y te envío una nueva versión.",
   imageGenerationAck: "Perfecto. Voy a generar la imagen y te la envío apenas esté lista.",
   imageRevisionAck: "Listo. Voy a preparar una nueva versión de la imagen con ese cambio.",

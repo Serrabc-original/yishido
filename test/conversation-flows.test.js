@@ -83,7 +83,7 @@ test("new technical question after price flow does not inherit stale media or ta
   assert.match(answer, /estator|rotor|campo/i);
 });
 
-test("single image without caption is analyzed and final response is image-specific", () => {
+test("single image without caption asks what to do instead of describing it", () => {
   const vision = {
     assets: [{
       analysis: {
@@ -97,15 +97,9 @@ test("single image without caption is analyzed and final response is image-speci
   const { plan } = planTurn([imageMessage("cat")], {
     campaign_assets: [{ asset_id: "asset_1", file_id: "cat", url: "https://cdn/cat.jpg", media_type: "IMAGE", turn_id: "turn_cat" }]
   }, [], { activeIntent: "general" }, "turn_cat");
-  const response = composeFinalResponse({
-    supervisorPlan: plan,
-    specialistResults: { vision },
-    currentMediaSummary: vision
-  });
-
-  assert.equal(plan.responseStrategy, "analyze_then_answer");
-  assert.match(response.text, /gatito|gato|caption|describir/i);
-  assert.doesNotMatch(response.text, /modelo exacto|garantia|precio/i);
+  assert.equal(plan.responseStrategy, "ask_clarification");
+  assert.equal(plan.needsClarification, true);
+  assert.match(plan.clarificationQuestion, /analice|texto visible|compare|puntual/i);
 });
 
 test("continuation phrase keeps the previous price comparison task", () => {

@@ -204,7 +204,7 @@ test("audio transcript list request routes to list without dragging images", () 
   assert.equal(turn.media_batch.assets.length, 0);
 });
 
-test("single image without text is analyzed before asking a useful question", () => {
+test("single image without text asks a useful question before analysis", () => {
   const messages = [imageMessage("img_lonely")];
   const campaignState = {
     campaign_assets: [
@@ -219,8 +219,9 @@ test("single image without text is analyzed before asking a useful question", ()
   });
 
   assert.equal(plan.intent, "unknown_image_request");
-  assert.equal(plan.responseStrategy, "analyze_then_answer");
-  assert.equal(plan.needsClarification, false);
+  assert.equal(plan.responseStrategy, "ask_clarification");
+  assert.equal(plan.needsClarification, true);
+  assert.match(plan.clarificationQuestion, /analice|texto visible|compare|puntual/i);
   assert.equal(plan.mediaScope, "current_only");
 });
 
