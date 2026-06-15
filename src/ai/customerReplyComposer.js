@@ -9,6 +9,78 @@ import { splitConversationalText } from "./finalResponseComposer.js";
 
 export const CUSTOMER_REPLY_MODEL = "CUSTOMER_REPLY_MODEL";
 
+export function buildCustomerReplyPromptPayload(input) {
+  const clean = input || {};
+  const userTurn = clean.userTurn || clean.user_turn || {};
+  const systemResult = clean.systemResult || clean.system_result || {};
+  const supervisorPlan = clean.supervisorPlan || clean.supervisor_plan || {};
+  const imageCount = Number(userTurn.image_count || userTurn.counts && userTurn.counts.image || 0);
+  const audioCount = Number(userTurn.audio_count || userTurn.counts && userTurn.counts.audio || 0);
+  const userText = String(userTurn.combinedUserText || userTurn.current_turn_text || "").trim();
+
+  return {
+    role: "customer_reply_composer",
+    purpose: "Redactar la respuesta final visible de un asistente conversacional de WhatsApp.",
+    output_contract: {
+      type: "json",
+      schema: {
+        text: "string",
+        shouldSend: "boolean"
+      }
+    },
+    non_negotiable_rules: [
+      "Responde en espanol natural, calido, claro y breve.",
+      "No expliques que eres un modulo ni menciones el orquestador, vision, OCR, prompts o herramientas internas.",
+      "Si el usuario hizo una pregunta o solicitud clara, responde directo. No mandes menus genericos.",
+      "Si hay imagenes y texto/audio claro, usa el texto/audio como intencion y las imagenes como evidencia.",
+      "Si solo hay imagenes sin instruccion, no describas de golpe: pregunta una aclaracion util con opciones concretas.",
+      "Si el sistema analizo imagenes, convierte el analisis en ayuda accionable, no en una descripcion seca.",
+      "No digas que no puedes generar imagenes si el intent o nextAction indica image_generation.",
+      "No inventes datos que no aparecen en systemResult o visibleFacts.",
+      "No digas 'No veo imagen' ni 'solo me llego una imagen' si imageCount o recentMediaCount es mayor que cero.",
+      "No uses frases como 'Quieres que lo explique, lo resuma o revise algun detalle puntual' cuando la intencion ya esta clara."
+    ],
+    style: {
+      tone: clean.tone || "warm_professional",
+      verbosity: clean.verbosity || "helpful_short",
+      locale: clean.locale || "es",
+      whatsapp: {
+        max_paragraphs: 3,
+        prefer_short_sentences: true,
+        ask_one_question_only_if_needed: true
+      }
+    },
+    routing_context: {
+      intent: String(clean.intent || systemResult.intent || supervisorPlan.intent || ""),
+      targetModules: supervisorPlan.targetModules || supervisorPlan.target_modules || [],
+      responseStrategy: supervisorPlan.responseStrategy || supervisorPlan.response_strategy || "",
+      nextAction: clean.nextAction || clean.next_action || ""
+    },
+    user_turn: {
+      turnId: String(userTurn.turn_id || userTurn.turnId || ""),
+      text: userText,
+      inputTypes: userTurn.input_types || userTurn.inputTypes || [],
+      counts: {
+        text: Number(userTurn.text_count || userTurn.counts && userTurn.counts.text || 0),
+        audio: audioCount,
+        image: imageCount,
+        video: Number(userTurn.video_count || userTurn.counts && userTurn.counts.video || 0),
+        file: Number(userTurn.file_count || userTurn.counts && userTurn.counts.file || 0)
+      },
+      captions: userTurn.captions || [],
+      audioTranscripts: userTurn.audio_transcripts || userTurn.audioTranscripts || []
+    },
+    media_context: {
+      currentImageCount: imageCount,
+      recentMediaCount: Number(clean.recentMediaCount || clean.recent_media_count || 0),
+      visibleFacts: clean.visibleFacts || clean.visible_facts || [],
+      moduleResult: systemResult
+    },
+    conversation_guidance: getConversationPromptGuidance(),
+    draft_response: String(systemResult.text || clean.text || "").trim()
+  };
+}
+
 export function composeCustomerReply(input, env) {
   const clean = input || {};
   const userTurn = clean.userTurn || clean.user_turn || {};
@@ -76,6 +148,7 @@ function humanizeReply(input) {
   const userText = String(userTurn.combinedUserText || userTurn.current_turn_text || "").trim();
   const scenario = input.scenario || inferConversationScenario(userText, input.intent || "");
   let text = String(input.text || "").trim();
+  const originalText = text;
   const hadGenericMenu = looksLikeGenericMenu(text);
 
   text = text
@@ -87,12 +160,16 @@ function humanizeReply(input) {
     .replace(/Que quieres que haga con est[oa]\?/gi, hasClearText ? "" : "Dime que quieres hacer con esto y te ayudo.")
     .trim();
 
-  if (hasClearText && (hadGenericMenu || looksLikeGenericMenu(text) || !text)) {
+  if (hasClearText && containsVisibleTextAnswer(originalText)) {
+    text = stripTrailingGenericPrompt(originalText).trim();
+  } else if (hasClearText && (hadGenericMenu || looksLikeGenericMenu(text) || !text)) {
     text = buildDirectTemplateFromUserText(userText, text, scenario);
   }
 
   if (!text && imageCount && !hasClearText) {
-    text = "Recibi la imagen. Dime si quieres que la analice, lea texto visible o la compare con otra.";
+    text = imageCount > 1
+      ? "Recibi las imagenes. Dime si quieres que las compare, lea texto visible o revise algun detalle puntual."
+      : "Recibi la imagen. Dime si quieres que la analice, lea texto visible o la compare con otra.";
   }
 
   if (!text) text = buildSafeTemplate(Object.assign({}, input, { scenario: scenario }));
@@ -114,6 +191,19 @@ function looksLikeGenericMenu(text) {
   return menuPatterns.some(function (pattern) {
     return clean.includes(normalizeSimpleText(pattern));
   });
+}
+
+function containsVisibleTextAnswer(text) {
+  const clean = normalizeSimpleText(text);
+  return /\b(texto visible|visible text|visible_text|texto detectado|ocr|se lee|dice|aparece en la imagen|en la captura)\b/.test(clean);
+}
+
+function stripTrailingGenericPrompt(text) {
+  return String(text || "")
+    .replace(/[Â¿¿?]?Quieres que (lo|la|te) (explique|resuma|revise|analice)[^.\n?]*[?.]?/gi, "")
+    .replace(/Dime si quieres que (lo|la|las|te)[^.\n?]*[?.]?/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function buildDirectTemplateFromUserText(userText, fallbackText, scenario) {
@@ -164,7 +254,9 @@ function buildSafeTemplate(input) {
   const scenario = input.scenario || inferConversationScenario(userText, intent);
 
   if (intent === "unknown_image_request" && imageCount) {
-    return "Recibi la imagen. Para ayudarte mejor, dime si quieres que la analice, lea texto visible o la compare con otra.";
+    return imageCount > 1
+      ? "Recibi las imagenes. Para ayudarte mejor, dime si quieres que las compare, lea texto visible o revise algun detalle puntual."
+      : "Recibi la imagen. Para ayudarte mejor, dime si quieres que la analice, lea texto visible o la compare con otra.";
   }
   if (audioCount && !String(userTurn.combinedUserText || userTurn.current_turn_text || "").trim()) {
     return "No pude entender bien el audio. Puedes reenviarlo o escribirme la idea principal?";

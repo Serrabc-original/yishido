@@ -339,7 +339,7 @@ function formatPetPhotoResponse(summary, message) {
     return "Está buenísima la foto: se ve " + subject + " relajado y gracioso por la postura. Si la quieres usar para Instagram, yo haría un caption tierno o divertido.";
   }
 
-  return "Veo " + subject + " en una escena tranquila. Si quieres, puedo ayudarte a describir la foto, hacer un caption tierno o pensar una edición con un estilo específico.";
+  return "Recibi la foto de " + subject + ". Puedo ayudarte a describirla, hacer un caption o pensar una edicion con un estilo especifico.";
 }
 
 function formatImageResponse(summary, message) {
@@ -347,10 +347,18 @@ function formatImageResponse(summary, message) {
   const visible = collectVisibleText(summary).join(" | ");
 
   if (subject) {
+    if (!hasClearQuestion(message)) {
+      return [
+        "Recibi la imagen" + (subject ? " de " + subject : "") + ".",
+        visible ? "Tambien detecte texto visible: " + visible + "." : "",
+        "Dime si quieres que la analice, extraiga el texto, la compare o la use para crear algo."
+      ].filter(Boolean).join("\n");
+    }
+
     return [
-      "Veo " + subject + ".",
+      "Con lo que se ve en la imagen, identifico " + subject + ".",
       visible ? "Texto visible: " + visible : "",
-      hasClearQuestion(message) ? "Con lo que se ve en la imagen, esa es la parte mas relevante para responderte." : "Quieres que la analice, extraiga texto o la compare con otra imagen?"
+      "Uso eso como evidencia para responder tu pregunta."
     ].filter(Boolean).join("\n");
   }
 
@@ -412,11 +420,11 @@ function formatPriceReview(summary) {
 function buildSpecificClarification(message, mediaSummary) {
   const subject = firstSubject(mediaSummary);
   if (subject) {
-    return "Veo " + subject + ". Quieres que la analice, extraiga texto o la compare con otra imagen?";
+    return "Recibi la imagen de " + subject + ". Dime si quieres que la analice, extraiga texto o la compare con otra imagen.";
   }
   return hasClearQuestion(message)
     ? "Quiero responderte bien, pero me falta un dato especifico. Te refieres al funcionamiento, al armado o a los materiales?"
-    : "Quieres que lo analice, extraiga texto o lo convierta en una lista?";
+    : "Dime si quieres que lo analice, extraiga texto o lo convierta en una lista.";
 }
 
 function isGenericFallback(text) {

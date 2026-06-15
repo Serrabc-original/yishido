@@ -194,3 +194,13 @@ test("/version, /reset-style clear, lists and reminders contracts still work", (
   const reminderPlan = createConversationSupervisorPlan({ currentTurn: reminderTurn, recentConversationWindow: [] });
   assert.equal(reminderPlan.intent, "reminder");
 });
+
+test("explicit image generation request routes to image_generation", () => {
+  const turn = buildUserTurn([
+    textMessage("Generame una imagen de un desayuno saludable con aguacate", "img_gen")
+  ], {}, { turnId: "turn_img_gen" });
+  const plan = createConversationSupervisorPlan({ currentTurn: turn, recentConversationWindow: [] });
+
+  assert.equal(plan.intent, "image_generation");
+  assert.equal(plan.targetModules.includes("image_generation"), true);
+});

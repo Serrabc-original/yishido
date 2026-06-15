@@ -62,7 +62,7 @@ import {
   splitConversationalText,
   validateSpecialistOutputAgainstIntent
 } from "./ai/finalResponseComposer.js";
-import { composeCustomerReply } from "./ai/customerReplyComposer.js";
+import { buildCustomerReplyPromptPayload, composeCustomerReply } from "./ai/customerReplyComposer.js";
 import { getConversationPromptGuidance } from "./ai/conversationStyleProfile.js";
 import {
   getCustomerReplyModel,
@@ -4272,6 +4272,7 @@ function buildNeutralOrchestratorPayload(env, params, context) {
       "Return valid JSON only. Do not answer the user directly.",
       "You are a neutral WhatsApp core orchestrator, not a marketing-only agent.",
       "First classify the user intent. Only use marketing actions when intent is marketing.",
+      "If the user explicitly asks to generate, create, design or edit an image, classify intent as image_generation and use generate_image or edit_image. This is allowed even when the request is not marketing.",
       "If intent is reminder or list and core utilities are enabled, return should_handle_in_core true and no marketing actions.",
       "For general list, reminder, support, order, CRM or question requests, do not ask whether the user wants text or image.",
       "For image_question or image_ocr, use vision analysis only; do not generate marketing copy unless the user explicitly asks for a post, ad, campaign, Instagram, copy, or content calendar.",
@@ -4281,10 +4282,11 @@ function buildNeutralOrchestratorPayload(env, params, context) {
     ].join(" "),
     customer_conversation_profile: getConversationPromptGuidance(),
     plan_schema: ORCHESTRATOR_PLAN_SCHEMA,
-    available_intents: ["general", "marketing", "reminder", "list", "image_question", "image_ocr", "crm", "orders", "support", "elderly", "unknown"],
+    available_intents: ["general", "marketing", "image_generation", "reminder", "list", "image_question", "image_ocr", "crm", "orders", "support", "elderly", "unknown"],
     available_actions: getAllowedOrchestratorActions(),
     action_policy: {
       marketing_actions_only_when_intent_is_marketing: true,
+      image_generation_actions_allowed_when_intent_is_image_generation: true,
       non_marketing_requests_should_not_generate_copy_or_images_by_default: true,
       pass_to_agent_when_core_module_is_disabled: true
     },
@@ -4415,18 +4417,20 @@ async function callClaudeOrchestratorPlan(env, params) {
     instruction: [
       "Return valid JSON only. Do not answer the user directly.",
       "You are a neutral WhatsApp core orchestrator, not a marketing-only agent.",
-      "First classify intent as general, marketing, reminder, list, image_question, image_ocr, crm, orders, support, elderly, or unknown.",
+      "First classify intent as general, marketing, image_generation, reminder, list, image_question, image_ocr, crm, orders, support, elderly, or unknown.",
       "Only use marketing actions when intent is marketing.",
+      "If the user explicitly asks to generate, create, design or edit an image, classify intent as image_generation and use generate_image or edit_image.",
       "Do not ask whether the user wants text or image for ordinary lists, reminders, support, orders, CRM, or general questions.",
       "Use the customer conversation profile: answer clear requests directly, ask one missing detail at a time, and never return a generic meta-menu for clear user intent.",
       "If intent is unclear, ask one brief clarification question."
     ].join(" "),
     customer_conversation_profile: getConversationPromptGuidance(),
     plan_schema: ORCHESTRATOR_PLAN_SCHEMA,
-    available_intents: ["general", "marketing", "reminder", "list", "image_question", "image_ocr", "crm", "orders", "support", "elderly", "unknown"],
+    available_intents: ["general", "marketing", "image_generation", "reminder", "list", "image_question", "image_ocr", "crm", "orders", "support", "elderly", "unknown"],
     available_actions: getAllowedOrchestratorActions(),
     action_policy: {
       marketing_actions_only_when_intent_is_marketing: true,
+      image_generation_actions_allowed_when_intent_is_image_generation: true,
       non_marketing_requests_should_not_generate_copy_or_images_by_default: true
     },
     orchestrator_input: compactInput,
@@ -4525,6 +4529,16 @@ const ORCHESTRATOR_PLAN_SCHEMA = {
     brief: "",
     platforms: ["instagram"],
     use_uploaded_image: false
+    },
+    {
+      type: "generate_image",
+      prompt: "",
+      source: "text_only"
+    },
+    {
+      type: "edit_image",
+      prompt: "",
+      source: "uploaded_image"
     },
     {
       type: "create_content_calendar",
@@ -4924,6 +4938,7 @@ function normalizePlan(plan) {
     ? plan.actions.filter(function (action) {
       if (!action || !allowedActions.includes(action.type)) return false;
       if ((intent === "image_question" || intent === "image_ocr") && action.type === "analyze_uploaded_image") return true;
+      if (intent === "image_generation" && ["generate_image", "edit_image", "analyze_uploaded_image"].includes(action.type)) return true;
       if (intent && intent !== "marketing" && action.type !== "ask_clarification") return false;
       return true;
     }).map(function (action) {
@@ -4962,13 +4977,13 @@ function normalizePlan(plan) {
 
 function normalizeOrchestratorIntent(intent) {
   const clean = String(intent || "").trim();
-  const allowed = ["general", "marketing", "reminder", "list", "image_question", "image_ocr", "crm", "orders", "support", "elderly", "unknown"];
+  const allowed = ["general", "marketing", "image_generation", "reminder", "list", "image_question", "image_ocr", "crm", "orders", "support", "elderly", "unknown"];
   return allowed.includes(clean) ? clean : "unknown";
 }
 
 function normalizeTargetModule(moduleName) {
   const clean = String(moduleName || "").trim();
-  const allowed = ["core", "marketing", "vision", "reminders", "lists", "crmLite", "orders", "support", "elderly"];
+  const allowed = ["core", "marketing", "image_generation", "vision", "reminders", "lists", "crmLite", "orders", "support", "elderly"];
   return allowed.includes(clean) ? clean : "core";
 }
 
@@ -6365,17 +6380,38 @@ async function sendConversationalResponse(env, params) {
   const enabled = String(env && env.CONVERSATIONAL_SPLIT_ENABLED || "true").toLowerCase() !== "false";
   const maxChars = getNumberEnv(env && env.CONVERSATIONAL_SPLIT_MAX_CHARS, 650);
   const delayMs = getNumberEnv(env && env.CONVERSATIONAL_SPLIT_DELAY_MS, 750);
-  let reply = composeCustomerReply({
+  const baseReplyInput = {
     userTurn: params && params.userTurn || {},
     intent: params && params.intent || params && params.supervisorPlan && params.supervisorPlan.intent || "",
+    supervisorPlan: params && params.supervisorPlan || {},
     systemResult: { text: params && params.text || "" },
     visibleFacts: params && params.visibleFacts || [],
     nextAction: params && params.nextAction || "",
+    recentMediaCount: countRecentMediaImages(params && params.recentMediaAssets || []),
     locale: "es",
     maxChars: maxChars,
     traceId: params && params.traceId || "",
     turnId: params && params.turnId || ""
+  };
+  let reply = composeCustomerReply({
+    userTurn: baseReplyInput.userTurn,
+    intent: baseReplyInput.intent,
+    supervisorPlan: baseReplyInput.supervisorPlan,
+    systemResult: baseReplyInput.systemResult,
+    visibleFacts: baseReplyInput.visibleFacts,
+    nextAction: baseReplyInput.nextAction,
+    recentMediaCount: baseReplyInput.recentMediaCount,
+    locale: baseReplyInput.locale,
+    maxChars: baseReplyInput.maxChars,
+    traceId: baseReplyInput.traceId,
+    turnId: baseReplyInput.turnId
   }, env || {});
+  const modelReplyText = await composeCustomerReplyWithOpenAI(env || {}, Object.assign({}, params || {}, baseReplyInput), reply.text);
+  if (modelReplyText) {
+    reply = composeCustomerReply(Object.assign({}, baseReplyInput, {
+      systemResult: { text: modelReplyText }
+    }), env || {});
+  }
   if (shouldBlockBadGenericReply(params && params.text || "", params && params.userTurn || {}) ||
     shouldBlockBadGenericReply(reply.text, params && params.userTurn || {})) {
     const forcedText = buildForcedDirectGeneralAnswer(params && params.userTurn || {}, params && params.text || "");
@@ -6506,6 +6542,145 @@ async function sendConversationalResponse(env, params) {
   return {
     partCount: parts.length
   };
+}
+
+async function composeCustomerReplyWithOpenAI(env, params, localDraftText) {
+  if (!shouldUseCustomerReplyAI(env, params)) return "";
+
+  const model = getCustomerReplyModel(env || {});
+  const traceId = params && params.traceId || params && params.userTurn && params.userTurn.trace_id || "";
+  const turnId = params && params.turnId || params && params.userTurn && params.userTurn.turn_id || "";
+  const doName = params && params.doName || "";
+  const promptPayload = buildCustomerReplyPromptPayload({
+    userTurn: params && params.userTurn || {},
+    intent: params && params.intent || params && params.supervisorPlan && params.supervisorPlan.intent || "",
+    supervisorPlan: params && params.supervisorPlan || {},
+    systemResult: { text: params && params.text || localDraftText || "" },
+    visibleFacts: params && params.visibleFacts || [],
+    nextAction: params && params.nextAction || "",
+    recentMediaCount: countRecentMediaImages(params && params.recentMediaAssets || []),
+    locale: "es"
+  });
+
+  promptPayload.local_fallback_draft = String(localDraftText || "").trim();
+
+  logEvent("CUSTOMER_REPLY_AI_START", {
+    traceId: traceId,
+    turnId: turnId,
+    doName: doName,
+    model: model,
+    intent: promptPayload.routing_context.intent,
+    imageCount: promptPayload.user_turn.counts.image,
+    audioCount: promptPayload.user_turn.counts.audio
+  });
+
+  try {
+    const res = await fetchWithTimeout("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + env.OPENAI_API_KEY,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: model,
+        input: [
+          {
+            role: "user",
+            content: JSON.stringify(promptPayload)
+          }
+        ],
+        text: {
+          verbosity: "low"
+        },
+        max_output_tokens: 700
+      })
+    }, 30000, "CUSTOMER_REPLY_AI_TIMEOUT");
+
+    const responseText = await res.text();
+
+    if (!res.ok) {
+      logEvent("CUSTOMER_REPLY_AI_FAILED", {
+        traceId: traceId,
+        turnId: turnId,
+        doName: doName,
+        model: model,
+        status: res.status,
+        errorSummary: summarizeTextForLog(responseText)
+      }, { level: "error", traceId: traceId });
+      return "";
+    }
+
+    const responseJson = parseMaybeJson(responseText);
+    const outputText = extractOpenAIResponseText(responseJson);
+    const parsed = parseCustomerReplyModelOutput(outputText);
+    const text = String(parsed.text || "").trim();
+
+    if (!parsed.shouldSend || !text || looksUnsafeCustomerReply(text)) {
+      logEvent("CUSTOMER_REPLY_AI_REJECTED", {
+        traceId: traceId,
+        turnId: turnId,
+        doName: doName,
+        model: model,
+        reason: !parsed.shouldSend ? "should_send_false" : !text ? "empty_text" : "unsafe_text"
+      }, { level: "error", traceId: traceId });
+      return "";
+    }
+
+    logEvent("CUSTOMER_REPLY_AI_OK", {
+      traceId: traceId,
+      turnId: turnId,
+      doName: doName,
+      model: model,
+      textLength: text.length
+    });
+
+    return text;
+  } catch (error) {
+    logEvent("CUSTOMER_REPLY_AI_FALLBACK", {
+      traceId: traceId,
+      turnId: turnId,
+      doName: doName,
+      model: model,
+      reason: summarizeErrorForLog(error)
+    }, { level: "error", traceId: traceId });
+    return "";
+  }
+}
+
+function shouldUseCustomerReplyAI(env, params) {
+  if (!env || !env.OPENAI_API_KEY) return false;
+  if (String(env.CUSTOMER_REPLY_AI_ENABLED || "false").toLowerCase() !== "true") return false;
+  if (String(getCustomerReplyModel(env || {})).toLowerCase() === "mock") return false;
+  const text = String(params && params.text || "").trim();
+  const turn = params && params.userTurn || {};
+  const imageCount = countUserTurnImages(turn);
+  const audioCount = Number(turn.audio_count || turn.counts && turn.counts.audio || 0);
+  const hasUserText = Boolean(cleanUserVisibleText(turn.combinedUserText || turn.current_turn_text || ""));
+  return Boolean(text || imageCount || audioCount || hasUserText);
+}
+
+function parseCustomerReplyModelOutput(outputText) {
+  const raw = String(outputText || "").trim();
+  if (!raw) return { text: "", shouldSend: false };
+
+  try {
+    const parsed = parseJsonFromText(raw);
+    return {
+      text: String(parsed && parsed.text || "").trim(),
+      shouldSend: parsed && Object.prototype.hasOwnProperty.call(parsed, "shouldSend")
+        ? Boolean(parsed.shouldSend)
+        : true
+    };
+  } catch (_) {
+    return {
+      text: raw,
+      shouldSend: true
+    };
+  }
+}
+
+function looksUnsafeCustomerReply(text) {
+  return /(OPENAI_API_KEY|ANTHROPIC_API_KEY|WOZTELL_ACCESS_TOKEN|WOZTELL_OPEN_API_TOKEN|GOOGLE_SHEETS_SECRET)=/i.test(String(text || ""));
 }
 
 function shouldBlockBadGenericReply(replyText, userTurn) {

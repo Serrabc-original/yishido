@@ -21,6 +21,7 @@ const INTENTS = new Set([
   "support",
   "order",
   "memory",
+  "image_generation",
   "unknown"
 ]);
 
@@ -93,6 +94,7 @@ export function createConversationSupervisorPlan(input) {
   const isReminder = isReminderIntent(normalized);
   const isList = isListIntent(normalized);
   const isMarketing = isMarketingIntent(normalized);
+  const isImageGeneration = isImageGenerationIntent(normalized);
   const isOcr = isOcrIntent(normalized);
   const isMemory = isMemoryIntent(normalized);
   const hasExplicitContinuationReference = isContinuationReference(currentText);
@@ -166,6 +168,12 @@ export function createConversationSupervisorPlan(input) {
     targetModules = ["memory", "general_llm"];
     responseStrategy = "answer_now";
     actions.push({ type: normalized.includes("como me llamo") || normalized.includes("cual es mi nombre") ? "answer_memory_name" : "update_memory" });
+  } else if (isImageGeneration) {
+    intent = "image_generation";
+    activeTask = "image_generation";
+    targetModules = hasCurrentImages ? ["vision", "image_generation", "general_llm"] : ["image_generation", "general_llm"];
+    mediaScope = hasCurrentImages ? "all_pending_batch" : "none";
+    responseStrategy = "execute_then_confirm";
   } else if (isMarketing) {
     intent = "marketing";
     activeTask = "marketing";
@@ -536,6 +544,12 @@ function isListIntent(text) {
 function isMarketingIntent(text) {
   if (/\b(no quiero|sin)\s+(post|posts|marketing|campana|campanas|contenido)\b/.test(text)) return false;
   return /\b(post|posts|copy|caption|instagram|facebook|tiktok|campana|campanas|anuncio|publicidad|calendario de contenido|contenido para redes)\b/.test(text);
+}
+
+function isImageGenerationIntent(text) {
+  if (/\b(no quiero|sin)\s+(imagen|diseno|dise[ñn]o|foto)\b/.test(text)) return false;
+  return /\b(genera|generame|gen[eé]rame|crea|crear|haz|hacer|disena|dise[ñn]a|editar|edita|modifica|cambia)\b.*\b(imagen|foto|dibujo|dise[ñn]o|banner|flyer|arte|creativo|post visual)\b/.test(text) ||
+    /\b(imagen|foto|dibujo|dise[ñn]o|banner|flyer|arte|creativo)\b.*\b(genera|generame|gen[eé]rame|crea|crear|haz|hacer|disena|dise[ñn]a|editar|edita|modifica|cambia)\b/.test(text);
 }
 
 function isMemoryIntent(text) {

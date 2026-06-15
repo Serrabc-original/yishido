@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { composeCustomerReply } from "../src/ai/customerReplyComposer.js";
+import { buildCustomerReplyPromptPayload, composeCustomerReply } from "../src/ai/customerReplyComposer.js";
 import { getCustomerReplyModel } from "../src/ai/modelRegistry.js";
 
 test("Customer Reply Composer humanizes without inventing", () => {
@@ -31,6 +31,61 @@ test("Customer Reply Composer asks useful clarification only when image has no i
 
   assert.match(reply.text, /Recibi la imagen/);
   assert.match(reply.text, /analice|lea texto|compare/);
+});
+
+test("Customer Reply Composer prompt exposes final WhatsApp response contract", () => {
+  const payload = buildCustomerReplyPromptPayload({
+    userTurn: {
+      turn_id: "turn_prompt",
+      combinedUserText: "Hazme una imagen de un desayuno saludable",
+      image_count: 0,
+      audio_count: 0
+    },
+    intent: "image_generation",
+    supervisorPlan: {
+      intent: "image_generation",
+      targetModules: ["image_generation", "general_llm"],
+      responseStrategy: "execute_then_confirm"
+    },
+    systemResult: {
+      text: "La imagen esta en proceso."
+    },
+    nextAction: "generate_image"
+  });
+
+  assert.equal(payload.role, "customer_reply_composer");
+  assert.equal(payload.output_contract.schema.text, "string");
+  assert.equal(payload.routing_context.intent, "image_generation");
+  assert.equal(payload.non_negotiable_rules.some((rule) => /No digas que no puedes generar imagenes/i.test(rule)), true);
+});
+
+test("Customer Reply Composer handles multiple image clarification as a batch", () => {
+  const reply = composeCustomerReply({
+    userTurn: { turn_id: "turn_imgs", image_count: 3, combinedUserText: "" },
+    intent: "unknown_image_request",
+    systemResult: { text: "" }
+  }, {});
+
+  assert.match(reply.text, /imagenes/i);
+  assert.match(reply.text, /compare|texto visible|detalle/i);
+});
+
+test("Customer Reply Composer preserves OCR text that looks like assistant stance", () => {
+  const reply = composeCustomerReply({
+    userTurn: {
+      turn_id: "turn_ocr",
+      combinedUserText: "Lee el texto visible de esta imagen",
+      image_count: 1
+    },
+    intent: "image_ocr",
+    systemResult: {
+      text: "Texto visible: No veo ninguna imagen adjunta en este turno. Puedes reenviarla?"
+    }
+  }, {});
+
+  assert.match(reply.text, /Texto visible/i);
+  assert.match(reply.text, /No veo ninguna imagen adjunta/i);
+  assert.doesNotMatch(reply.text, /Voy a tomar tu mensaje como la instruccion principal/i);
 });
 
 test("CUSTOMER_REPLY_MODEL prefers gpt-4.1-mini and falls back to configured mini", () => {
