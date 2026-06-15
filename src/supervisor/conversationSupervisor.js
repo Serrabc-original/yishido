@@ -97,6 +97,8 @@ export function createConversationSupervisorPlan(input) {
   const isImageGeneration = isImageGenerationIntent(normalized);
   const isOcr = isOcrIntent(normalized);
   const isMemory = isMemoryIntent(normalized);
+  const lastOfferedAction = String(activeContext.lastOfferedAction || activeContext.last_offered_action || "");
+  const isAffirmativeMediaFollowup = Boolean(lastOfferedAction && isAffirmativeFollowup(normalized));
   const hasExplicitContinuationReference = isContinuationReference(currentText);
   const hasAwaitingMediaTask = Boolean(activeTaskContext && activeTaskContext.status === "awaiting_media");
   const activeTaskType = activeTaskContext && activeTaskContext.type || "";
@@ -135,7 +137,22 @@ export function createConversationSupervisorPlan(input) {
   const actions = [];
   const memoryUpdates = detectMemoryUpdates(currentText);
 
-  if (hasClearGeneralQuestion) {
+  if (isAffirmativeMediaFollowup && (hasCurrentImages || hasPreviousRelevantMedia)) {
+    intent = normalizeOfferedMediaIntent(lastOfferedAction, imageCount);
+    activeTask = intent;
+    targetModules = ["vision", "general_llm"];
+    mediaScope = hasCurrentImages ? imageCount > 1 ? "all_pending_batch" : "current_only" : "previous_relevant";
+    shouldUsePreviousMedia = mediaScope === "previous_relevant";
+    responseStrategy = "analyze_then_answer";
+    needsClarification = false;
+    clarificationQuestion = "";
+    logEvent("SUPERVISOR_MEDIA_FOLLOWUP_CONFIRMED", {
+      lastOfferedAction: lastOfferedAction,
+      intent: intent,
+      imageCount: imageCount,
+      hasPreviousRelevantMedia: hasPreviousRelevantMedia
+    });
+  } else if (hasClearGeneralQuestion) {
     intent = "general";
     activeTask = "general";
     targetModules = ["general_llm"];
@@ -558,6 +575,21 @@ function isMemoryIntent(text) {
 
 function isContinuationReference(text) {
   return /\b(eso|esto|la segunda|la primera|la tercera|los precios|lo de antes|lo anterior|la lista anterior|y este|y esta|y este otro|y esta otra|cual conviene|cu[aá]l conviene)\b/i.test(String(text || ""));
+}
+
+function isAffirmativeFollowup(text) {
+  const clean = normalizeText(text);
+  if (!clean) return false;
+  return /^(si|sí|sii|si porfa|sí porfa|porfa|claro|dale|ok|okay|hazlo|de una|si dale|sí dale|si gracias|sí gracias)\.?$/.test(clean) ||
+    /\b(si|sí|claro|dale|ok|porfa|por favor)\b/.test(clean) && clean.length <= 40;
+}
+
+function normalizeOfferedMediaIntent(action, imageCount) {
+  const clean = String(action || "");
+  if (clean === "image_ocr") return "image_ocr";
+  if (clean === "multi_image_review") return "multi_image_review";
+  if (clean === "image_question") return Number(imageCount || 0) > 1 ? "multi_image_review" : "image_question";
+  return Number(imageCount || 0) > 1 ? "multi_image_review" : "image_question";
 }
 
 function detectMemoryUpdates(text) {

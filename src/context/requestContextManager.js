@@ -103,6 +103,9 @@ function normalizeActiveContext(context) {
     contextId: String(clean.contextId || clean.context_id || ""),
     lastUserGoal: String(clean.lastUserGoal || clean.last_user_goal || "").slice(0, 500),
     pendingClarification: String(clean.pendingClarification || clean.pending_clarification || "").slice(0, 500),
+    lastOfferedAction: String(clean.lastOfferedAction || clean.last_offered_action || ""),
+    lastOfferedIntent: String(clean.lastOfferedIntent || clean.last_offered_intent || ""),
+    lastOfferedAt: String(clean.lastOfferedAt || clean.last_offered_at || ""),
     referencedMedia: clean.referencedMedia || clean.referenced_media || null,
     updatedAt: String(clean.updatedAt || clean.updated_at || "")
   };

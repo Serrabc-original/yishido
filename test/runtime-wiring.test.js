@@ -498,6 +498,40 @@ test("unsupported 131051 plus split image turns still use recent media fallback"
   }
 });
 
+test("affirmative follow-up reuses recent image batch after visual offer", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781471650000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_follow_a", "")));
+    await coordinator.fetch(localMessageRequest(imageMessage("img_b", "msg_follow_b", "")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    let saved = await state.storage.get("data");
+    assert.equal(saved.campaignState.active_turn.counts.image, 2);
+    assert.equal(saved.activeContext.lastOfferedAction, "image_ocr");
+
+    captures.visionUrls.length = 0;
+    captures.sentTexts.length = 0;
+    await coordinator.fetch(localMessageRequest(textMessage("sí, porfa", "msg_follow_yes")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+    saved = await state.storage.get("data");
+
+    assert.equal(saved.campaignState.active_turn.counts.image, 2);
+    assert.deepEqual(captures.visionUrls.sort(), ["https://cdn.test/img_a.jpg", "https://cdn.test/img_b.jpg"]);
+    assert.doesNotMatch(captures.sentTexts.join("\n"), /que quieres|qué quieres/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
 test("audio that refers to recent image uses recent media fallback", async () => {
   const state = createMemoryState();
   const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };

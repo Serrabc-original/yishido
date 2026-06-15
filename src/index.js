@@ -986,7 +986,7 @@ export class ConversationCoordinator {
 
           console.log("UPLOADED_IMAGE_URL_RESOLVED:", JSON.stringify({
             fileId: mediaItem.fileId,
-            url: uploadedImageUrl
+            urlPreview: safeUrlPreview(uploadedImageUrl)
           }));
         } catch (error) {
           console.error("UPLOADED_IMAGE_URL_RESOLVE_ERROR:", JSON.stringify({
@@ -2547,7 +2547,10 @@ export class ConversationCoordinator {
       userTurn: userTurn,
       route: route,
       campaignState: data.campaignState,
-      pendingClarification: ""
+      pendingClarification: buildMediaFollowupPrompt(route.intent, analysisResult.summary),
+      lastOfferedAction: inferMediaFollowupAction(route.intent, analysisResult.summary, userTurn),
+      lastOfferedIntent: route.intent || "image_question",
+      lastOfferedAt: new Date().toISOString()
     });
     data.campaignState.history = appendHistory(data.campaignState.history, {
       role: "assistant",
@@ -3053,7 +3056,10 @@ export class ConversationCoordinator {
           userTurn: userTurn,
           route: { intent: plan.intent, module: "vision" },
           campaignState: data.campaignState,
-          pendingClarification: ""
+          pendingClarification: buildMediaFollowupPrompt(plan.intent, analysisResult.summary),
+          lastOfferedAction: inferMediaFollowupAction(plan.intent, analysisResult.summary, userTurn),
+          lastOfferedIntent: plan.intent,
+          lastOfferedAt: new Date().toISOString()
         });
         ackSent = true;
         return data;
@@ -3675,7 +3681,7 @@ async function convertAudioMessageToText(env, woztellPayload, parsedMessage) {
 
   console.log("AUDIO_URL_RESOLVED:", JSON.stringify({
     fileId: parsedMessage.fileId,
-    url: fileInfo.url || "",
+    urlPreview: safeUrlPreview(fileInfo.url || ""),
     fileType: fileInfo.fileType || "",
     size: fileInfo.size || 0
   }));
@@ -5106,7 +5112,7 @@ async function analyzeUploadedImageWithOpenAI(env, params) {
   }
 
   console.log("IMAGE_ANALYSIS_START:", JSON.stringify({
-    imageUrl: imageUrl,
+    imageUrlPreview: safeUrlPreview(imageUrl),
     captionPreview: String(params.caption || "").slice(0, 500)
   }));
 
@@ -5258,7 +5264,7 @@ async function callVisionModel(env, params) {
   const data = JSON.parse(visionResponse.responseText);
   const output = extractOpenAIResponseText(data);
 
-  console.log("VISION_RAW_OUTPUT:", String(output || "").slice(0, 3000));
+  console.log("VISION_RAW_OUTPUT:", JSON.stringify(summarizeVisionTextForLog(output)));
 
   if (!output) {
     throw new Error("VISION_ANALYSIS_EMPTY_OUTPUT: " + responseText);
@@ -5266,7 +5272,7 @@ async function callVisionModel(env, params) {
 
   const parsed = parseVisionAnalysisJson(output);
 
-  console.log("VISION_PARSED_JSON:", JSON.stringify(parsed));
+  console.log("VISION_PARSED_JSON:", JSON.stringify(summarizeVisionAnalysisForLog(parsed)));
 
   console.log("IMAGE_ANALYSIS_RESULT:", JSON.stringify({
     model: params.model,
@@ -5276,6 +5282,51 @@ async function callVisionModel(env, params) {
   }));
 
   return parsed;
+}
+
+function safeUrlPreview(value) {
+  const raw = String(value || "");
+  if (!raw) return "";
+
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol + "//" + parsed.hostname + "/... length=" + raw.length;
+  } catch (error) {
+    const head = raw.slice(0, 12);
+    return head + (raw.length > 12 ? "***" : "") + " length=" + raw.length;
+  }
+}
+
+function summarizeVisionTextForLog(text) {
+  const raw = String(text || "");
+
+  return {
+    textLength: raw.length,
+    startsWithJson: raw.trim().startsWith("{"),
+    preview: redactSensitiveLogText(raw.slice(0, 240))
+  };
+}
+
+function summarizeVisionAnalysisForLog(analysis) {
+  const clean = analysis && typeof analysis === "object" ? analysis : {};
+
+  return {
+    main_subject: redactSensitiveLogText(String(clean.main_subject || "").slice(0, 160)),
+    product_type: redactSensitiveLogText(String(clean.product_type || "").slice(0, 120)),
+    visible_text_length: String(clean.visible_text || "").length,
+    brand_or_labels_length: String(clean.brand_or_labels || "").length,
+    color_count: Array.isArray(clean.colors) ? clean.colors.length : 0,
+    object_count: Array.isArray(clean.objects_detected) ? clean.objects_detected.length : 0,
+    warning_count: Array.isArray(clean.warnings) ? clean.warnings.length : 0,
+    confidence: Number(clean.confidence || 0)
+  };
+}
+
+function redactSensitiveLogText(text) {
+  return String(text || "")
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[EMAIL]")
+    .replace(/\b\d{4,}\b/g, "[NUM]")
+    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, "[URL]");
 }
 
 function buildVisionRequestBody(params) {
@@ -5333,7 +5384,7 @@ async function sendVisionRequest(env, requestBody) {
     model: requestBody.model,
     hasJsonSchema: Boolean(requestBody.text && requestBody.text.format),
     verbosity: requestBody.text && requestBody.text.verbosity || "not_set",
-    imageUrlPreview: requestBody.input[0].content[1].image_url.slice(0, 300),
+    imageUrlPreview: safeUrlPreview(requestBody.input[0].content[1].image_url),
     maxOutputTokens: requestBody.max_output_tokens
   }));
 
@@ -5350,7 +5401,7 @@ async function sendVisionRequest(env, requestBody) {
           },
           {
             type: "input_image",
-            image_url: requestBody.input[0].content[1].image_url
+            image_url: safeUrlPreview(requestBody.input[0].content[1].image_url)
           }
         ]
       }
@@ -5738,7 +5789,7 @@ async function processAudioQueueJob(env, job) {
 
     console.log("AUDIO_URL_RESOLVED:", JSON.stringify({
       fileId: job.fileId,
-      url: fileInfo.url || "",
+      urlPreview: safeUrlPreview(fileInfo.url || ""),
       fileType: fileInfo.fileType || "",
       size: fileInfo.size || 0
     }));
@@ -7450,6 +7501,9 @@ function createEmptyConversationContext(reason) {
     contextId: "ctx_" + Date.now() + "_" + randomId(6),
     lastUserGoal: "",
     pendingClarification: "",
+    lastOfferedAction: "",
+    lastOfferedIntent: "",
+    lastOfferedAt: "",
     currentTurnMedia: emptyMediaContext(),
     previousRelevantMedia: emptyMediaContext(),
     staleMedia: emptyMediaContext(),
@@ -7470,6 +7524,9 @@ function normalizeConversationContext(context) {
     currentTurnMedia: normalizeMediaContext(clean.currentTurnMedia || clean.current_turn_media || {}),
     previousRelevantMedia: normalizeMediaContext(clean.previousRelevantMedia || clean.previous_relevant_media || {}),
     staleMedia: normalizeMediaContext(clean.staleMedia || clean.stale_media || {}),
+    lastOfferedAction: String(clean.lastOfferedAction || clean.last_offered_action || ""),
+    lastOfferedIntent: String(clean.lastOfferedIntent || clean.last_offered_intent || ""),
+    lastOfferedAt: String(clean.lastOfferedAt || clean.last_offered_at || ""),
     resetReason: String(clean.resetReason || clean.reset_reason || ""),
     updatedAt: String(clean.updatedAt || clean.updated_at || new Date().toISOString())
   };
@@ -7491,6 +7548,9 @@ function updateConversationContext(context, params) {
     currentTurnMedia: normalizeMediaContext(userTurn.currentTurnMedia || userTurn.current_turn_media || {}),
     previousRelevantMedia: normalizeMediaContext(userTurn.previousRelevantMedia || userTurn.previous_relevant_media || {}),
     staleMedia: normalizeMediaContext(userTurn.staleMedia || userTurn.stale_media || summarizeStaleMedia(campaignState, userTurn)),
+    lastOfferedAction: String(params && Object.prototype.hasOwnProperty.call(params, "lastOfferedAction") ? params.lastOfferedAction : current.lastOfferedAction || ""),
+    lastOfferedIntent: String(params && Object.prototype.hasOwnProperty.call(params, "lastOfferedIntent") ? params.lastOfferedIntent : current.lastOfferedIntent || ""),
+    lastOfferedAt: String(params && Object.prototype.hasOwnProperty.call(params, "lastOfferedAt") ? params.lastOfferedAt : current.lastOfferedAt || ""),
     resetReason: "",
     updatedAt: new Date().toISOString()
   };
@@ -7569,6 +7629,7 @@ function buildContextSnapshot(data) {
     contextId: context.contextId,
     lastUserGoal: context.lastUserGoal,
     pendingClarification: context.pendingClarification,
+    lastOfferedAction: context.lastOfferedAction,
     activeList: data && data.coreUtilityState && data.coreUtilityState.activeList || "",
     pendingReminders: countPendingReminders(data && data.coreUtilityState && data.coreUtilityState.reminders || []),
     currentTurnMedia: context.currentTurnMedia.asset_count,
@@ -7776,6 +7837,23 @@ function shouldUseRecentMediaAssetsForTurn(userTurn, messages) {
     isUserClaimingMoreImages(text);
 }
 
+function shouldUseRecentMediaAssetsForFollowup(userTurn, data, messages) {
+  const context = normalizeConversationContext(data && data.activeContext || {});
+  const text = normalizeTextForIntent([
+    userTurn && (userTurn.combinedUserText || userTurn.current_turn_text) || "",
+    consolidatedMessagesText(messages || [])
+  ].filter(Boolean).join("\n"));
+
+  return Boolean(context.lastOfferedAction && isAffirmativeMediaFollowupText(text));
+}
+
+function isAffirmativeMediaFollowupText(text) {
+  const normalized = normalizeTextForIntent(text);
+  if (!normalized) return false;
+  return /^(si|sí|sii|si porfa|sí porfa|porfa|claro|dale|ok|okay|hazlo|de una|si dale|sí dale|si gracias|sí gracias)\.?$/.test(normalized) ||
+    /\b(si|sí|claro|dale|ok|porfa|por favor)\b/.test(normalized) && normalized.length <= 40;
+}
+
 function collectRelevantMediaForTurn(userTurn, data, messages, options) {
   const turn = userTurn || {};
   const cleanData = normalizeCoordinatorData(data || {});
@@ -7808,6 +7886,7 @@ function collectRelevantMediaForTurn(userTurn, data, messages, options) {
   }
 
   const wantsRecent = shouldUseRecentMediaAssetsForTurn(turn, messages) ||
+    shouldUseRecentMediaAssetsForFollowup(turn, cleanData, messages) ||
     countUserTurnImages(turn) > 0 && getRecentMediaAssets(cleanData, now, maxAgeMs).length > countUserTurnImages(turn);
   if (wantsRecent) {
     const recent = getRecentMediaAssets(cleanData, now, maxAgeMs)
@@ -8113,6 +8192,24 @@ function formatVisionUtilityResponse(intent, summary, userTurn) {
     data.failed_asset_count ? "Nota: " + data.failed_asset_count + " imagen(es) no se pudieron analizar." : "",
     userTurn && userTurn.context_policy === "use_previous_context" ? "Usé la media anterior que mencionaste." : ""
   ].filter(Boolean).join("\n");
+}
+
+function buildMediaFollowupPrompt(intent, summary) {
+  const action = inferMediaFollowupAction(intent, summary, {});
+  if (action === "image_ocr") return "awaiting_media_followup:image_ocr";
+  if (action === "multi_image_review") return "awaiting_media_followup:multi_image_review";
+  return "awaiting_media_followup:image_question";
+}
+
+function inferMediaFollowupAction(intent, summary, userTurn) {
+  if (intent === "image_ocr") return "image_ocr";
+  const assets = Array.isArray(summary && summary.assets) ? summary.assets : [];
+  const hasVisibleText = assets.some(function (asset) {
+    return Boolean(asset && asset.analysis && String(asset.analysis.visible_text || "").trim());
+  });
+  if (hasVisibleText) return "image_ocr";
+  if (Number(userTurn && userTurn.image_count || assets.length || 0) > 1) return "multi_image_review";
+  return "image_question";
 }
 
 function formatListForWhatsApp(list) {
