@@ -8,21 +8,23 @@ Modules are optional building blocks for a universal WhatsApp AI Agent Core. The
 - `src/conversationMemory.js`: compact conversation summary, optional style profile, optional customer memory, utility memory.
 - `src/coreUtilityRouter.js`: lightweight intent router for reminders, lists, general, marketing, support, orders, CRM and future elderly flows.
 - `src/whatsapp/sendInteractiveMessage.js`: WhatsApp/Woztell interactive message builder and sender with text fallback.
+- `src/agent/`: active task/agent runtime for tasks, lightweight CRM actions and handoff policy.
+- `src/agents/`: specialist agent registry for intent-specific behavior.
 - `scripts/export-bug-report.js`: redacted bug report bundle by `traceId`.
 
 ## Modulo Opcional
 
-- `src/modules/reminders/`: parser and mock/local reminder storage. Variable: `ENABLE_REMINDERS=false`.
+- `src/modules/reminders/`: parser, reminder storage and delivery-path selection for `mock`, `alarm` and template-gated delivery. Variable: `ENABLE_REMINDERS=false`.
 - `src/modules/lists/`: notes/lists parser and mock/local list storage. Variable: `ENABLE_LISTS=false`.
 - `src/modules/templates/`: WhatsApp templates stub. Variable: `ENABLE_TEMPLATE_MODULE=false`.
 - `src/modules/customerMemory/`: customer memory read model. Variable: `ENABLE_CUSTOMER_MEMORY=false`.
-- `src/modules/crmLite/`: CRM-lite proposal.
+- `src/modules/crmLite/`: lightweight CRM module scaffold used by the active task/agent runtime; full CRM remains future work.
 - `src/modules/orders/`: orders intake proposal.
 - `src/modules/support/`: support ticketing proposal.
 
 ## Backlog
 
-- Production reminder scheduler with Durable Object alarms, Cron Triggers, Queues or another reliable scheduler.
+- Cron Triggers, Queues or another reminder scheduler beyond the current Durable Object Alarm path.
 - WhatsApp template catalog with approval states.
 - CRM-lite with contact tags, pipeline and handoff.
 - Orders agent with catalog, pricing and availability.

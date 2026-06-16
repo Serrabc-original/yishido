@@ -387,7 +387,7 @@ function extractReminderTitle(text) {
     .replace(/\b(ma[nñ]ana|el viernes|el lunes|el martes|el miercoles|el miércoles|el jueves|el sabado|el sábado|el domingo)\b/gi, "")
     .replace(/\b(a las|a la)\s+\d{1,2}(:\d{2})?\s*(am|pm)?\b/gi, "")
     .replace(/\b\d+\s*(d[ií]a|dias|días|hora|horas|minuto|minutos)\s+antes\b/gi, "")
-    .replace(/\b(?:para\s+)?(?:en|dentro de)\s+\d+\s*(min|minuto|minutos|m|hora|horas|h|d[iÃ­]a|dias|dÃ­as|d)\b/gi, "")
+    .replace(/\b(?:para\s+)?(?:en|dentro de)\s+\d+\s*(min|minuto|minutos|m|hora|horas|h|d[i\u00ed]a|dias|d\u00edas|d)\b/gi, "")
     .replace(/\b(vi\s+que\s+)?(tengo|tenia|debo|necesito)\s+que\s+/gi, "")
     .replace(/\bpara\s+(?=(llamar|comprar|pagar|hacer|enviar|revisar|mandar|escribir|actualizar)\b)/gi, "")
     .replace(/\s+/g, " ")

@@ -57,21 +57,27 @@ Use these exact values for the admin/reporting backend when it runs at `https://
 | OAuth scopes, Gmail + user OAuth Sheets | `https://www.googleapis.com/auth/gmail.send` and `https://www.googleapis.com/auth/spreadsheets` |
 | OAuth scopes, Gmail + Service Account Sheets | `https://www.googleapis.com/auth/gmail.send` only |
 | APIs to enable | Gmail API, Google Sheets API, Google Drive API, Apps Script API, Generative Language API |
-| Backend health route | `GET https://admin.yishido.com/health` |
-| OAuth start route | `GET https://admin.yishido.com/auth/google/start` |
-| OAuth callback route | `GET https://admin.yishido.com/auth/google/callback` |
-| Generate report route | `POST https://admin.yishido.com/reports/generate` |
-| Send report route | `POST https://admin.yishido.com/reports/send` |
-| Sync metrics route | `POST https://admin.yishido.com/metrics/sync` |
+| Admin Dashboard health route | `GET https://admin.yishido.com/health` |
+| Worker OAuth start route | `GET https://admin.yishido.com/auth/google/start` |
+| Worker OAuth callback route | `GET https://admin.yishido.com/auth/google/callback` |
+| Admin Dashboard generate report route | `POST https://admin.yishido.com/reports/generate` |
+| Admin Dashboard send report route | `POST https://admin.yishido.com/reports/send` |
+| Admin Dashboard sync metrics route | `POST https://admin.yishido.com/metrics/sync` |
 
 The OAuth consent screen must use `yishido.com` as the authorized domain. The OAuth client must be a Web application client. The redirect URI configured in Google Cloud must exactly match `GOOGLE_REDIRECT_URI`. Use `https://admin.yishido.com/auth/google/callback` in production and `http://localhost:8787/auth/google/callback` in local development.
 
-Required Worker routes:
+Current Worker routes implemented in this repo:
+
+```text
+GET /version
+GET /auth/google/start
+GET /auth/google/callback
+```
+
+Admin Dashboard, Billing & Reports routes to implement outside the current Worker core:
 
 ```text
 GET /health
-GET /auth/google/start
-GET /auth/google/callback
 POST /reports/generate
 POST /reports/send
 POST /metrics/sync
@@ -185,13 +191,13 @@ Production callback responses do not include token values. They only report `has
 - `/clear-media`: clears previous images/files without deleting lists or reminders.
 - `/lists`: shows saved lists for the conversation.
 - `/reminders`: shows pending reminders.
-- `/clear-reminders`: clears mock/local reminders for the conversation.
+- `/clear-reminders`: clears reminders for the conversation.
 - `/debug-interactive`: sends a safe interactive-message test with text fallback.
 - `/reset`: clears conversation context, previous media, campaign state, and pending clarification.
 
-## Local Feature Modes
+## Feature Modes
 
-Local development enables the assistant core by default:
+The checked-in Worker configuration enables the assistant core by default:
 
 - `DEBUG_LOGS=true`
 - `ENABLE_LISTS=true`
@@ -202,12 +208,12 @@ Local development enables the assistant core by default:
 - `ENABLE_USER_STYLE_PROFILE=true`
 - `ENABLE_CUSTOMER_MEMORY=true`
 - `CORE_UTILITIES_SANDBOX=true`
-- `REMINDERS_DELIVERY_MODE=mock`
+- `REMINDERS_DELIVERY_MODE=alarm`
 - `INTERACTIVE_DELIVERY_MODE=safe`
 - `MEMORY_RETENTION_MODE=summarized`
 - `LOG_CAPTURE_MODE=console_and_file`
 
-Run `/version` in WhatsApp to see which capabilities are active and which are mock/sandbox.
+Run `/version` in WhatsApp to see which capabilities are active, which delivery mode is selected, and which pieces are sandboxed. Use `REMINDERS_DELIVERY_MODE=mock` only for local or sandbox runs where real reminder delivery must be blocked.
 
 ## Reminder Templates
 

@@ -4,11 +4,11 @@ The default orchestrator is OpenAI.
 
 ```text
 ORCHESTRATOR_PROVIDER=openai
-ORCHESTRATOR_MODEL=gpt-5.4-mini
-ORCHESTRATOR_FALLBACK_PROVIDER=claude
+ORCHESTRATOR_MODEL=gpt-5.4
+ORCHESTRATOR_FALLBACK_PROVIDER=
 ```
 
-Claude remains available as an optional fallback. Do not delete the Claude provider or its configuration.
+Claude remains available as an optional fallback provider, but the current default keeps fallback disabled unless `ORCHESTRATOR_FALLBACK_PROVIDER=claude` is set intentionally. Do not delete the Claude provider or its configuration.
 
 ## Switching Providers
 
@@ -16,7 +16,15 @@ Use OpenAI:
 
 ```text
 ORCHESTRATOR_PROVIDER=openai
-ORCHESTRATOR_MODEL=gpt-5.4-mini
+ORCHESTRATOR_MODEL=gpt-5.4
+ORCHESTRATOR_FALLBACK_PROVIDER=
+```
+
+Use OpenAI with Claude fallback intentionally enabled:
+
+```text
+ORCHESTRATOR_PROVIDER=openai
+ORCHESTRATOR_MODEL=gpt-5.4
 ORCHESTRATOR_FALLBACK_PROVIDER=claude
 ```
 

@@ -15,7 +15,7 @@ import {
   normalizeIncomingMessage
 } from "../src/index.js";
 import { addListItems, createList } from "../src/modules/lists/index.js";
-import { buildConversationSummary, buildCustomerMemory, updateConversationMemory } from "../src/conversationMemory.js";
+import { buildConversationSummary, buildCustomerMemory, buildUtilityMemory, updateConversationMemory } from "../src/conversationMemory.js";
 import { selectReminderDeliveryPath } from "../src/modules/reminders/index.js";
 
 const basePayload = {
@@ -443,6 +443,50 @@ test("conversation memory stores only the last 20 turns", () => {
 
   const summary = buildConversationSummary(data.conversationLog);
   assert.equal(summary.recent_turn_ids.length, 20);
+});
+
+test("conversation memory keeps compact text audio and image refs in the latest 20 turns", () => {
+  let data = { conversationLog: [] };
+
+  for (let index = 0; index < 22; index++) {
+    data = updateConversationMemory(data, {
+      turn_id: "turn_" + index,
+      created_at: "2026-06-15T05:" + String(index).padStart(2, "0") + ":00.000Z",
+      input_types: index % 2 ? ["AUDIO", "IMAGE"] : ["TEXT"],
+      current_turn_text: index % 2 ? "[Audio transcrito]: anota pan y leche" : "mensaje " + index,
+      text_count: index % 2 ? 0 : 1,
+      audio_count: index % 2 ? 1 : 0,
+      image_count: index % 2 ? 1 : 0,
+      audio_transcripts: index % 2 ? ["anota pan y leche"] : [],
+      media_batch: index % 2 ? { fileIds: ["img_" + index], assetCount: 1, failedAssetCount: 0 } : { fileIds: [], assetCount: 0, failedAssetCount: 0 }
+    }, {
+      flags: {
+        saveConversationLogs: true,
+        enableUserStyleProfile: false,
+        enableCustomerMemory: true
+      }
+    });
+  }
+
+  assert.equal(data.conversationLog.length, 20);
+  assert.equal(data.conversationLog[0].turnId, "turn_2");
+  assert.equal(data.conversationLog.some((entry) => entry.audioTranscripts.includes("anota pan y leche")), true);
+  assert.equal(data.conversationLog.some((entry) => entry.media.fileIds.includes("img_21")), true);
+  assert.match(data.customerMemory.last_audio_summary, /pan y leche/i);
+});
+
+test("utility memory exposes recent non-empty lists for reference resolution", () => {
+  let listState = createList({}, "super");
+  listState = addListItems(listState, "super", ["huevos", "pan", "leche"]);
+  const memory = buildUtilityMemory({
+    lists: listState.lists,
+    activeList: "super"
+  });
+
+  assert.equal(memory.active_list, "super");
+  assert.equal(memory.recent_lists.length, 1);
+  assert.equal(memory.recent_lists[0].item_count, 3);
+  assert.deepEqual(memory.recent_lists[0].items, ["huevos", "pan", "leche"]);
 });
 
 test("conversation memory promotes client data from audio into compact facts", () => {

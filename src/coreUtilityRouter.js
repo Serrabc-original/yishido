@@ -74,6 +74,7 @@ function isReminderContinuation(text) {
   if (/\b(?:para\s+)?(?:en|dentro de)\s+(?:\d+|un|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|quince|veinte|treinta)\s*(min|minuto|minutos|m|hora|horas|h)\b/.test(text)) return true;
   if (/^\s*(si|sí|ok|listo|dale)\s*$/i.test(text)) return true;
   if (/\b(lo que te dije|lo que dije|lo del audio|en el audio|del audio)\b/.test(text)) return true;
+  if (/\b(la lista|esa lista|lista que me anotaste|lista que anotaste|lista que te dije|la lista.*(anotaste|anote|anotes|dije|diciendo))\b/.test(text)) return true;
   if (/\b(solo|solamente)?\s*(me\s+)?(haces? acuerdo|recuerdame|avisame)\b/.test(text)) return true;
   if (/\bpara\s+.{3,120}/.test(text)) return true;
   return false;

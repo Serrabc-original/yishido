@@ -2187,6 +2187,7 @@ export class ConversationCoordinator {
       const utilityRoute = routeCoreUtilityIntent(userTurn, {
         flags: coreFlags,
         timezone: this.env.USER_TIMEZONE || "America/Bogota",
+        now: getReminderReferenceNow(data, userTurn),
         pendingReminderDraft: data.coreUtilityState && data.coreUtilityState.pendingReminderDraft
       });
       if (isMarketingRoute(utilityRoute, userTurn)) {
@@ -2690,7 +2691,7 @@ export class ConversationCoordinator {
     if (route.intent === "reminder") {
       const parsed = mergeReminderDraft(
         data.coreUtilityState.pendingReminderDraft,
-        resolveReminderReferences(route.parsed || {}, data.activeContext, data.customerMemory),
+        resolveReminderReferences(route.parsed || {}, data.activeContext, data.customerMemory, data.coreUtilityState, userTurn),
         userTurn
       );
 
@@ -8131,6 +8132,20 @@ function buildReminderForConversation(parsed, data, env, userTurn) {
   });
 }
 
+function getReminderReferenceNow(data, userTurn) {
+  const candidates = [
+    data && data.lastMessageAt,
+    data && data.firstMessageAt,
+    userTurn && (userTurn.timestamp || userTurn.created_at || userTurn.createdAt)
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const value = typeof candidate === "number" ? candidate : Date.parse(candidate);
+    if (Number.isFinite(value) && value > 0) return new Date(value).toISOString();
+  }
+  return new Date(Date.now()).toISOString();
+}
+
 function applySupervisorMemoryUpdates(memory, updates) {
   const next = Object.assign({}, memory || {});
   for (const update of Array.isArray(updates) ? updates : []) {
@@ -8175,7 +8190,7 @@ function shouldUseRecentMediaAssetsForTurn(userTurn, messages) {
     consolidatedMessagesText(messages || [])
   ].filter(Boolean).join("\n"));
   if (!text) return false;
-  return /\b(listo|ya|eso es todo|esas son|dale|revisa|te mande \d+ imagenes|te mandé \d+ imágenes|te mande imagenes|te mandé imágenes|como no puedes ver|esta imagen|esa imagen|la imagen|esta parte|esta foto|esa foto|esto)\b/.test(text) ||
+  return /\b(listo|ya|eso es todo|esas son|dale|revisa|te mande \d+ imagenes|te mandé \d+ imágenes|te mande imagenes|te mandé imágenes|como no puedes ver|esta imagen|esa imagen|la imagen|imagen que te mande|imagen que te mandé|usa la imagen|usa esa imagen|usa esta imagen|esta parte|esta foto|esa foto|foto que te mande|foto que te mandé|usa la foto|usa esa foto|sobre esta foto|sobre esa foto|esto)\b/.test(text) ||
     isUserClaimingMoreImages(text);
 }
 
@@ -8499,16 +8514,25 @@ async function sendWoztellTemplateMessage(env, params) {
   });
 }
 
-function resolveReminderReferences(parsed, activeContext, customerMemory) {
+function resolveReminderReferences(parsed, activeContext, customerMemory, coreUtilityState, userTurn) {
   const clean = Object.assign({}, parsed || {});
   const context = normalizeConversationContext(activeContext || {});
   const memoryReference = getLatestAudioReminderReference(customerMemory);
+  const listReference = getLatestListReminderReference(coreUtilityState, userTurn);
   const title = cleanReminderTitle(clean.title || "", clean.context || "");
-  const referencesLatestAudio = /\b(lo que te dije|lo que dije|lo del audio|en el audio|del audio)\b/i.test([title, clean.context || ""].join(" "));
+  const referenceText = [title, clean.context || "", userTurn && userTurn.current_turn_text || ""].join(" ");
+  const referencesLatestAudio = /\b(lo que te dije|lo que dije|lo del audio|en el audio|del audio)\b/i.test(referenceText);
+  const referencesLatestList = /\b(la lista|esa lista|lista que me anotaste|lista que anotaste|lista que te dije|lo que te dije.*lista|la lista.*(anotaste|anote|anotes|dije|diciendo))\b/i.test(referenceText);
 
   if (referencesLatestAudio && memoryReference) {
     clean.title = memoryReference;
     clean.context = [clean.context || "", "Referencia de audio resuelta: " + memoryReference].filter(Boolean).join("\n");
+    clean.missingFields = Array.isArray(clean.missingFields)
+      ? clean.missingFields.filter(function (field) { return field !== "title"; })
+      : clean.missingFields;
+  } else if (referencesLatestList && listReference) {
+    clean.title = listReference;
+    clean.context = [clean.context || "", "Referencia de lista resuelta: " + listReference].filter(Boolean).join("\n");
     clean.missingFields = Array.isArray(clean.missingFields)
       ? clean.missingFields.filter(function (field) { return field !== "title"; })
       : clean.missingFields;
@@ -8535,6 +8559,38 @@ function getLatestAudioReminderReference(customerMemory) {
   const clean = cleanReminderTitle(String(memory.last_audio_summary || memory.lastAudioSummary || ""), "");
   if (!clean || isGenericReminderTitle(clean)) return "";
   return clean.slice(0, 180);
+}
+
+function getLatestListReminderReference(coreUtilityState, userTurn) {
+  const state = normalizeCoreUtilityState(coreUtilityState || {});
+  const text = normalizeTextForIntent(userTurn && userTurn.current_turn_text || "");
+  const activeName = state.activeList || "";
+  const activeList = activeName ? listItems(state.listsState, activeName) : null;
+  const candidates = [];
+
+  if (activeList && Array.isArray(activeList.items) && activeList.items.length) candidates.push(activeList);
+  for (const list of Object.values(state.lists || {})) {
+    if (list && Array.isArray(list.items) && list.items.length) candidates.push(list);
+  }
+
+  const unique = candidates.filter(function (list, index, all) {
+    const name = normalizeSimpleName(list && list.name || "");
+    return name && all.findIndex(function (candidate) {
+      return normalizeSimpleName(candidate && candidate.name || "") === name;
+    }) === index;
+  });
+  if (!unique.length) return "";
+
+  const named = unique.find(function (list) {
+    const name = normalizeTextForIntent(list.name || "");
+    return name && text.includes(name);
+  });
+  const selected = named || unique[0];
+  const items = (selected.items || []).map(function (item) {
+    return String(item && item.text || "").trim();
+  }).filter(Boolean).slice(0, 20);
+  if (!items.length) return "";
+  return ("lista " + (selected.name || "pendientes") + ": " + items.join(", ")).slice(0, 180);
 }
 
 function formatListGoal(list) {
@@ -8735,9 +8791,22 @@ function resolveActiveListName(parsed, coreUtilityState) {
   const requested = String(route.listName || "").trim();
 
   if (requested && requested !== "pendientes") return requested;
+  const active = state.activeList ? listItems(state.listsState, state.activeList) : null;
+  if (active && Array.isArray(active.items) && active.items.length) return state.activeList;
+  const nonEmpty = Object.values(state.lists || {}).find(function (list) {
+    return list && Array.isArray(list.items) && list.items.length;
+  });
+  if (isGenericListReference(route) && nonEmpty && nonEmpty.name) return nonEmpty.name;
   if (state.activeList) return state.activeList;
   if (requested) return requested;
   return "pendientes";
+}
+
+function isGenericListReference(parsed) {
+  const route = parsed || {};
+  const text = normalizeTextForIntent([route.listName || "", route.context || "", route.rawText || ""].join(" "));
+  if (String(route.listName || "").trim() === "pendientes") return true;
+  return /\b(lista|anotaste|anote|anotes|te dije|diciendo)\b/.test(text);
 }
 
 function cancelReminderByText(reminders, text) {
@@ -8875,7 +8944,7 @@ function mergeReminderDueAt(previous, current) {
 function isGenericReminderTitle(title) {
   const clean = normalizeTextForIntent(title);
   if (!clean) return true;
-  return /^(si|ok|listo|dale|para manana|manana|a las \d{1,2}|solo me haces acuerdo.*|me haces acuerdo.*|recuerdame.*|avisame.*)$/.test(clean);
+  return /^(si|ok|listo|dale|para en|para|en|para manana|manana|a las \d{1,2}|dentro de .*|en \d+.*|solo me haces acuerdo.*|me haces acuerdo.*|recuerdame.*|avisame.*)$/.test(clean);
 }
 
 function formatReminderCreatedForWhatsApp(reminder, env) {

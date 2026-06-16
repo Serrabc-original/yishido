@@ -3,6 +3,7 @@ const PER_MILLION = 1000000;
 const TEXT_MODEL_PRICING = {
   "gpt-5.4": { input: 2.50, cachedInput: 0.25, output: 15.00 },
   "gpt-5.4-mini": { input: 0.75, cachedInput: 0.075, output: 4.50 },
+  "gpt-5.4-nano": { input: 0.20, cachedInput: 0.02, output: 1.25 },
   "gpt-5.5": { input: 5.00, cachedInput: 0.50, output: 30.00 }
 };
 

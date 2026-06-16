@@ -191,7 +191,7 @@ export function createConversationSupervisorPlan(input) {
     targetModules = ["memory", "general_llm"];
     responseStrategy = "answer_now";
     actions.push({ type: normalized.includes("como me llamo") || normalized.includes("cual es mi nombre") ? "answer_memory_name" : "update_memory" });
-  } else if (isImageGeneration && !isMarketing) {
+  } else if ((isImageGeneration || isImageGenerationContinuation(normalized, previousTask, hasPreviousRelevantMedia, activeTaskContext)) && !isMarketing) {
     intent = "image_generation";
     activeTask = "image_generation";
     targetModules = hasCurrentImages || hasPreviousRelevantMedia ? ["vision", "image_generation", "general_llm"] : ["image_generation", "general_llm"];
@@ -507,11 +507,20 @@ function findPreviousTask(window, activeContext) {
     if (isPriceReviewIntent(text)) return { intent: "price_review", source: "recent_history" };
     if (isReminderIntent(text)) return { intent: "reminder", source: "recent_history" };
     if (isListIntent(text)) return { intent: "list", source: "recent_history" };
+    if (isImageGenerationIntent(text)) return { intent: "image_generation", source: "recent_history" };
     if (isMarketingIntent(text)) return { intent: "marketing", source: "recent_history" };
     if (entry.type === "image" && active && active !== "general") return { intent: active, source: "active_context" };
   }
 
   return { intent: active && active !== "unknown" ? active : "general", source: active ? "active_context" : "" };
+}
+
+function isImageGenerationContinuation(text, previousTask, hasPreviousRelevantMedia, activeTask) {
+  const previousIntent = String(previousTask && previousTask.intent || "");
+  const activeType = String(activeTask && activeTask.type || "");
+  if (previousIntent !== "image_generation" && activeType !== "image_generation") return false;
+  if (!hasPreviousRelevantMedia) return false;
+  return /\b(mismo texto|texto que|ponlo|ponlo en|pusiste|poniste|usa la foto|usa la imagen|esa foto|esta foto|la foto|esa imagen|esta imagen|la imagen|hazlo|disenalo|armalo|preparalo)\b/.test(text);
 }
 
 function normalizeActiveTaskForSupervisor(task) {

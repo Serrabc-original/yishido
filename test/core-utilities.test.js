@@ -104,6 +104,15 @@ test("reminder parser handles relative audio wording with dentro de and min", ()
   assert.match(short.dueAt, /^2026-06-15T23:47:48/);
 });
 
+test("reminder parser removes accented relative day wording from title", () => {
+  const now = "2026-06-15T23:42:48.000Z";
+  const parsed = parseReminderRequest("Avisame dentro de 1 d\u00eda la reunion con Juan", "America/Bogota", { now });
+
+  assert.equal(parsed.missingFields.length, 0);
+  assert.equal(parsed.title, "la reunion con Juan");
+  assert.match(parsed.dueAt, /^2026-06-16T23:42:48/);
+});
+
 test("reminder parser handles spoken corrections and afternoon time", () => {
   const now = "2026-06-15T23:55:47.000Z";
   const corrected = parseReminderRequest("Ay, perdon, me puedes poner otro recordatorio en dos minutos? No, que digo? En cinco minutos mejor? Para yo poder enviar un mensaje a un lead, por favor. Entonces, necesito ese recordatorio.", "America/Bogota", { now });

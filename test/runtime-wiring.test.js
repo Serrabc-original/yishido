@@ -1095,6 +1095,131 @@ test("reminder follow-up uses compact latest audio summary as title", async () =
   }
 });
 
+test("reminder time follow-up keeps previous pending title instead of generic relative wording", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(Date.parse("2026-06-16T05:22:00.000Z"));
+  globalThis.fetch = mockRuntimeFetch(captures);
+  await state.storage.put("data", {
+    doName: "channel_runtime:593995660220",
+    channel: "channel_runtime",
+    phone: "593995660220",
+    member: "member_runtime",
+    app: "app_runtime",
+    coreUtilityState: {
+      reminders: [],
+      pendingReminderDraft: {
+        action: "create",
+        title: "llamar a un cliente para hacerle seguimiento",
+        dueAt: "",
+        timezone: "America/Bogota",
+        context: "Recordatorio: llamar a un cliente para hacerle seguimiento",
+        reminderOffsets: [],
+        recurrence: null,
+        confidence: 0.65,
+        missingFields: ["date", "time"],
+        hasDate: false,
+        hasTime: false
+      },
+      usageReports: {}
+    }
+  });
+  const coordinator = new ConversationCoordinator(state, Object.assign(env(), {
+    ENABLE_REMINDERS: "true",
+    USER_TIMEZONE: "America/Bogota"
+  }));
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Para en dentro de 5min", "msg_time_followup")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const saved = await state.storage.get("data");
+    assert.equal(saved.coreUtilityState.reminders.length, 1);
+    assert.equal(saved.coreUtilityState.reminders[0].title, "llamar a un cliente para hacerle seguimiento");
+    assert.match(saved.coreUtilityState.reminders[0].dueAt, /^2026-06-16T05:27:00/);
+    assert.doesNotMatch(captures.sentTexts.join("\n"), /Asunto: Para en/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("reminder title follow-up can resolve the active shopping list", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(Date.parse("2026-06-16T05:12:00.000Z"));
+  globalThis.fetch = mockRuntimeFetch(captures);
+  await state.storage.put("data", {
+    doName: "channel_runtime:593995660220",
+    channel: "channel_runtime",
+    phone: "593995660220",
+    member: "member_runtime",
+    app: "app_runtime",
+    coreUtilityState: {
+      reminders: [],
+      listsState: {
+        lists: {
+          compras: {
+            name: "compras",
+            items: [
+              { id: "item_1", text: "huevos", done: false },
+              { id: "item_2", text: "pan", done: false },
+              { id: "item_3", text: "leche", done: false }
+            ]
+          }
+        }
+      },
+      lists: {
+        compras: {
+          name: "compras",
+          items: [
+            { id: "item_1", text: "huevos", done: false },
+            { id: "item_2", text: "pan", done: false },
+            { id: "item_3", text: "leche", done: false }
+          ]
+        }
+      },
+      activeList: "compras",
+      pendingReminderDraft: {
+        action: "create",
+        title: "",
+        dueAt: "2026-06-16T05:17:00.000Z",
+        timezone: "America/Bogota",
+        context: "en 5 minutos",
+        reminderOffsets: [],
+        recurrence: null,
+        confidence: 0.65,
+        missingFields: ["title"],
+        hasDate: true,
+        hasTime: true
+      },
+      usageReports: {}
+    }
+  });
+  const coordinator = new ConversationCoordinator(state, Object.assign(env(), {
+    ENABLE_REMINDERS: "true",
+    ENABLE_LISTS: "true",
+    USER_TIMEZONE: "America/Bogota"
+  }));
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Si, pero el asunto es la lista que me anotaste", "msg_list_ref_title")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const saved = await state.storage.get("data");
+    assert.equal(saved.coreUtilityState.reminders.length, 1);
+    assert.match(saved.coreUtilityState.reminders[0].title, /lista compras: huevos, pan, leche/i);
+    assert.doesNotMatch(captures.sentTexts.join("\n"), /lista .*est[aá] vac[ií]a/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
 test("runtime commands /version and /reset keep short-circuit behavior", async () => {
   const state = createMemoryState();
   const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };

@@ -23,12 +23,13 @@ test("OpenAI usage cost estimates text model interactions from response usage", 
   assert.equal(cost.estimatedUsd, 0.005275);
 });
 
-test("unknown usage pricing is explicit instead of invented", () => {
+test("OpenAI usage cost estimates nano model interactions", () => {
   const cost = estimateOpenAIUsageCost({
     model: "gpt-5.4-nano",
     usage: { inputTokens: 1000, outputTokens: 100 }
   });
 
-  assert.equal(cost.estimatedUsd, null);
-  assert.equal(cost.reason, "unknown_pricing");
+  assert.equal(cost.estimatedUsd, 0.000325);
+  assert.equal(cost.pricing.inputUsdPerMillion, 0.20);
+  assert.equal(cost.pricing.outputUsdPerMillion, 1.25);
 });

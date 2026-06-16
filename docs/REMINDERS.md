@@ -1,6 +1,6 @@
 # Reminders
 
-`src/modules/reminders/` is an active core utility for WhatsApp reminders. In local development the default delivery mode is mock, so reminders are saved and shown but are not delivered by a real scheduler.
+`src/modules/reminders/` is an active core utility for WhatsApp reminders. The current Worker configuration uses Durable Object Alarms with `REMINDERS_DELIVERY_MODE=alarm`. Local or sandbox runs can still use `mock` when real delivery must be blocked.
 
 ## Supported Parsing
 
@@ -31,16 +31,16 @@ If date, time, or title is missing, the core asks only for the missing field. Re
 
 ```text
 ENABLE_REMINDERS=true
-REMINDERS_DELIVERY_MODE=mock
+REMINDERS_DELIVERY_MODE=alarm
 CORE_UTILITIES_SANDBOX=true
 ```
 
 Supported modes:
 
-- `mock`: local/safe default. Stores reminders, no automatic delivery.
+- `alarm`: current Worker default. Uses Durable Object Alarms for scheduled delivery.
+- `mock`: local/safe mode. Stores reminders, no automatic delivery.
 - `disabled`: reminder requests can be routed away from the core.
-- `alarm`: reserved for Durable Object Alarms.
-- `cron`: reserved for scheduled delivery.
+- `cron`: reserved for scheduled delivery if a separate scheduler is added.
 
 ## Logs
 

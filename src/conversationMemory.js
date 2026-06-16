@@ -323,6 +323,7 @@ export function buildUtilityMemory(utilityState) {
   const tasks = Array.isArray(clean.tasks) ? clean.tasks : [];
   const leads = Array.isArray(clean.leads) ? clean.leads : [];
   const clients = Array.isArray(clean.clients) ? clean.clients : [];
+  const recentLists = buildRecentListMemory(lists);
 
   return {
     reminder_count: reminders.filter(function (item) {
@@ -335,8 +336,34 @@ export function buildUtilityMemory(utilityState) {
     list_names: Object.values(lists).map(function (list) {
       return list.name || "";
     }).filter(Boolean).slice(0, 20),
+    active_list: String(clean.activeList || clean.active_list || ""),
+    recent_lists: recentLists,
     updated_at: new Date().toISOString()
   };
+}
+
+function buildRecentListMemory(lists) {
+  return Object.values(lists || {}).map(function (list) {
+    const items = Array.isArray(list && list.items) ? list.items : [];
+    const itemTexts = items.map(function (item) {
+      return sanitizeMemoryText(item && item.text || "").trim();
+    }).filter(Boolean);
+    const latestItemAt = items.reduce(function (latest, item) {
+      const at = Date.parse(item && (item.updatedAt || item.createdAt) || "") || 0;
+      return Math.max(latest, at);
+    }, 0);
+
+    return {
+      name: sanitizeMemoryText(list && list.name || "").slice(0, 80),
+      item_count: itemTexts.length,
+      items: itemTexts.slice(0, 20),
+      latest_item_at: latestItemAt ? new Date(latestItemAt).toISOString() : ""
+    };
+  }).filter(function (list) {
+    return list.name && list.item_count > 0;
+  }).sort(function (a, b) {
+    return Date.parse(b.latest_item_at || "") - Date.parse(a.latest_item_at || "");
+  }).slice(0, 5);
 }
 
 export function sanitizeMemoryText(text) {

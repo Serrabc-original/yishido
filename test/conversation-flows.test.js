@@ -125,6 +125,28 @@ test("continuation phrase keeps the previous price comparison task", () => {
   assert.equal(plan.mediaScope, "current_only");
 });
 
+test("image generation continuation reuses previous media when user references the photo", () => {
+  const { turn, plan } = planTurn([
+    textMessage("El mismo texto que me diste y que pusiste en la foto", "same_text")
+  ], {}, [
+    { turnId: "turn_design", type: "image", summary: "puedes disenar ese texto sobre esta foto", mediaRefs: { fileIds: ["img_mom"], assetCount: 1 } }
+  ], { activeIntent: "image_generation" }, "turn_same_text");
+  turn.previous_relevant_media = { asset_count: 1, image_count: 1, file_ids: ["img_mom"] };
+  turn.previousRelevantMedia = turn.previous_relevant_media;
+  const fixedPlan = createConversationSupervisorPlan({
+    currentTurn: turn,
+    recentConversationWindow: [
+      { turnId: "turn_design", type: "image", summary: "puedes disenar ese texto sobre esta foto", mediaRefs: { fileIds: ["img_mom"], assetCount: 1 } }
+    ],
+    activeContext: { activeIntent: "image_generation" }
+  });
+
+  assert.equal(plan.intent, "general");
+  assert.equal(fixedPlan.intent, "image_generation");
+  assert.equal(fixedPlan.mediaScope, "previous_relevant");
+  assert.equal(fixedPlan.shouldUsePreviousMedia, true);
+});
+
 test("multi image final answer compares all visible prices", () => {
   const text = generateFinalUserResponse({
     intent: "multi_image_price_review",

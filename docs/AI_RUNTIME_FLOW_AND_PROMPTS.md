@@ -23,7 +23,7 @@ Woztell webhook
 | --- | --- | --- |
 | Orchestrator | `ORCHESTRATOR_MODEL` | `gpt-5.4` |
 | Supervisor config | `SUPERVISOR_MODEL` | `gpt-5.4` |
-| Vision | `VISION_MODEL` | `gpt-5.4-mini` |
+| Vision | `VISION_MODEL` | `gpt-5.4-nano` with `gpt-5.4-mini` fallback |
 | Final customer reply | `CUSTOMER_REPLY_MODEL` | `gpt-5.4-mini` |
 | Image generation | `OPENAI_IMAGE_MODEL` | `gpt-image-2` |
 | Audio transcription | `AUDIO_TRANSCRIPTION_MODEL` | `whisper-1` |

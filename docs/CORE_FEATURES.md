@@ -17,13 +17,13 @@ Este proyecto debe funcionar como un core universal de agentes inteligentes por 
 - Logging estructurado con `traceId`.
 - Memoria compacta y segura, resumida y sin historial crudo completo.
 - Router ligero de utilidades core.
-- Recordatorios y listas como utilidades core activas en modo seguro local.
+- Recordatorios y listas como utilidades core activas; recordatorios usan `alarm` en la configuracion actual y pueden usar `mock` en local/sandbox.
 - Mensajes interactivos WhatsApp/Woztell activos en modo seguro con fallback a texto.
 - Bug report bundle por `traceId`.
 
 ## Configuracion
 
-Defaults locales:
+Configuracion versionada:
 
 - `DEBUG_LOGS=true`
 - `SAVE_CONVERSATION_LOGS=true`
@@ -34,12 +34,12 @@ Defaults locales:
 - `ENABLE_WHATSAPP_INTERACTIVE=true`
 - `ENABLE_TEMPLATE_MODULE=true`
 - `CORE_UTILITIES_SANDBOX=true`
-- `REMINDERS_DELIVERY_MODE=mock`
+- `REMINDERS_DELIVERY_MODE=alarm`
 - `INTERACTIVE_DELIVERY_MODE=safe`
 - `MEMORY_RETENTION_MODE=summarized`
 - `LOG_CAPTURE_MODE=console_and_file`
 
-`/version` muestra estos flags, el modo mock/sandbox y que los recordatorios no tienen entrega real mientras `REMINDERS_DELIVERY_MODE=mock`.
+`/version` muestra estos flags, el modo de entrega de recordatorios y el estado de plantillas cuando `REMINDERS_DELIVERY_MODE=alarm`.
 
 ## Compatibilidad
 

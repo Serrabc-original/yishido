@@ -238,7 +238,7 @@ function containsVisibleTextAnswer(text) {
 
 function stripTrailingGenericPrompt(text) {
   return String(text || "")
-    .replace(/[Â¿¿?]?Quieres que (lo|la|te) (explique|resuma|revise|analice)[^.\n?]*[?.]?/gi, "")
+    .replace(/[\u00bf?]?Quieres que (lo|la|te) (explique|resuma|revise|analice)[^.\n?]*[?.]?/gi, "")
     .replace(/Dime si quieres que (lo|la|las|te)[^.\n?]*[?.]?/gi, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
