@@ -199,6 +199,7 @@ test("fast ack sends for multiple images and skips simple text", () => {
 
   assert.equal(imageAck, true);
   assert.equal(buildFastAckText({ intent: "multi_image_price_review" }, { image_count: 3 }), "Perfecto, estoy revisando los precios.");
+  assert.equal(buildFastAckText({ intent: "multi_image_review" }, { image_count: 3 }), "Dame un momento, voy a revisar las imagenes.");
   assert.equal(textAck, false);
 });
 

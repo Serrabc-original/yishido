@@ -15,7 +15,7 @@ import {
   normalizeIncomingMessage
 } from "../src/index.js";
 import { addListItems, createList } from "../src/modules/lists/index.js";
-import { buildCustomerMemory } from "../src/conversationMemory.js";
+import { buildConversationSummary, buildCustomerMemory, updateConversationMemory } from "../src/conversationMemory.js";
 import { selectReminderDeliveryPath } from "../src/modules/reminders/index.js";
 
 const basePayload = {
@@ -61,13 +61,57 @@ test("supervisor continues price review and selects all pending images", () => {
   const plan = createConversationSupervisorPlan({
     currentTurn: turn,
     recentConversationWindow,
-    activeContext: { activeIntent: "price_review" }
+    activeContext: { activeIntent: "price_review" },
+    activeTask: { type: "price_review", status: "awaiting_media", expectedInputs: "images" }
   });
 
   assert.equal(plan.intent, "multi_image_price_review");
   assert.equal(plan.isContinuation, true);
   assert.equal(plan.mediaScope, "all_pending_batch");
   assert.equal(turn.media_batch.assets.length, 3);
+});
+
+test("images without text do not inherit stale price review without active task", () => {
+  const messages = [imageMessage("img_new_1"), imageMessage("img_new_2")];
+  const campaignState = {
+    campaign_assets: [
+      { asset_id: "asset_1", asset_index: 1, file_id: "img_new_1", url: "https://cdn/1.jpg", media_type: "IMAGE", turn_id: "turn_new" },
+      { asset_id: "asset_2", asset_index: 2, file_id: "img_new_2", url: "https://cdn/2.jpg", media_type: "IMAGE", turn_id: "turn_new" }
+    ]
+  };
+  const turn = buildUserTurn(messages, campaignState, { turnId: "turn_new" });
+  const plan = createConversationSupervisorPlan({
+    currentTurn: turn,
+    recentConversationWindow: [{
+      turnId: "turn_old",
+      type: "text",
+      timestamp: "2026-06-13T11:00:00.000Z",
+      summary: "Puedes revisar estos precios?",
+      mediaRefs: { fileIds: [], assetCount: 0 }
+    }],
+    activeContext: { activeIntent: "price_review" }
+  });
+
+  assert.equal(plan.intent, "multi_image_review");
+  assert.equal(plan.activeTask, "multi_image_review");
+  assert.equal(plan.mediaScope, "all_pending_batch");
+  assert.equal(plan.isContinuation, false);
+});
+
+test("design request with previous media is routed to image generation context", () => {
+  const turn = buildUserTurn([textMessage("Con esta informacion me haces un diseno?", "design_text")], {}, { turnId: "turn_design" });
+  turn.previous_relevant_media = { asset_count: 2, image_count: 2, file_ids: ["img_old_1", "img_old_2"] };
+  turn.previousRelevantMedia = turn.previous_relevant_media;
+  const plan = createConversationSupervisorPlan({
+    currentTurn: turn,
+    recentConversationWindow: [],
+    activeContext: { activeIntent: "image_question" }
+  });
+
+  assert.equal(plan.intent, "image_generation");
+  assert.equal(plan.mediaScope, "previous_relevant");
+  assert.equal(plan.shouldUsePreviousMedia, true);
+  assert.equal(plan.responseStrategy, "execute_then_confirm");
 });
 
 test("final response compares all price images and does not ask what to do", () => {
@@ -372,6 +416,78 @@ test("recent conversation window normalizes the last 20 turns", () => {
   assert.equal(window.length, 20);
   assert.equal(window[0].turnId, "turn_5");
   assert.equal(window[19].type, "text");
+});
+
+test("conversation memory stores only the last 20 turns", () => {
+  let data = { conversationLog: [] };
+
+  for (let index = 0; index < 25; index++) {
+    data = updateConversationMemory(data, {
+      turn_id: "turn_" + index,
+      created_at: "2026-06-13T12:00:00.000Z",
+      input_types: ["TEXT"],
+      current_turn_text: "mensaje " + index,
+      media_batch: { fileIds: [], assetCount: 0, failedAssetCount: 0 }
+    }, {
+      flags: {
+        saveConversationLogs: true,
+        enableUserStyleProfile: false,
+        enableCustomerMemory: false
+      }
+    });
+  }
+
+  assert.equal(data.conversationLog.length, 20);
+  assert.equal(data.conversationLog[0].turnId, "turn_5");
+  assert.equal(data.conversationLog[19].turnId, "turn_24");
+
+  const summary = buildConversationSummary(data.conversationLog);
+  assert.equal(summary.recent_turn_ids.length, 20);
+});
+
+test("conversation memory promotes client data from audio into compact facts", () => {
+  const data = updateConversationMemory({}, {
+    turn_id: "turn_audio_client",
+    created_at: "2026-06-15T05:40:00.000Z",
+    input_types: ["AUDIO"],
+    current_turn_text: "[Audio transcrito]: Los datos de Mateo Serrano son 27 anos, correo mate.serra@gmail.com, plan de 50 dolares y maneja Google Maps, Instagram, Facebook y WhatsApp.",
+    audio_count: 1,
+    audio_transcripts: ["Los datos de Mateo Serrano son 27 anos, correo mate.serra@gmail.com, plan de 50 dolares y maneja Google Maps, Instagram, Facebook y WhatsApp."],
+    media_batch: { fileIds: [], assetCount: 0, failedAssetCount: 0 }
+  }, {
+    flags: {
+      saveConversationLogs: true,
+      enableUserStyleProfile: false,
+      enableCustomerMemory: true
+    }
+  });
+
+  const facts = data.customerMemory.important_facts;
+  assert.equal(facts.some((fact) => fact.label === "email" && fact.value === "mate.serra@gmail.com"), true);
+  assert.equal(facts.some((fact) => fact.label === "edad" && fact.value === "27"), true);
+  assert.equal(facts.some((fact) => fact.label === "canales_o_plataformas" && fact.value.includes("instagram")), true);
+  assert.equal(data.customerMemory.compact_data_memory.length > 0, true);
+});
+
+test("conversation memory keeps compact latest audio task for follow-ups", () => {
+  const data = updateConversationMemory({}, {
+    turn_id: "turn_audio_reminder",
+    created_at: "2026-06-15T23:55:00.000Z",
+    input_types: ["AUDIO"],
+    current_turn_text: "[Audio transcrito]: Para yo poder enviar un mensaje a un lead en cinco minutos.",
+    audio_count: 1,
+    audio_transcripts: ["Para yo poder enviar un mensaje a un lead en cinco minutos."],
+    media_batch: { fileIds: [], assetCount: 0, failedAssetCount: 0 }
+  }, {
+    flags: {
+      saveConversationLogs: true,
+      enableUserStyleProfile: false,
+      enableCustomerMemory: true
+    }
+  });
+
+  assert.match(data.customerMemory.last_audio_summary, /enviar un mensaje a un lead/i);
+  assert.equal(data.customerMemory.last_audio_summary.length <= 240, true);
 });
 
 test("buildMediaBatch still treats campaign_assets as media source of truth", () => {

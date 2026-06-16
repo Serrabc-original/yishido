@@ -38,7 +38,8 @@ export function buildCustomerReplyPromptPayload(input) {
       "No digas que no puedes generar imagenes si el intent o nextAction indica image_generation.",
       "No inventes datos que no aparecen en systemResult o visibleFacts.",
       "No digas 'No veo imagen' ni 'solo me llego una imagen' si imageCount o recentMediaCount es mayor que cero.",
-      "No uses frases como 'Quieres que lo explique, lo resuma o revise algun detalle puntual' cuando la intencion ya esta clara."
+      "No uses frases como 'Quieres que lo explique, lo resuma o revise algun detalle puntual' cuando la intencion ya esta clara.",
+      "Puedes usar 1 o 2 emojis discretos cuando ayuden a sonar cercano, pero no conviertas la respuesta en marketing."
     ],
     style: {
       tone: clean.tone || "warm_professional",
@@ -147,6 +148,7 @@ function humanizeReply(input) {
   const imageCount = Number(userTurn.image_count || userTurn.counts && userTurn.counts.image || 0);
   const userText = String(userTurn.combinedUserText || userTurn.current_turn_text || "").trim();
   const scenario = input.scenario || inferConversationScenario(userText, input.intent || "");
+  const visibleFacts = Array.isArray(input.visibleFacts) ? input.visibleFacts : [];
   let text = String(input.text || "").trim();
   const originalText = text;
   const hadGenericMenu = looksLikeGenericMenu(text);
@@ -160,8 +162,12 @@ function humanizeReply(input) {
     .replace(/Que quieres que haga con est[oa]\?/gi, hasClearText ? "" : "Dime que quieres hacer con esto y te ayudo.")
     .trim();
 
-  if (hasClearText && containsVisibleTextAnswer(originalText)) {
+  if (imageCount > 1 && visibleFacts.length > 1 && !mentionsEnoughImageEvidence(text, Math.min(imageCount, visibleFacts.length))) {
+    text = buildMultiImageEvidenceReply(visibleFacts, input.intent || "");
+  } else if (hasClearText && containsVisibleTextAnswer(originalText)) {
     text = stripTrailingGenericPrompt(originalText).trim();
+  } else if (imageCount > 1 && visibleFacts.length && (hadGenericMenu || looksLikeGenericMenu(text) || !mentionsMultipleImages(text))) {
+    text = buildMultiImageEvidenceReply(visibleFacts, input.intent || "");
   } else if (hasClearText && (hadGenericMenu || looksLikeGenericMenu(text) || !text)) {
     text = buildDirectTemplateFromUserText(userText, text, scenario);
   }
@@ -174,6 +180,38 @@ function humanizeReply(input) {
 
   if (!text) text = buildSafeTemplate(Object.assign({}, input, { scenario: scenario }));
   return text.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function buildMultiImageEvidenceReply(visibleFacts, intent) {
+  const facts = visibleFacts.slice(0, 6);
+  const heading = intent === "image_ocr" ? "Listo, lei las imagenes:" : "Listo, revise las imagenes:";
+  const lines = facts.map(function (fact, index) {
+    const subject = String(fact.subject || fact.main_subject || fact.product_type || "").trim();
+    const visibleText = String(fact.visibleText || fact.visible_text || "").trim();
+    const detail = visibleText || subject || "sin detalle claro";
+    return "Imagen " + (index + 1) + ": " + detail.slice(0, 220);
+  });
+
+  return [heading].concat(lines).join("\n");
+}
+
+function mentionsMultipleImages(text) {
+  return /\b(imagenes|fotos|capturas|imagen 1|imagen 2|primera|segunda|tercera|cuarta)\b/i.test(String(text || ""));
+}
+
+function mentionsEnoughImageEvidence(text, expectedCount) {
+  const clean = normalizeSimpleText(text);
+  const needed = Math.min(Number(expectedCount || 0), 3);
+  if (needed <= 1) return true;
+
+  let mentioned = 0;
+  for (let index = 1; index <= needed; index++) {
+    const ordinal = index === 1 ? "primera" : index === 2 ? "segunda" : "tercera";
+    const pattern = new RegExp("\\b(imagen|foto|captura)\\s*" + index + "\\b|\\b" + ordinal + "\\b", "i");
+    if (pattern.test(clean)) mentioned += 1;
+  }
+
+  return mentioned >= Math.min(needed, 2);
 }
 
 function looksLikeGenericMenu(text) {

@@ -46,6 +46,103 @@ test("core feature flags are active in local safe modes by default", () => {
   assert.equal(flags.logCaptureMode, "console_and_file");
 });
 
+test("Google OAuth start builds authorization URL with exact redirect URI", async () => {
+  const response = await worker.fetch(new Request("http://localhost:8787/auth/google/start"), {
+    GOOGLE_CLIENT_ID: "client-id",
+    GOOGLE_REDIRECT_URI: "http://localhost:8787/auth/google/callback"
+  }, {});
+
+  assert.equal(response.status, 302);
+  const location = new URL(response.headers.get("location"));
+  assert.equal(location.origin + location.pathname, "https://accounts.google.com/o/oauth2/v2/auth");
+  assert.equal(location.searchParams.get("client_id"), "client-id");
+  assert.equal(location.searchParams.get("redirect_uri"), "http://localhost:8787/auth/google/callback");
+  assert.equal(location.searchParams.get("scope"), "https://www.googleapis.com/auth/gmail.send");
+  assert.equal(location.searchParams.get("access_type"), "offline");
+  assert.equal(location.searchParams.get("prompt"), "consent");
+  assert.equal(location.searchParams.get("include_granted_scopes"), "true");
+});
+
+test("Google OAuth callback rejects missing code", async () => {
+  const response = await worker.fetch(new Request("http://localhost:8787/auth/google/callback"), {
+    GOOGLE_CLIENT_ID: "client-id",
+    GOOGLE_CLIENT_SECRET: "client-secret",
+    GOOGLE_REDIRECT_URI: "http://localhost:8787/auth/google/callback"
+  }, {});
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.equal(body.code, "missing_code");
+});
+
+test("Google OAuth callback exchanges code and returns refresh token only in local development", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async function (url, options) {
+    assert.equal(String(url), "https://oauth2.googleapis.com/token");
+    const form = new URLSearchParams(options.body);
+    assert.equal(form.get("client_id"), "client-id");
+    assert.equal(form.get("client_secret"), "client-secret");
+    assert.equal(form.get("redirect_uri"), "http://localhost:8787/auth/google/callback");
+    assert.equal(form.get("grant_type"), "authorization_code");
+    return new Response(JSON.stringify({
+      access_token: "access-token",
+      refresh_token: "refresh-token",
+      token_type: "Bearer",
+      expires_in: 3600,
+      scope: "https://www.googleapis.com/auth/gmail.send"
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const response = await worker.fetch(new Request("http://localhost:8787/auth/google/callback?code=abc"), {
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      GOOGLE_REDIRECT_URI: "http://localhost:8787/auth/google/callback"
+    }, {});
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(body.hasRefreshToken, true);
+    assert.equal(body.refreshToken, "refresh-token");
+    assert.equal(body.redirectUriUsed, "http://localhost:8787/auth/google/callback");
+    assert.equal(body.redirectUriMatchesEnv, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Google OAuth callback maps invalid_grant errors safely", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async function () {
+    return new Response(JSON.stringify({
+      error: "invalid_grant",
+      error_description: "Bad Request"
+    }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const response = await worker.fetch(new Request("http://localhost:8787/auth/google/callback?code=abc"), {
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      GOOGLE_REDIRECT_URI: "http://localhost:8787/auth/google/callback"
+    }, {});
+    const body = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.equal(body.code, "invalid_grant");
+    assert.equal(body.details.googleError, "invalid_grant");
+    assert.equal(Object.prototype.hasOwnProperty.call(body, "refreshToken"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("conversation memory stores compact sanitized turn data only when enabled", () => {
   const userTurn = {
     turn_id: "turn_1",
@@ -142,6 +239,7 @@ test("version diagnostic exposes safe runtime configuration", () => {
   assert.equal(diagnostic.ENABLE_WHATSAPP_INTERACTIVE, "true");
   assert.equal(diagnostic.REMINDERS_DELIVERY_MODE, "mock");
   assert.equal(diagnostic.REMINDERS_STATUS, "mock_safe_no_real_delivery");
+  assert.equal(diagnostic.REMINDER_TEMPLATE_STATUS, "not_required_for_current_mode");
   assert.equal(diagnostic.INTERACTIVE_DELIVERY_MODE, "safe");
   assert.equal(diagnostic.MEMORY_RETENTION_MODE, "summarized");
   assert.equal(diagnostic.LOG_CAPTURE_MODE, "console_and_file");
@@ -149,6 +247,19 @@ test("version diagnostic exposes safe runtime configuration", () => {
   assert.match(text, /version: whatsapp-ai-agent-core-v3/);
   assert.match(text, /ORCHESTRATOR_PROVIDER: openai/);
   assert.match(text, /REMINDERS_STATUS: mock_safe_no_real_delivery/);
+  assert.match(text, /REMINDER_TEMPLATE_STATUS: not_required_for_current_mode/);
+});
+
+test("version diagnostic exposes missing reminder template for outside 24h delivery", () => {
+  const diagnostic = buildVersionDiagnostic({
+    REMINDERS_DELIVERY_MODE: "alarm",
+    REMINDER_TEMPLATE_NAME: ""
+  });
+  const text = formatVersionDiagnosticForWhatsApp(diagnostic);
+
+  assert.equal(diagnostic.REMINDER_TEMPLATE_CONFIGURED, "false");
+  assert.equal(diagnostic.REMINDER_TEMPLATE_STATUS, "outside_24h_blocked_template_missing");
+  assert.match(text, /REMINDER_TEMPLATE_STATUS: outside_24h_blocked_template_missing/);
 });
 
 test("GET /version returns version diagnostic JSON", async () => {

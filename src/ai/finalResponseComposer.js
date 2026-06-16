@@ -282,6 +282,11 @@ export function shouldSendFastAck(input) {
 export function buildFastAckText(supervisorPlan, userTurn) {
   const plan = supervisorPlan || {};
   const imageCount = Number(userTurn && userTurn.image_count || 0);
+  const targetModules = plan.targetModules || [];
+
+  if (isPriceIntent(plan.intent)) return "Perfecto, estoy revisando los precios.";
+  if (targetModules.includes("image_generation")) return "Ya lo estoy procesando.";
+  if (plan.intent === "multi_image_review" || imageCount > 1) return "Dame un momento, voy a revisar las imagenes.";
 
   if (isPriceIntent(plan.intent)) return "Perfecto, estoy revisando los precios.";
   if (imageCount > 1) return "Dame un momento, voy a comparar las imágenes.";

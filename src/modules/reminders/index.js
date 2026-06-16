@@ -240,13 +240,14 @@ function parseDueDate(normalized, now, timezone) {
   const due = new Date(now);
   let hasDate = false;
   let hasTime = false;
-  const relativeMatch = normalized.match(/\ben\s+(\d+)\s*(minuto|minutos|hora|horas|dia|dias)\b/);
+  const relativeMatches = Array.from(normalized.matchAll(/\b(?:para\s+)?(?:en|dentro de)\s+(\d+|un|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|quince|veinte|treinta)\s*(min|minuto|minutos|m|hora|horas|h|dia|dias|d)\b/g));
+  const relativeMatch = relativeMatches.length ? relativeMatches[relativeMatches.length - 1] : null;
 
   if (relativeMatch) {
-    const value = Number(relativeMatch[1]);
+    const value = parseSpokenNumber(relativeMatch[1]);
     const unit = relativeMatch[2];
-    if (unit.startsWith("minuto")) due.setMinutes(due.getMinutes() + value);
-    else if (unit.startsWith("hora")) due.setHours(due.getHours() + value);
+    if (unit === "min" || unit === "m" || unit.startsWith("minuto")) due.setMinutes(due.getMinutes() + value);
+    else if (unit === "h" || unit.startsWith("hora")) due.setHours(due.getHours() + value);
     else due.setDate(due.getDate() + value);
     hasDate = true;
     hasTime = true;
@@ -277,7 +278,7 @@ function parseDueDate(normalized, now, timezone) {
   if (timeMatch && normalized.match(/\b(a\s+las|a\s+la|am|pm|:\d{2})\b/)) {
     let hour = Number(timeMatch[1]);
     const minute = Number(timeMatch[2] || 0);
-    const meridiem = timeMatch[3] || "";
+    const meridiem = timeMatch[3] || inferSpanishDaypart(normalized);
     if (meridiem === "pm" && hour < 12) hour += 12;
     if (meridiem === "am" && hour === 12) hour = 0;
     setTimeForTimezone(due, hour, minute, timezone);
@@ -289,6 +290,37 @@ function parseDueDate(normalized, now, timezone) {
     hasDate: hasDate,
     hasTime: hasTime
   };
+}
+
+function parseSpokenNumber(value) {
+  const clean = String(value || "").toLowerCase();
+  const words = {
+    un: 1,
+    una: 1,
+    uno: 1,
+    dos: 2,
+    tres: 3,
+    cuatro: 4,
+    cinco: 5,
+    seis: 6,
+    siete: 7,
+    ocho: 8,
+    nueve: 9,
+    diez: 10,
+    quince: 15,
+    veinte: 20,
+    treinta: 30
+  };
+  const parsed = Number(clean);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  return words[clean] || 0;
+}
+
+function inferSpanishDaypart(normalized) {
+  const clean = String(normalized || "");
+  if (/\b(de la tarde|por la tarde|tarde|de la noche|por la noche|noche)\b/.test(clean)) return "pm";
+  if (/\b(de la manana|de la ma[ñn]ana|por la manana|por la ma[ñn]ana)\b/.test(clean)) return "am";
+  return "";
 }
 
 function setTimeForTimezone(date, hour, minute, timezone) {
@@ -342,14 +374,54 @@ function parseRecurrence(normalized) {
 }
 
 function extractReminderTitle(text) {
+  const inferredTitle = extractSmartReminderTitle(text);
+  if (inferredTitle) return inferredTitle;
+
   return String(text || "")
+    .replace(/^\s*(ya,?\s*)?gracias[,.]?\s*/i, "")
+    .replace(/^\s*(me\s+puedes\s+poner|puedes\s+ponerme|ponme|pon|crea|agrega|hazme|hacerme)\s+(otro\s+)?(un\s+)?recordatorio(?:\s+(de|para)\b)?\??\s*/i, "")
+    .replace(/\b(me\s+puedes\s+poner|puedes\s+ponerme|ponme|pon|crea|agrega|hazme|hacerme)\s+(otro\s+)?(un\s+)?recordatorio(?:\s+(de|para)\b)?\??\s*/gi, " ")
     .replace(/^\s*(hazme acuerdo|av[ií]same|avisame)\s*/i, "")
     .replace(/^\s*(recu[eé]rdame|recordarme|anota un recordatorio para|anota recordatorio para|recuerdame)\s*/i, "")
     .replace(/\ben\s+\d+\s*(minuto|minutos|hora|horas|d[ií]a|dias|días)\b/gi, "")
     .replace(/\b(ma[nñ]ana|el viernes|el lunes|el martes|el miercoles|el miércoles|el jueves|el sabado|el sábado|el domingo)\b/gi, "")
     .replace(/\b(a las|a la)\s+\d{1,2}(:\d{2})?\s*(am|pm)?\b/gi, "")
     .replace(/\b\d+\s*(d[ií]a|dias|días|hora|horas|minuto|minutos)\s+antes\b/gi, "")
+    .replace(/\b(?:para\s+)?(?:en|dentro de)\s+\d+\s*(min|minuto|minutos|m|hora|horas|h|d[iÃ­]a|dias|dÃ­as|d)\b/gi, "")
+    .replace(/\b(vi\s+que\s+)?(tengo|tenia|debo|necesito)\s+que\s+/gi, "")
+    .replace(/\bpara\s+(?=(llamar|comprar|pagar|hacer|enviar|revisar|mandar|escribir|actualizar)\b)/gi, "")
     .replace(/\s+/g, " ")
+    .replace(/^[,.;:?\s]+|[,.;:?\s]+$/g, "")
+    .trim();
+}
+
+function extractSmartReminderTitle(text) {
+  const raw = String(text || "").replace(/\s+/g, " ");
+  const explicitShoppingList = raw.match(/\b(?:esta\s+)?lista\s+(?:necesito\s+que\s+)?(?:son|sean)\s+([^.!?]{3,240})/i);
+  if (explicitShoppingList) return cleanupReminderTitle("comprar " + explicitShoppingList[1]);
+
+  const shopping = raw.match(/\b(?:lista|cosas)\s+que\s+(?:tengo\s+que\s+)?comprar\b[^.?!]*?(?:son|sean)\s+([^.!?]{3,240})/i);
+  if (shopping) return cleanupReminderTitle("comprar " + shopping[1]);
+
+  const purposeMatches = Array.from(raw.matchAll(/\bpara\s+(?:yo\s+poder\s+)?((?:llamar|comprar|pagar|hacer|enviar|revisar|mandar|escribir|actualizar)\b[^.?!,;]{0,160})/gi));
+  if (purposeMatches.length) return cleanupReminderTitle(purposeMatches[purposeMatches.length - 1][1]);
+
+  const actionMatches = Array.from(raw.matchAll(/\b((?:llamar|comprar|pagar|hacer|enviar|revisar|mandar|escribir|actualizar)\b[^.?!,;]{0,160})/gi));
+  if (actionMatches.length) return cleanupReminderTitle(actionMatches[actionMatches.length - 1][1]);
+
+  return "";
+}
+
+function cleanupReminderTitle(text) {
+  return String(text || "")
+    .replace(/\b(ma[ñn]ana|hoy|pasado ma[ñn]ana)\b/gi, "")
+    .replace(/\b(?:para\s+)?(?:en|dentro de)\s+(\d+|un|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|quince|veinte|treinta)\s*(min|minuto|minutos|m|hora|horas|h|d[ií]a|dias|días|d)\b/gi, "")
+    .replace(/\b(a las|a la)\s+\d{1,2}(:\d{2})?\s*(am|pm)?\b/gi, "")
+    .replace(/\b(de la tarde|por la tarde|de la noche|por la noche|de la manana|de la ma[ñn]ana|por la manana|por la ma[ñn]ana)\b/gi, "")
+    .replace(/\b(por favor|entonces|necesito ese recordatorio|ese recordatorio|mejor|que digo|qu[eé] digo|no importa)\b/gi, " ")
+    .replace(/\bno,?\s+no\s+tienes\s+que\s+.+$/gi, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^[,.;:?\s]+|[,.;:?\s]+$/g, "")
     .trim();
 }
 

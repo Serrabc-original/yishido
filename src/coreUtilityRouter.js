@@ -8,7 +8,7 @@ export function routeCoreUtilityIntent(userTurn, options) {
   const flags = cleanOptions.flags || {};
   const media = getTurnMediaCounts(userTurn);
 
-  if (isReminderIntent(normalized)) {
+  if (isReminderIntent(normalized) || cleanOptions.pendingReminderDraft && isReminderContinuation(normalized)) {
     const parsed = parseReminderRequest(text, cleanOptions.timezone || "UTC", {
       now: cleanOptions.now
     });
@@ -63,6 +63,18 @@ export function routeCoreUtilityIntent(userTurn, options) {
   return intentResult("general", normalized ? 0.5 : 0.1, "core");
 }
 
+function isReminderContinuation(text) {
+  if (!text) return false;
+  if (/\b(ma[nn]ana|hoy|pasado ma[nn]ana|lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b/.test(text)) return true;
+  if (/\b(a las|a la)\s+\d{1,2}(:\d{2})?\s*(am|pm)?\b/.test(text)) return true;
+  if (/\b(?:para\s+)?(?:en|dentro de)\s+(?:\d+|un|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|quince|veinte|treinta)\s*(min|minuto|minutos|m|hora|horas|h)\b/.test(text)) return true;
+  if (/^\s*(si|sí|ok|listo|dale)\s*$/i.test(text)) return true;
+  if (/\b(lo que te dije|lo que dije|lo del audio|en el audio|del audio)\b/.test(text)) return true;
+  if (/\b(solo|solamente)?\s*(me\s+)?(haces? acuerdo|recuerdame|avisame)\b/.test(text)) return true;
+  if (/\bpara\s+.{3,120}/.test(text)) return true;
+  return false;
+}
+
 function intentResult(intent, confidence, module) {
   return {
     intent: intent,
@@ -76,7 +88,7 @@ function intentResult(intent, confidence, module) {
 
 function isReminderIntent(text) {
   return /\b(recuerdame|recordarme|recordatorio|recordatorios|avisame|hazme acuerdo|acuerdame|cancel(a|ar).*(recordatorio)|muestrame.*recordatorio|mostrar.*recordatorio)\b/.test(text) ||
-    /\ben\s+\d+\s*(minuto|minutos|hora|horas)\b/.test(text) && /\b(comprar|pagar|llamar|hacer|enviar)\b/.test(text);
+    /\b(?:para\s+)?(?:en|dentro de)\s+(?:\d+|un|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|quince|veinte|treinta)\s*(min|minuto|minutos|m|hora|horas|h)\b/.test(text) && /\b(comprar|pagar|llamar|hacer|enviar|mandar|escribir|actualizar|revisar)\b/.test(text);
 }
 
 function isListIntent(text) {

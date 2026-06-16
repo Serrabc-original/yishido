@@ -74,6 +74,7 @@ import {
   getTranscriptionModel,
   getVisionModel
 } from "./ai/modelRegistry.js";
+import { estimateOpenAIUsageCost, extractOpenAIUsage } from "./ai/usageCost.js";
 
 let activeLogContext = {};
 
@@ -109,6 +110,14 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET") {
+      if (url.pathname === "/auth/google/start") {
+        return handleGoogleOAuthStart(request, env);
+      }
+
+      if (url.pathname === "/auth/google/callback") {
+        return await handleGoogleOAuthCallback(request, env);
+      }
+
       if (url.pathname === "/version") {
         return jsonResponse(buildVersionDiagnostic(env));
       }
@@ -431,6 +440,8 @@ export class ConversationCoordinator {
     const now = Date.now();
     const dueReminderResult = await this.processDueReminders(data, now);
     data = dueReminderResult.data;
+    const dailyUsageResult = await this.processDueDailyUsageReport(data, now);
+    data = dailyUsageResult.data;
 
     if (data.processing) {
       const processingStartedAt = Number(data.processingStartedAt || 0);
@@ -475,7 +486,7 @@ export class ConversationCoordinator {
     if (!data.pendingMessages.length) {
       console.log("DO_ALARM_SKIPPED_PROCESSING:", JSON.stringify({
         doName: data.doName || "",
-        reason: dueReminderResult.handled ? "reminders_processed_no_pending" : "no_pending",
+        reason: dueReminderResult.handled ? "reminders_processed_no_pending" : dailyUsageResult.handled ? "daily_usage_report_processed_no_pending" : "no_pending",
         pendingCount: 0,
         processing: data.processing,
         processingStartedAt: data.processingStartedAt || null,
@@ -1755,7 +1766,7 @@ export class ConversationCoordinator {
           recipientId: data.phone,
           memberId: data.member,
           appId: data.app,
-          text: "Pasame las imagenes o capturas y te ayudo a revisar los precios."
+          text: buildTaskExpiredNoMediaMessage(activeTaskBeforeProcessing)
         });
         logEvent("TASK_INTAKE_EXPIRED_NO_MEDIA", {
           traceId: data.currentTraceId || "",
@@ -2074,6 +2085,9 @@ export class ConversationCoordinator {
         });
       } else if (supervisorPlan.intent === "memory") {
         data = await this.handleMemoryUtility(data, supervisorPlan, userTurn);
+      } else if (supervisorPlan.intent === "image_generation") {
+        await this.maybeSendFastAck(data, supervisorPlan, userTurn);
+        data = await this.executePlan(data, messages, buildImageGenerationExecutionPlan(supervisorPlan, userTurn), userTurn);
       } else if (supervisorPlan.responseStrategy === "ask_clarification" && supervisorPlan.clarificationQuestion) {
         await sendWoztellTextMessage(this.env, {
           channelId: data.channel,
@@ -2156,7 +2170,8 @@ export class ConversationCoordinator {
       } else {
       const utilityRoute = routeCoreUtilityIntent(userTurn, {
         flags: coreFlags,
-        timezone: this.env.USER_TIMEZONE || "America/Bogota"
+        timezone: this.env.USER_TIMEZONE || "America/Bogota",
+        pendingReminderDraft: data.coreUtilityState && data.coreUtilityState.pendingReminderDraft
       });
       if (isMarketingRoute(utilityRoute, userTurn)) {
         logEvent("LEGACY_MARKETING_PATH_ALLOWED", {
@@ -2290,6 +2305,8 @@ export class ConversationCoordinator {
         }));
         await this.saveData(data);
         await this.state.storage.setAlarm(data.processAfter);
+      } else if (success) {
+        await this.scheduleNextReminderAlarm(data);
       }
     }
 
@@ -2509,20 +2526,34 @@ export class ConversationCoordinator {
     });
     const text = finalResponse.text || supervisedText || legacyText;
     try {
-      await sendConversationalResponse(this.env, {
-        channelId: data.channel,
-        recipientId: data.phone,
-        memberId: data.member,
-        appId: data.app,
-        traceId: userTurn && userTurn.trace_id || "",
-        turnId: userTurn && userTurn.turn_id || "",
-        doName: data.doName,
-        userTurn: userTurn,
-        recentMediaAssets: data.recentMediaAssets,
-        supervisorPlan: route.supervisorPlan || { intent: route.intent || "image_question" },
-        intent: route.supervisorPlan && route.supervisorPlan.intent || route.intent || "image_question",
-        text: text
-      });
+      const ocrParts = buildPerImageOcrMessages(route.intent, analysisResult.summary);
+      if (ocrParts.length > 1) {
+        for (const part of ocrParts) {
+          await sendWoztellTextMessage(this.env, {
+            channelId: data.channel,
+            recipientId: data.phone,
+            memberId: data.member,
+            appId: data.app,
+            text: part
+          });
+        }
+      } else {
+        await sendConversationalResponse(this.env, {
+          channelId: data.channel,
+          recipientId: data.phone,
+          memberId: data.member,
+          appId: data.app,
+          traceId: userTurn && userTurn.trace_id || "",
+          turnId: userTurn && userTurn.turn_id || "",
+          doName: data.doName,
+          userTurn: userTurn,
+          recentMediaAssets: data.recentMediaAssets,
+          supervisorPlan: route.supervisorPlan || { intent: route.intent || "image_question" },
+          intent: route.supervisorPlan && route.supervisorPlan.intent || route.intent || "image_question",
+          visibleFacts: buildVisibleFactsFromMediaSummary(analysisResult.summary),
+          text: text
+        });
+      }
       logEvent("VISION_FINAL_RESPONSE_SENT", {
         traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
         turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
@@ -2599,7 +2630,11 @@ export class ConversationCoordinator {
     data.coreUtilityState = normalizeCoreUtilityState(data.coreUtilityState);
 
     if (route.intent === "reminder") {
-      const parsed = resolveReminderReferences(route.parsed || {}, data.activeContext);
+      const parsed = mergeReminderDraft(
+        data.coreUtilityState.pendingReminderDraft,
+        resolveReminderReferences(route.parsed || {}, data.activeContext, data.customerMemory),
+        userTurn
+      );
 
       if (parsed.action === "list") {
         await sendWoztellTextMessage(this.env, {
@@ -2611,6 +2646,7 @@ export class ConversationCoordinator {
       }
 
       if (parsed.action === "cancel") {
+        data.coreUtilityState.pendingReminderDraft = null;
         const result = cancelReminderByText(data.coreUtilityState.reminders, parsed.title);
         data.coreUtilityState.reminders = result.reminders;
         await sendWoztellTextMessage(this.env, {
@@ -2624,6 +2660,7 @@ export class ConversationCoordinator {
       }
 
       if (parsed.missingFields && parsed.missingFields.length) {
+        data.coreUtilityState.pendingReminderDraft = buildPendingReminderDraft(parsed, userTurn);
         const question = parsed.missingFields.includes("date")
           ? "¿Para qué fecha quieres que te lo recuerde?"
           : parsed.missingFields.includes("time")
@@ -2653,6 +2690,7 @@ export class ConversationCoordinator {
 
       const reminder = createReminder(data.coreUtilityState.reminders, buildReminderForConversation(parsed, data, this.env, userTurn));
       data.coreUtilityState.reminders = data.coreUtilityState.reminders.concat([reminder]);
+      data.coreUtilityState.pendingReminderDraft = null;
       logEvent("REMINDER_SCHEDULED", {
         traceId: userTurn && userTurn.trace_id || "",
         turnId: userTurn && userTurn.turn_id || "",
@@ -2873,15 +2911,63 @@ export class ConversationCoordinator {
     return { data: next, handled: handled };
   }
 
+  async processDueDailyUsageReport(data, now) {
+    const next = normalizeCoordinatorData(data || {});
+    if (!isDailyUsageReportEnabled(this.env)) return { data: next, handled: false };
+    if (!next.channel || !next.phone || !next.doName) return { data: next, handled: false };
+
+    next.coreUtilityState = normalizeCoreUtilityState(next.coreUtilityState);
+    const reportDate = getLocalDateKey(now, this.env && this.env.USER_TIMEZONE || "America/Bogota");
+    const reportAt = getDailyUsageReportAtMs(now, this.env);
+    const reports = next.coreUtilityState.usageReports || {};
+    if (now < reportAt || reports.lastDailyReportDate === reportDate) return { data: next, handled: false };
+
+    const summary = await readDailyUsageSummary(this.env, next.doName, reportDate);
+    if (!summary || Number(summary.callCount || 0) <= 0 && Number(summary.estimatedUsd || 0) <= 0) {
+      reports.lastDailyReportDate = reportDate;
+      reports.lastCheckedAt = new Date(now).toISOString();
+      next.coreUtilityState.usageReports = reports;
+      return { data: next, handled: false };
+    }
+
+    await sendWoztellTextMessage(this.env, {
+      channelId: next.channel,
+      recipientId: next.phone,
+      memberId: next.member,
+      appId: next.app,
+      text: formatDailyUsageReportForWhatsApp(summary, reportDate)
+    });
+
+    reports.lastDailyReportDate = reportDate;
+    reports.lastReportAt = new Date(now).toISOString();
+    next.coreUtilityState.usageReports = reports;
+    logEvent("DAILY_USAGE_REPORT_SENT", {
+      doName: next.doName,
+      reportDate: reportDate,
+      callCount: summary.callCount,
+      estimatedUsd: summary.estimatedUsd
+    });
+    return { data: next, handled: true };
+  }
+
   async scheduleNextReminderAlarm(data) {
     const mode = getReminderDeliveryMode(this.env);
-    if (mode !== "alarm") return;
+    if (mode !== "alarm" && !isDailyUsageReportEnabled(this.env)) return;
 
     const reminders = normalizeCoreUtilityState(data && data.coreUtilityState || {}).reminders;
     const dueTimes = reminders
       .filter(function (item) { return String(item.status || "").startsWith("scheduled"); })
       .map(function (item) { return Date.parse(item.dueAt || ""); })
       .filter(function (value) { return Number.isFinite(value) && value > Date.now(); });
+    if (isDailyUsageReportEnabled(this.env)) {
+      const now = Date.now();
+      const reportDate = getLocalDateKey(now, this.env && this.env.USER_TIMEZONE || "America/Bogota");
+      const usageReports = normalizeCoreUtilityState(data && data.coreUtilityState || {}).usageReports;
+      const todayReportAt = getDailyUsageReportAtMs(now, this.env);
+      dueTimes.push(usageReports.lastDailyReportDate !== reportDate && now >= todayReportAt
+        ? now + 1000
+        : getNextDailyUsageReportAtMs(now, this.env));
+    }
 
     if (!dueTimes.length) return;
     const nextDueAt = Math.min.apply(null, dueTimes);
@@ -3018,21 +3104,34 @@ export class ConversationCoordinator {
         });
         const text = formatVisionUtilityResponse(plan.intent, analysisResult.summary, userTurn);
         try {
-          await sendConversationalResponse(this.env, {
-            channelId: data.channel,
-            recipientId: data.phone,
-            memberId: data.member,
-            appId: data.app,
-            traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
-            turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
-            doName: data.doName,
-            userTurn: userTurn,
-            recentMediaAssets: data.recentMediaAssets,
-            intent: plan.intent,
-            text: text,
-            visibleFacts: [analysisResult.summary],
-            nextAction: ""
-          });
+          const ocrParts = buildPerImageOcrMessages(plan.intent, analysisResult.summary);
+          if (ocrParts.length > 1) {
+            for (const part of ocrParts) {
+              await sendWoztellTextMessage(this.env, {
+                channelId: data.channel,
+                recipientId: data.phone,
+                memberId: data.member,
+                appId: data.app,
+                text: part
+              });
+            }
+          } else {
+            await sendConversationalResponse(this.env, {
+              channelId: data.channel,
+              recipientId: data.phone,
+              memberId: data.member,
+              appId: data.app,
+              traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
+              turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
+              doName: data.doName,
+              userTurn: userTurn,
+              recentMediaAssets: data.recentMediaAssets,
+              intent: plan.intent,
+              text: text,
+              visibleFacts: [analysisResult.summary],
+              nextAction: ""
+            });
+          }
           logEvent("VISION_FINAL_RESPONSE_SENT", {
             traceId: userTurn && userTurn.trace_id || data.currentTraceId || "",
             turnId: userTurn && userTurn.turn_id || data.currentTurnId || "",
@@ -3505,6 +3604,7 @@ async function processImageQueueJob(env, job) {
   const prompt = buildImagePrompt(job.prompt || "", state);
   let generatedImage;
   let publicUrl = "";
+  let imageDelivered = false;
 
   try {
     console.log("IMAGE_PIPELINE_START:", JSON.stringify({
@@ -3562,6 +3662,10 @@ async function processImageQueueJob(env, job) {
       recipientId: woztellPayload.from,
       imageUrl: publicUrl
     });
+    if (imageSendResult && imageSendResult.failed) {
+      throw new Error("WOZTELL_IMAGE_SEND_FAILED " + (imageSendResult.status || 0) + ": " + String(imageSendResult.body || "").slice(0, 500));
+    }
+    imageDelivered = true;
 
     console.log("WOZTELL_IMAGE_SEND_OK:", JSON.stringify(imageSendResult));
 
@@ -3627,7 +3731,7 @@ async function processImageQueueJob(env, job) {
       imageUrl: publicUrl || ""
     }));
 
-    if (woztellPayload.channel && woztellPayload.from) {
+    if (!imageDelivered && woztellPayload.channel && woztellPayload.from) {
       await sendWoztellTextMessage(env, {
         channelId: woztellPayload.channel,
         recipientId: woztellPayload.from,
@@ -3642,6 +3746,13 @@ async function processImageQueueJob(env, job) {
         doName: job.doName || "",
         reason: "image_pipeline_error"
       });
+    } else if (imageDelivered) {
+      logEvent("IMAGE_PIPELINE_POST_SEND_ERROR_SUPPRESSED", {
+        traceId: job.traceId || "",
+        turnId: job.turnId || "",
+        doName: job.doName || "",
+        imageUrl: publicUrl || ""
+      }, { level: "error", traceId: job.traceId || "" });
     }
 
     throw error;
@@ -4051,6 +4162,11 @@ async function openaiOrchestratorProvider(env, params) {
   });
 
   const responseJson = parseMaybeJson(responseText);
+  await logOpenAIUsageCost(env, "orchestrator", model, responseJson, {
+    traceId: traceId,
+    turnId: turnId,
+    doName: params.doName || ""
+  });
   const text = extractOpenAIResponseText(responseJson);
   logEvent("ORCHESTRATOR_RAW_RESPONSE_SHAPE", {
     traceId: traceId,
@@ -5082,6 +5198,11 @@ async function generateCopyWithOpenAI(env, params) {
   }
 
   const data = JSON.parse(responseText);
+  await logOpenAIUsageCost(env, "copy_generation", model, data, {
+    traceId: params.traceId || "",
+    turnId: params.turnId || "",
+    doName: params.doName || ""
+  });
   const output = extractOpenAIResponseText(data);
 
   if (!output) {
@@ -5262,6 +5383,11 @@ async function callVisionModel(env, params) {
   }
 
   const data = JSON.parse(visionResponse.responseText);
+  await logOpenAIUsageCost(env, "vision_analysis", params.model, data, {
+    traceId: params.traceId || "",
+    turnId: params.turnId || "",
+    doName: params.doName || ""
+  });
   const output = extractOpenAIResponseText(data);
 
   console.log("VISION_RAW_OUTPUT:", JSON.stringify(summarizeVisionTextForLog(output)));
@@ -5548,6 +5674,134 @@ function extractOpenAIResponseText(data) {
   return "";
 }
 
+async function logOpenAIUsageCost(env, purpose, model, responseJson, context, options) {
+  const cleanContext = Object.assign({}, activeLogContext || {}, context || {});
+  const usage = extractOpenAIUsage(responseJson || {});
+  const estimate = estimateOpenAIUsageCost(Object.assign({
+    kind: options && options.kind || "text",
+    model: model,
+    usage: usage
+  }, options || {}));
+  logEvent("AI_USAGE_COST_ESTIMATED", Object.assign({
+    purpose: purpose,
+    model: model,
+    traceId: cleanContext.traceId || "",
+    turnId: cleanContext.turnId || "",
+    doName: cleanContext.doName || ""
+  }, estimate));
+  await recordDailyUsageEstimate(env, purpose, estimate, cleanContext);
+  return estimate;
+}
+
+async function recordDailyUsageEstimate(env, purpose, estimate, context) {
+  if (!env || !env.SESSIONS_KV || !context || !context.doName) return;
+  const reportDate = getLocalDateKey(Date.now(), env.USER_TIMEZONE || "America/Bogota");
+  const key = buildDailyUsageKey(context.doName, reportDate);
+  const previous = parseMaybeJson(await env.SESSIONS_KV.get(key) || "{}");
+  const next = normalizeDailyUsageSummary(previous, context.doName, reportDate);
+  next.callCount += 1;
+  next.estimatedUsd = Number((next.estimatedUsd + Number(estimate && estimate.estimatedUsd || 0)).toFixed(8));
+  next.inputTokens += Number(estimate && estimate.inputTokens || 0);
+  next.cachedInputTokens += Number(estimate && estimate.cachedInputTokens || 0);
+  next.outputTokens += Number(estimate && estimate.outputTokens || 0);
+  next.totalTokens += Number(estimate && estimate.totalTokens || 0);
+  next.unknownCostCount += estimate && estimate.estimatedUsd === null ? 1 : 0;
+  next.byPurpose[purpose] = next.byPurpose[purpose] || { calls: 0, estimatedUsd: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  next.byPurpose[purpose].calls += 1;
+  next.byPurpose[purpose].estimatedUsd = Number((next.byPurpose[purpose].estimatedUsd + Number(estimate && estimate.estimatedUsd || 0)).toFixed(8));
+  next.byPurpose[purpose].inputTokens += Number(estimate && estimate.inputTokens || 0);
+  next.byPurpose[purpose].outputTokens += Number(estimate && estimate.outputTokens || 0);
+  next.byPurpose[purpose].totalTokens += Number(estimate && estimate.totalTokens || 0);
+  next.updatedAt = new Date().toISOString();
+  await env.SESSIONS_KV.put(key, JSON.stringify(next), { expirationTtl: 60 * 60 * 24 * 45 });
+}
+
+async function readDailyUsageSummary(env, doName, reportDate) {
+  if (!env || !env.SESSIONS_KV || !doName || !reportDate) return null;
+  const raw = await env.SESSIONS_KV.get(buildDailyUsageKey(doName, reportDate));
+  return raw ? normalizeDailyUsageSummary(parseMaybeJson(raw), doName, reportDate) : null;
+}
+
+function normalizeDailyUsageSummary(summary, doName, reportDate) {
+  const clean = summary && typeof summary === "object" ? summary : {};
+  return {
+    doName: String(clean.doName || doName || ""),
+    reportDate: String(clean.reportDate || reportDate || ""),
+    callCount: Number(clean.callCount || 0),
+    estimatedUsd: Number(clean.estimatedUsd || 0),
+    inputTokens: Number(clean.inputTokens || 0),
+    cachedInputTokens: Number(clean.cachedInputTokens || 0),
+    outputTokens: Number(clean.outputTokens || 0),
+    totalTokens: Number(clean.totalTokens || 0),
+    unknownCostCount: Number(clean.unknownCostCount || 0),
+    byPurpose: clean.byPurpose && typeof clean.byPurpose === "object" ? clean.byPurpose : {},
+    updatedAt: String(clean.updatedAt || "")
+  };
+}
+
+function buildDailyUsageKey(doName, reportDate) {
+  return "usage:daily:" + reportDate + ":" + String(doName || "unknown").replace(/[^A-Za-z0-9:_-]/g, "_");
+}
+
+function isDailyUsageReportEnabled(env) {
+  return parseBooleanLike(env && env.DAILY_USAGE_REPORT_ENABLED, true);
+}
+
+function getDailyUsageReportHour(env) {
+  const value = Number(env && env.DAILY_USAGE_REPORT_HOUR || 18);
+  return Number.isFinite(value) && value >= 0 && value <= 23 ? value : 18;
+}
+
+function getDailyUsageReportAtMs(now, env) {
+  const current = new Date(now);
+  const offsetHours = getTimezoneOffsetHours(env && env.USER_TIMEZONE || "America/Bogota");
+  const local = new Date(current.getTime() + offsetHours * 60 * 60 * 1000);
+  const reportUtc = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(), getDailyUsageReportHour(env) - offsetHours, 0, 0, 0);
+  return reportUtc;
+}
+
+function getNextDailyUsageReportAtMs(now, env) {
+  const reportAt = getDailyUsageReportAtMs(now, env);
+  return reportAt > now ? reportAt : reportAt + 24 * 60 * 60 * 1000;
+}
+
+function getLocalDateKey(now, timezone) {
+  const offsetHours = getTimezoneOffsetHours(timezone || "America/Bogota");
+  const local = new Date(Number(now || Date.now()) + offsetHours * 60 * 60 * 1000);
+  return local.toISOString().slice(0, 10);
+}
+
+function getTimezoneOffsetHours(timezone) {
+  const clean = String(timezone || "").toLowerCase();
+  const offsets = {
+    "america/bogota": -5,
+    "america/lima": -5,
+    "america/quito": -5,
+    "america/mexico_city": -6,
+    "america/new_york": -5,
+    "utc": 0
+  };
+  return Object.prototype.hasOwnProperty.call(offsets, clean) ? offsets[clean] : 0;
+}
+
+function formatDailyUsageReportForWhatsApp(summary, reportDate) {
+  const clean = normalizeDailyUsageSummary(summary, summary && summary.doName || "", reportDate);
+  const purposeLines = Object.entries(clean.byPurpose || {}).map(function (entry) {
+    const item = entry[1] || {};
+    return "- " + entry[0] + ": " + Number(item.calls || 0) + " llamadas, $" + Number(item.estimatedUsd || 0).toFixed(4);
+  }).slice(0, 8);
+  return [
+    "Reporte diario de créditos IA",
+    "Fecha: " + reportDate,
+    "Cliente: " + clean.doName,
+    "Llamadas IA: " + clean.callCount,
+    "Tokens: " + clean.totalTokens + " total (" + clean.inputTokens + " input / " + clean.outputTokens + " output)",
+    "Costo estimado: $" + Number(clean.estimatedUsd || 0).toFixed(4),
+    clean.unknownCostCount ? "Pendiente sin costo exacto: " + clean.unknownCostCount + " llamada(s)" : "",
+    purposeLines.length ? "Detalle:\n" + purposeLines.join("\n") : ""
+  ].filter(Boolean).join("\n");
+}
+
 async function generateImageWithOpenAI(env, prompt) {
   if (!env.OPENAI_API_KEY) {
     throw new Error("Missing OPENAI_API_KEY");
@@ -5593,6 +5847,7 @@ async function generateImageWithOpenAI(env, prompt) {
     bodyPreview: responseText.slice(0, 500)
   }));
 
+  await logOpenAIUsageCost(env, "image_generation", model, parseMaybeJson(responseText), {}, { kind: "image" });
   return await parseOpenAIImageResponse(responseText);
 }
 
@@ -5647,6 +5902,7 @@ async function generateImageEditWithOpenAI(env, params) {
     bodyPreview: responseText.slice(0, 500)
   }));
 
+  await logOpenAIUsageCost(env, "image_edit", model, parseMaybeJson(responseText), {}, { kind: "image" });
   return await parseOpenAIImageResponse(responseText);
 }
 
@@ -6663,6 +6919,11 @@ async function composeCustomerReplyWithOpenAI(env, params, localDraftText) {
     }
 
     const responseJson = parseMaybeJson(responseText);
+    await logOpenAIUsageCost(env, "customer_reply", model, responseJson, {
+      traceId: traceId,
+      turnId: turnId,
+      doName: doName
+    });
     const outputText = extractOpenAIResponseText(responseJson);
     const parsed = parseCustomerReplyModelOutput(outputText);
     const text = String(parsed.text || "").trim();
@@ -7016,6 +7277,7 @@ async function sendWoztellResponse(env, params) {
   });
   const attempts = buildWoztellSendAttempts(baseParams);
   let parsed = null;
+  let successStatus = 0;
   let lastFailure = null;
 
   console.log("WOZTELL_SEND_ENDPOINT:", JSON.stringify({
@@ -7086,6 +7348,7 @@ async function sendWoztellResponse(env, params) {
     }
 
     parsed = parseMaybeJson(responseText);
+    successStatus = res.status;
     break;
   }
 
@@ -7095,7 +7358,7 @@ async function sendWoztellResponse(env, params) {
 
   if (params.logPrefix === "WOZTELL_IMAGE_SEND") {
     console.log("WOZTELL_IMAGE_SEND_OK:", JSON.stringify({
-      status: res.status,
+      status: successStatus,
       body: parsed
     }));
   }
@@ -7238,7 +7501,7 @@ function normalizeCoordinatorData(data) {
     updatedAt: String(clean.updatedAt || new Date().toISOString()),
     clientProfile: clientProfile,
     campaignState: campaignState,
-    conversationLog: Array.isArray(clean.conversationLog || clean.conversation_log) ? (clean.conversationLog || clean.conversation_log).slice(-30) : [],
+    conversationLog: Array.isArray(clean.conversationLog || clean.conversation_log) ? (clean.conversationLog || clean.conversation_log).slice(-20) : [],
     conversationSummary: clean.conversationSummary || clean.conversation_summary || null,
     userStyleProfile: clean.userStyleProfile || clean.user_style_profile || null,
     customerMemory: clean.customerMemory || clean.customer_memory || null,
@@ -7332,6 +7595,7 @@ function recentMediaAssetToCampaignAsset(item) {
   const asset = normalizeRecentMediaAssets([item])[0];
   if (!asset) return null;
   return normalizeCampaignAssets([{
+    asset_id: buildStableAssetId(asset.fileId || asset.messageId || asset.url),
     file_id: asset.fileId,
     url: asset.url,
     media_type: asset.mediaType || "IMAGE",
@@ -7489,6 +7753,8 @@ function normalizeCoreUtilityState(state) {
 
   return {
     reminders: Array.isArray(clean.reminders) ? clean.reminders.slice(-100) : [],
+    pendingReminderDraft: normalizePendingReminderDraft(clean.pendingReminderDraft || clean.pending_reminder_draft || null),
+    usageReports: normalizeUsageReportsState(clean.usageReports || clean.usage_reports || {}),
     listsState: listsState,
     lists: listsState.lists,
     activeList: String(clean.activeList || clean.active_list || "")
@@ -7766,6 +8032,7 @@ function formatReminderDebugForWhatsApp(decision) {
 function buildReminderForConversation(parsed, data, env, userTurn) {
   const clean = parsed || {};
   const mode = getReminderDeliveryMode(env);
+  const title = cleanReminderTitle(clean.title || clean.message || "", clean.context || userTurn && userTurn.current_turn_text || "");
   const lastInteraction = data && data.lastMessageAt
     ? new Date(data.lastMessageAt).toISOString()
     : new Date().toISOString();
@@ -7776,7 +8043,8 @@ function buildReminderForConversation(parsed, data, env, userTurn) {
     memberId: data && data.member || "",
     appId: data && data.app || "",
     recipientId: data && data.phone || "",
-    message: clean.message || clean.title || "",
+    title: title || clean.title || "",
+    message: clean.message && !isGenericReminderTitle(clean.message) ? cleanReminderTitle(clean.message, clean.context || "") : title || clean.title || "",
     sourceContext: {
       turnId: userTurn && (userTurn.turn_id || userTurn.turnId) || "",
       traceId: userTurn && (userTurn.trace_id || userTurn.traceId) || "",
@@ -7992,6 +8260,44 @@ function shouldSupervisorHandleVision(supervisorPlan, userTurn) {
     userTurn && userTurn.media_batch && userTurn.media_batch.assets && userTurn.media_batch.assets.length > 0;
 }
 
+function buildImageGenerationExecutionPlan(supervisorPlan, userTurn) {
+  const turn = userTurn || {};
+  const text = extractPlainTurnText(turn.current_turn_text || turn.combinedUserText || "");
+  const mediaAssets = turn.media_batch && Array.isArray(turn.media_batch.assets) ? turn.media_batch.assets : [];
+  const hasMedia = mediaAssets.some(function (asset) {
+    return String(asset && asset.media_type || "IMAGE").toUpperCase() === "IMAGE";
+  });
+  const prompt = text || "Crea una imagen clara y profesional con la instruccion del usuario.";
+  const actions = hasMedia
+    ? [
+      { type: "analyze_uploaded_image" },
+      { type: "edit_image", prompt: prompt, source: "uploaded_image" }
+    ]
+    : [
+      { type: "generate_image", prompt: prompt, source: "text_only" }
+    ];
+
+  logEvent("IMAGE_GENERATION_LOCAL_PLAN_CREATED", {
+    traceId: turn.trace_id || "",
+    turnId: turn.turn_id || "",
+    mediaAssetCount: mediaAssets.length,
+    actionTypes: actions.map(function (action) { return action.type; })
+  });
+
+  return {
+    intent: "image_generation",
+    confidence: supervisorPlan && supervisorPlan.confidence || 0.86,
+    should_handle_in_core: false,
+    target_module: "image_generation",
+    needs_clarification: false,
+    clarification_question: "",
+    user_facing_ack: "",
+    actions: actions,
+    final_response_mode: "async_image",
+    state_updates: {}
+  };
+}
+
 function mapSupervisorVisionIntent(intent) {
   if (intent === "image_ocr") return "image_ocr";
   return intent || "image_question";
@@ -8115,14 +8421,24 @@ async function sendWoztellTemplateMessage(env, params) {
   });
 }
 
-function resolveReminderReferences(parsed, activeContext) {
+function resolveReminderReferences(parsed, activeContext, customerMemory) {
   const clean = Object.assign({}, parsed || {});
   const context = normalizeConversationContext(activeContext || {});
-  const title = String(clean.title || "").trim();
+  const memoryReference = getLatestAudioReminderReference(customerMemory);
+  const title = cleanReminderTitle(clean.title || "", clean.context || "");
+  const referencesLatestAudio = /\b(lo que te dije|lo que dije|lo del audio|en el audio|del audio)\b/i.test([title, clean.context || ""].join(" "));
 
-  if (/\b(eso|esto|lo anterior|esa lista|la lista)\b/i.test(title) && context.lastUserGoal) {
+  if (referencesLatestAudio && memoryReference) {
+    clean.title = memoryReference;
+    clean.context = [clean.context || "", "Referencia de audio resuelta: " + memoryReference].filter(Boolean).join("\n");
+    clean.missingFields = Array.isArray(clean.missingFields)
+      ? clean.missingFields.filter(function (field) { return field !== "title"; })
+      : clean.missingFields;
+  } else if (/\b(eso|esto|lo anterior|esa lista|la lista)\b/i.test(title) && context.lastUserGoal) {
     clean.title = title.replace(/\b(eso|esto|lo anterior|esa lista|la lista)\b/ig, context.lastUserGoal).replace(/\s+/g, " ").trim();
     clean.context = [clean.context || "", "Referencia resuelta: " + context.lastUserGoal].filter(Boolean).join("\n");
+  } else {
+    clean.title = title;
   }
 
   if (!clean.title && context.lastUserGoal && Array.isArray(clean.missingFields) && clean.missingFields.includes("title")) {
@@ -8134,6 +8450,13 @@ function resolveReminderReferences(parsed, activeContext) {
   }
 
   return clean;
+}
+
+function getLatestAudioReminderReference(customerMemory) {
+  const memory = customerMemory && typeof customerMemory === "object" ? customerMemory : {};
+  const clean = cleanReminderTitle(String(memory.last_audio_summary || memory.lastAudioSummary || ""), "");
+  if (!clean || isGenericReminderTitle(clean)) return "";
+  return clean.slice(0, 180);
 }
 
 function formatListGoal(list) {
@@ -8192,6 +8515,40 @@ function formatVisionUtilityResponse(intent, summary, userTurn) {
     data.failed_asset_count ? "Nota: " + data.failed_asset_count + " imagen(es) no se pudieron analizar." : "",
     userTurn && userTurn.context_policy === "use_previous_context" ? "Usé la media anterior que mencionaste." : ""
   ].filter(Boolean).join("\n");
+}
+
+function buildPerImageOcrMessages(intent, summary) {
+  if (intent !== "image_ocr") return [];
+  const assets = Array.isArray(summary && summary.assets) ? summary.assets : [];
+  const analyzed = assets.filter(function (asset) {
+    return asset && asset.analysis && String(asset.analysis.visible_text || "").trim();
+  });
+  if (analyzed.length <= 1) return [];
+  return analyzed.map(function (asset, index) {
+    const imageIndex = Number(asset.asset_index || asset.assetIndex || index + 1);
+    const analysis = asset.analysis || {};
+    return [
+      "Imagen " + imageIndex,
+      analysis.main_subject || analysis.product_type ? "Veo: " + (analysis.main_subject || analysis.product_type) : "",
+      "Texto visible:",
+      String(analysis.visible_text || "").trim()
+    ].filter(Boolean).join("\n");
+  });
+}
+
+function buildVisibleFactsFromMediaSummary(summary) {
+  const assets = Array.isArray(summary && summary.assets) ? summary.assets : [];
+  return assets.map(function (asset, index) {
+    const analysis = asset && asset.analysis || {};
+    return {
+      index: index + 1,
+      fileId: asset && asset.file_id || "",
+      subject: analysis.main_subject || analysis.product_type || "",
+      visibleText: analysis.visible_text || "",
+      status: asset && asset.status || "",
+      error: asset && asset.analysis_error || ""
+    };
+  });
 }
 
 function buildMediaFollowupPrompt(intent, summary) {
@@ -8320,6 +8677,115 @@ function cancelReminderByText(reminders, text) {
     reminders: next,
     cancelled: cancelled
   };
+}
+
+function normalizePendingReminderDraft(draft) {
+  if (!draft || typeof draft !== "object") return null;
+  return {
+    action: "create",
+    title: String(draft.title || "").trim(),
+    dueAt: String(draft.dueAt || ""),
+    timezone: String(draft.timezone || "UTC"),
+    context: String(draft.context || "").trim().slice(0, 1000),
+    reminderOffsets: Array.isArray(draft.reminderOffsets) ? draft.reminderOffsets.map(String) : [],
+    recurrence: draft.recurrence || null,
+    confidence: Number(draft.confidence || 0),
+    missingFields: Array.isArray(draft.missingFields) ? draft.missingFields.map(String) : [],
+    hasDate: draft.hasDate === true,
+    hasTime: draft.hasTime === true,
+    updatedAt: String(draft.updatedAt || new Date().toISOString())
+  };
+}
+
+function normalizeUsageReportsState(state) {
+  const clean = state && typeof state === "object" ? state : {};
+  return {
+    lastDailyReportDate: String(clean.lastDailyReportDate || clean.last_daily_report_date || ""),
+    lastReportAt: String(clean.lastReportAt || clean.last_report_at || ""),
+    lastCheckedAt: String(clean.lastCheckedAt || clean.last_checked_at || "")
+  };
+}
+
+function buildPendingReminderDraft(parsed, userTurn) {
+  const draft = normalizePendingReminderDraft(parsed) || {};
+  return Object.assign({}, draft, {
+    context: [draft.context || "", userTurn && userTurn.current_turn_text || ""].filter(Boolean).join("\n").slice(0, 1000),
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function mergeReminderDraft(previousDraft, parsed, userTurn) {
+  const previous = normalizePendingReminderDraft(previousDraft);
+  const current = enrichReminderDateFlags(parsed || {});
+  if (!previous) return current;
+  if (current.action && current.action !== "create") return current;
+
+  const next = Object.assign({}, previous, {
+    timezone: current.timezone || previous.timezone || "UTC",
+    reminderOffsets: current.reminderOffsets && current.reminderOffsets.length ? current.reminderOffsets : previous.reminderOffsets || [],
+    recurrence: current.recurrence || previous.recurrence || null,
+    context: [previous.context, current.context, userTurn && userTurn.current_turn_text || ""].filter(Boolean).join("\n").slice(0, 1000),
+    confidence: Math.max(Number(previous.confidence || 0), Number(current.confidence || 0)),
+    updatedAt: new Date().toISOString()
+  });
+
+  if (current.title && !isGenericReminderTitle(current.title)) next.title = current.title;
+  next.hasDate = Boolean(previous.hasDate || current.hasDate);
+  next.hasTime = Boolean(previous.hasTime || current.hasTime);
+  next.dueAt = mergeReminderDueAt(previous, current);
+  next.missingFields = [];
+  if (!next.hasDate) next.missingFields.push("date");
+  if (!next.hasTime) next.missingFields.push("time");
+  if (!next.title) next.missingFields.push("title");
+  return next;
+}
+
+function enrichReminderDateFlags(parsed) {
+  const clean = Object.assign({}, parsed || {});
+  const missing = Array.isArray(clean.missingFields) ? clean.missingFields : [];
+  clean.hasDate = Boolean(clean.dueAt && !missing.includes("date"));
+  clean.hasTime = Boolean(clean.dueAt && !missing.includes("time"));
+  return clean;
+}
+
+function cleanReminderTitle(title, contextText) {
+  let clean = String(title || "").trim();
+  const context = String(contextText || "");
+  clean = clean
+    .replace(/^\s*(y\s+)?(ahi|ah[ií])\s+me\s+puedes\s+poner\s+un\s+recordatorio\s+(de|para)?\s*/i, "")
+    .replace(/^\s*(ponme|pon|crea|agrega|hazme|hacerme)\s+un\s+recordatorio\s+(de|para)?\s*/i, "")
+    .replace(/\b(y\s+)?(ahi|ah[ií])\s+me\s+puedes\s+poner\s+un\s+recordatorio\s+(de|para)?\s*/ig, " ")
+    .replace(/\b(ponme|pon|crea|agrega|hazme|hacerme)\s+un\s+recordatorio\s+(de|para)?\s*/ig, " ")
+    .replace(/\b(ma[nñ]ana|hoy|pasado ma[nñ]ana)\b/ig, " ")
+    .replace(/\b(a las|a la)\s+\d{1,2}(:\d{2})?\s*(am|pm)?\b/ig, " ")
+    .replace(/\bpara\s*,?\s*\.?$/i, "")
+    .replace(/\s+/g, " ")
+    .replace(/^[,.;:\s]+|[,.;:\s]+$/g, "")
+    .trim();
+
+  if ((!clean || isGenericReminderTitle(clean)) && /\bde eso\b/i.test(context)) return "eso";
+  return clean.slice(0, 180);
+}
+
+function mergeReminderDueAt(previous, current) {
+  const previousDate = previous && previous.dueAt ? new Date(previous.dueAt) : null;
+  const currentDate = current && current.dueAt ? new Date(current.dueAt) : null;
+  const base = current && current.hasDate && currentDate && Number.isFinite(currentDate.getTime())
+    ? new Date(currentDate)
+    : previousDate && Number.isFinite(previousDate.getTime()) ? new Date(previousDate) : currentDate;
+  if (!base || !Number.isFinite(base.getTime())) return "";
+  if (current && current.hasTime && currentDate && Number.isFinite(currentDate.getTime())) {
+    base.setUTCHours(currentDate.getUTCHours(), currentDate.getUTCMinutes(), 0, 0);
+  } else if (previous && previous.hasTime && previousDate && Number.isFinite(previousDate.getTime())) {
+    base.setUTCHours(previousDate.getUTCHours(), previousDate.getUTCMinutes(), 0, 0);
+  }
+  return base.toISOString();
+}
+
+function isGenericReminderTitle(title) {
+  const clean = normalizeTextForIntent(title);
+  if (!clean) return true;
+  return /^(si|ok|listo|dale|para manana|manana|a las \d{1,2}|solo me haces acuerdo.*|me haces acuerdo.*|recuerdame.*|avisame.*)$/.test(clean);
 }
 
 function formatReminderCreatedForWhatsApp(reminder, env) {
@@ -10055,13 +10521,18 @@ function updateCampaignAssetsWithAnalysis(campaignState, analyzedAssets) {
   }));
 
   state.campaign_assets = normalizeCampaignAssets(state.campaign_assets).map(function (asset) {
-    const patch = byId.get(asset.asset_id) || byFileId.get(asset.file_id);
+    const patch = byFileId.get(asset.file_id) || byId.get(asset.asset_id);
     return patch ? Object.assign({}, asset, patch) : asset;
   });
 
   state.media_batch_summary = buildMediaBatchSummary({ assets: state.campaign_assets });
 
   return state;
+}
+
+function buildStableAssetId(value) {
+  const clean = String(value || "").replace(/[^A-Za-z0-9_-]+/g, "_").slice(0, 48);
+  return clean ? "asset_" + clean : "";
 }
 
 function buildMediaBatchSummary(mediaBatch) {
@@ -10324,6 +10795,14 @@ function parseMaybeJson(text) {
   }
 }
 
+function parseBooleanLike(value, fallback) {
+  if (value === true || value === false) return value;
+  const clean = String(value || "").trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(clean)) return true;
+  if (["false", "0", "no", "off"].includes(clean)) return false;
+  return fallback;
+}
+
 function jsonResponse(data, status) {
   return new Response(JSON.stringify(data, null, 2), {
     status: status || 200,
@@ -10333,11 +10812,188 @@ function jsonResponse(data, status) {
   });
 }
 
+const GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send";
+const GOOGLE_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
+
+function handleGoogleOAuthStart(request, env) {
+  const config = getGoogleOAuthConfig(env);
+  const missing = getMissingGoogleOAuthVars(config, false);
+  if (missing.length) {
+    return googleOAuthErrorResponse("missing_env_vars", "Missing Google OAuth environment variables.", 500, {
+      missing: missing
+    });
+  }
+
+  const state = buildGoogleOAuthState(request);
+  const authUrl = new URL(GOOGLE_OAUTH_AUTH_URL);
+  authUrl.searchParams.set("client_id", config.clientId);
+  authUrl.searchParams.set("redirect_uri", config.redirectUri);
+  authUrl.searchParams.set("response_type", "code");
+  authUrl.searchParams.set("scope", GOOGLE_GMAIL_SEND_SCOPE);
+  authUrl.searchParams.set("access_type", "offline");
+  authUrl.searchParams.set("prompt", "consent");
+  authUrl.searchParams.set("include_granted_scopes", "true");
+  authUrl.searchParams.set("state", state);
+
+  return Response.redirect(authUrl.toString(), 302);
+}
+
+async function handleGoogleOAuthCallback(request, env) {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const oauthError = url.searchParams.get("error");
+
+  if (oauthError) {
+    return googleOAuthErrorResponse("google_oauth_error", "Google returned an OAuth error.", 400, {
+      error: oauthError,
+      errorDescription: url.searchParams.get("error_description") || ""
+    });
+  }
+
+  if (!code) {
+    return googleOAuthErrorResponse("missing_code", "Missing OAuth code in callback.", 400);
+  }
+
+  const config = getGoogleOAuthConfig(env);
+  const missing = getMissingGoogleOAuthVars(config, true);
+  if (missing.length) {
+    return googleOAuthErrorResponse("missing_env_vars", "Missing Google OAuth environment variables.", 500, {
+      missing: missing
+    });
+  }
+
+  const tokenResponse = await exchangeGoogleOAuthCode(code, config);
+  if (!tokenResponse.ok) {
+    return googleOAuthErrorResponse(tokenResponse.errorCode, tokenResponse.message, tokenResponse.status, tokenResponse.details);
+  }
+
+  const tokens = tokenResponse.tokens || {};
+  const refreshToken = String(tokens.refresh_token || "");
+  const isDev = isLocalGoogleOAuthRequest(request, env);
+  const result = {
+    status: "ok",
+    provider: "google",
+    redirectUriUsed: config.redirectUri,
+    redirectUriMatchesEnv: true,
+    hasRefreshToken: Boolean(refreshToken),
+    tokenType: tokens.token_type || "",
+    expiresIn: tokens.expires_in || null,
+    scope: tokens.scope || GOOGLE_GMAIL_SEND_SCOPE,
+    refreshTokenDelivery: refreshToken
+      ? isDev ? "included_for_local_development_only" : "store_as_GOOGLE_REFRESH_TOKEN_secret"
+      : "not_returned_by_google_try_prompt_consent_again"
+  };
+
+  if (refreshToken && isDev) {
+    result.refreshToken = refreshToken;
+  }
+
+  return jsonResponse(result);
+}
+
+function getGoogleOAuthConfig(env) {
+  return {
+    clientId: String(env && (env.GOOGLE_CLIENT_ID || env.GOOGLE_OAUTH_CLIENT_ID) || "").trim(),
+    clientSecret: String(env && (env.GOOGLE_CLIENT_SECRET || env.GOOGLE_OAUTH_CLIENT_SECRET) || "").trim(),
+    redirectUri: String(env && (env.GOOGLE_REDIRECT_URI || env.GOOGLE_OAUTH_REDIRECT_URI) || "").trim()
+  };
+}
+
+function getMissingGoogleOAuthVars(config, includeSecret) {
+  const missing = [];
+  if (!config.clientId) missing.push("GOOGLE_CLIENT_ID");
+  if (includeSecret && !config.clientSecret) missing.push("GOOGLE_CLIENT_SECRET");
+  if (!config.redirectUri) missing.push("GOOGLE_REDIRECT_URI");
+  return missing;
+}
+
+function buildGoogleOAuthState(request) {
+  const url = new URL(request.url);
+  return JSON.stringify({
+    host: url.host,
+    ts: Date.now()
+  });
+}
+
+async function exchangeGoogleOAuthCode(code, config) {
+  const body = new URLSearchParams();
+  body.set("code", code);
+  body.set("client_id", config.clientId);
+  body.set("client_secret", config.clientSecret);
+  body.set("redirect_uri", config.redirectUri);
+  body.set("grant_type", "authorization_code");
+
+  let res;
+  try {
+    res = await fetch(GOOGLE_OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: body.toString()
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      status: 502,
+      errorCode: "token_exchange_failed",
+      message: "Google token exchange request failed.",
+      details: { error: summarizeErrorForLog(error) }
+    };
+  }
+
+  const responseText = await res.text();
+  const parsed = parseMaybeJson(responseText);
+  if (!res.ok) {
+    const googleError = String(parsed && parsed.error || "");
+    return {
+      ok: false,
+      status: res.status,
+      errorCode: googleError === "invalid_grant" ? "invalid_grant" : googleError === "redirect_uri_mismatch" ? "redirect_uri_mismatch" : "token_exchange_failed",
+      message: buildGoogleTokenExchangeErrorMessage(googleError),
+      details: {
+        googleError: googleError || "unknown",
+        googleErrorDescription: summarizeTextForLog(parsed && parsed.error_description || responseText)
+      }
+    };
+  }
+
+  return {
+    ok: true,
+    status: res.status,
+    tokens: parsed && typeof parsed === "object" ? parsed : {}
+  };
+}
+
+function buildGoogleTokenExchangeErrorMessage(errorCode) {
+  if (errorCode === "invalid_grant") return "Google rejected the authorization code. It may be expired, reused, or tied to a different redirect URI.";
+  if (errorCode === "redirect_uri_mismatch") return "The redirect_uri sent to Google does not match the OAuth Client configuration.";
+  return "Google token exchange failed.";
+}
+
+function googleOAuthErrorResponse(code, message, status, details) {
+  return jsonResponse({
+    status: "error",
+    code: code,
+    message: message,
+    details: details || {}
+  }, status || 400);
+}
+
+function isLocalGoogleOAuthRequest(request, env) {
+  const url = new URL(request.url);
+  const host = url.hostname.toLowerCase();
+  const mode = String(env && (env.ENVIRONMENT || env.NODE_ENV || env.BUILD_LABEL) || "").toLowerCase();
+  return host === "localhost" || host === "127.0.0.1" || mode === "development" || mode === "local" || mode === "local-dev";
+}
+
 function buildVersionDiagnostic(env) {
   const now = new Date().toISOString();
   const flags = getCoreFeatureFlags(env || {});
   const remindersMode = String(flags.remindersDeliveryMode || "mock");
   const interactiveMode = String(flags.interactiveDeliveryMode || "safe");
+  const reminderTemplateConfigured = Boolean(env && env.REMINDER_TEMPLATE_NAME);
 
   return {
     version: "whatsapp-ai-agent-core-v3",
@@ -10362,11 +11018,14 @@ function buildVersionDiagnostic(env) {
     ENABLE_CUSTOMER_MEMORY: String(flags.enableCustomerMemory),
     CORE_UTILITIES_SANDBOX: String(flags.coreUtilitiesSandbox),
     REMINDERS_DELIVERY_MODE: remindersMode,
-    REMINDER_TEMPLATE_CONFIGURED: String(Boolean(env && env.REMINDER_TEMPLATE_NAME)),
+    DAILY_USAGE_REPORT_ENABLED: String(isDailyUsageReportEnabled(env || {})),
+    DAILY_USAGE_REPORT_HOUR: String(getDailyUsageReportHour(env || {})),
+    REMINDER_TEMPLATE_CONFIGURED: String(reminderTemplateConfigured),
+    REMINDER_TEMPLATE_STATUS: getReminderTemplateStatus(remindersMode, reminderTemplateConfigured),
     INTERACTIVE_DELIVERY_MODE: interactiveMode,
     MEMORY_RETENTION_MODE: String(flags.memoryRetentionMode || "summarized"),
     LOG_CAPTURE_MODE: String(flags.logCaptureMode || "console_and_file"),
-    REMINDERS_STATUS: remindersMode === "alarm" ? "production_alarm_requires_worker_alarm" : remindersMode === "cron" ? "production_cron_requires_scheduler" : remindersMode === "disabled" ? "disabled" : "mock_safe_no_real_delivery",
+    REMINDERS_STATUS: remindersMode === "alarm" ? "production_alarm_enabled" : remindersMode === "cron" ? "production_cron_requires_scheduler" : remindersMode === "disabled" ? "disabled" : "mock_safe_no_real_delivery",
     INTERACTIVE_STATUS: interactiveMode === "safe" ? "safe_with_text_fallback" : interactiveMode,
     MEMORY_STATUS: flags.memoryRetentionMode === "summarized" ? "summarized_no_raw_history" : String(flags.memoryRetentionMode || ""),
     LOGS_STATUS: flags.logCaptureMode === "console_and_file" ? "console_plus_local_wrapper" : String(flags.logCaptureMode || ""),
@@ -10401,7 +11060,10 @@ function formatVersionDiagnosticForWhatsApp(diagnostic) {
     "ENABLE_CUSTOMER_MEMORY: " + (data.ENABLE_CUSTOMER_MEMORY || ""),
     "CORE_UTILITIES_SANDBOX: " + (data.CORE_UTILITIES_SANDBOX || ""),
     "REMINDERS_DELIVERY_MODE: " + (data.REMINDERS_DELIVERY_MODE || ""),
+    "DAILY_USAGE_REPORT_ENABLED: " + (data.DAILY_USAGE_REPORT_ENABLED || ""),
+    "DAILY_USAGE_REPORT_HOUR: " + (data.DAILY_USAGE_REPORT_HOUR || ""),
     "REMINDER_TEMPLATE_CONFIGURED: " + (data.REMINDER_TEMPLATE_CONFIGURED || ""),
+    "REMINDER_TEMPLATE_STATUS: " + (data.REMINDER_TEMPLATE_STATUS || ""),
     "REMINDERS_STATUS: " + (data.REMINDERS_STATUS || ""),
     "INTERACTIVE_DELIVERY_MODE: " + (data.INTERACTIVE_DELIVERY_MODE || ""),
     "INTERACTIVE_STATUS: " + (data.INTERACTIVE_STATUS || ""),
@@ -10411,6 +11073,11 @@ function formatVersionDiagnosticForWhatsApp(diagnostic) {
     "LOGS_STATUS: " + (data.LOGS_STATUS || ""),
     "timestamp: " + (data.timestamp || "")
   ].join("\n");
+}
+
+function getReminderTemplateStatus(remindersMode, templateConfigured) {
+  if (remindersMode !== "alarm") return "not_required_for_current_mode";
+  return templateConfigured ? "outside_24h_ready" : "outside_24h_blocked_template_missing";
 }
 
 function normalizeActiveTask(task) {
@@ -10528,6 +11195,22 @@ function buildTaskIntakeDecision(activeTask, options) {
     reason: hasMedia ? "awaiting_silence" : "awaiting_media",
     nextProcessAt: hasMedia ? Math.min(silenceAt, maxWaitUntil) : Math.min(waitUntil, maxWaitUntil)
   };
+}
+
+function buildTaskExpiredNoMediaMessage(activeTask) {
+  const task = normalizeActiveTask(activeTask);
+  const type = task && task.type || "";
+
+  if (type === "price_review") {
+    return "Pasame las imagenes o capturas y te ayudo a revisar los precios.";
+  }
+  if (type === "image_generation") {
+    return "Pasame la imagen o informacion base y te preparo el diseno.";
+  }
+  if (type === "document_review") {
+    return "Pasame las imagenes o archivos y te ayudo a revisarlos.";
+  }
+  return "Pasame las imagenes o la informacion base y te ayudo a revisarlas.";
 }
 
 function handleUserClaimedMoreImages(text, campaignState, messages) {

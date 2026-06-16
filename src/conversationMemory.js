@@ -1,7 +1,8 @@
 import { redactForLog } from "./logger.js";
 
-const MAX_CONVERSATION_LOG = 30;
+const MAX_CONVERSATION_LOG = 20;
 const MAX_KEYWORDS = 12;
+const MAX_IMPORTANT_FACTS = 20;
 
 export function getCoreFeatureFlags(env) {
   return {
@@ -34,21 +35,22 @@ export function updateConversationMemory(data, userTurn, options) {
   }
 
   next.conversationSummary = buildConversationSummary(
-    flags.saveConversationLogs ? next.conversationLog : previousLog.concat([safeTurn]).slice(-6)
+    flags.saveConversationLogs ? next.conversationLog : previousLog.concat([safeTurn]).slice(-MAX_CONVERSATION_LOG)
   );
   next.utilityMemory = buildUtilityMemory(options && options.utilityState || next.coreUtilityState || {});
 
   if (flags.enableUserStyleProfile) {
     next.userStyleProfile = buildUserStyleProfile(
-      flags.saveConversationLogs ? next.conversationLog : previousLog.concat([safeTurn]).slice(-6),
+      flags.saveConversationLogs ? next.conversationLog : previousLog.concat([safeTurn]).slice(-MAX_CONVERSATION_LOG),
       next.userStyleProfile
     );
   }
 
   if (flags.enableCustomerMemory) {
     next.customerMemory = buildCustomerMemory(
-      flags.saveConversationLogs ? next.conversationLog : previousLog.concat([safeTurn]).slice(-6),
-      next.customerMemory
+      flags.saveConversationLogs ? next.conversationLog : previousLog.concat([safeTurn]).slice(-MAX_CONVERSATION_LOG),
+      next.customerMemory,
+      userTurn
     );
   }
 
@@ -87,7 +89,7 @@ export function buildConversationLogEntry(userTurn) {
 
 export function buildConversationSummary(conversationLog) {
   const turns = Array.isArray(conversationLog) ? conversationLog : [];
-  const recent = turns.slice(-6);
+  const recent = turns.slice(-MAX_CONVERSATION_LOG);
   const keywords = extractKeywords(recent.map(function (turn) {
     return turn.textPreview || "";
   }).join(" "));
@@ -135,13 +137,15 @@ export function buildUserStyleProfile(conversationLog, previousProfile) {
   };
 }
 
-export function buildCustomerMemory(conversationLog, previousMemory) {
+export function buildCustomerMemory(conversationLog, previousMemory, userTurn) {
   const turns = Array.isArray(conversationLog) ? conversationLog : [];
   const text = turns.map(function (turn) { return turn.textPreview || ""; }).join(" ");
   const keywords = extractKeywords(text);
   const previous = previousMemory && typeof previousMemory === "object" ? previousMemory : {};
   const name = extractUserName(text) || previous.name || "";
   const responsePreference = extractResponsePreference(text) || previous.response_preference || "";
+  const importantFacts = mergeImportantFacts(previous.important_facts || previous.importantFacts || [], extractImportantFactsFromTurn(userTurn));
+  const lastAudioSummary = extractLatestAudioSummary(turns) || previous.last_audio_summary || "";
 
   return {
     name: name,
@@ -156,10 +160,160 @@ export function buildCustomerMemory(conversationLog, previousMemory) {
       return !["hazme", "quiero", "necesito", "para", "con"].includes(word);
     }).slice(0, MAX_KEYWORDS),
     preferences: previous.preferences || {},
+    important_facts: importantFacts,
+    compact_data_memory: importantFacts.map(function (fact) {
+      return fact.label + ": " + fact.value;
+    }).slice(-MAX_IMPORTANT_FACTS),
+    last_audio_summary: lastAudioSummary,
     open_questions: inferOpenQuestions(text),
-    source: "safe_optional_memory_v1",
+    source: "safe_optional_memory_v2",
     updated_at: new Date().toISOString()
   };
+}
+
+function extractLatestAudioSummary(turns) {
+  const entries = Array.isArray(turns) ? turns.slice().reverse() : [];
+  for (const turn of entries) {
+    const transcripts = Array.isArray(turn && turn.audioTranscripts) ? turn.audioTranscripts : [];
+    const text = transcripts.map(String).join(" ").replace(/\s+/g, " ").trim();
+    if (text) return summarizeAudioForMemory(text);
+  }
+  return "";
+}
+
+function summarizeAudioForMemory(text) {
+  const clean = sanitizeFactText(text);
+  const action = clean.match(/\b(llamar|comprar|pagar|hacer|enviar|revisar|mandar|escribir|actualizar)\b[^.?!]{0,180}/i);
+  const reminder = clean.match(/\b(recordatorio|recuerdame|hazme acuerdo|avisame)\b[^.?!]{0,220}/i);
+  const picked = action && action[0] || reminder && reminder[0] || clean;
+  return picked.replace(/\s+/g, " ").slice(0, 240);
+}
+
+export function extractImportantFactsFromTurn(userTurn) {
+  const turn = userTurn || {};
+  const sources = [];
+  if (turn.current_turn_text) sources.push({ source: "text", text: turn.current_turn_text });
+  for (const transcript of turn.audio_transcripts || []) {
+    if (transcript) sources.push({ source: "audio", text: transcript });
+  }
+  for (const caption of turn.captions || []) {
+    if (caption) sources.push({ source: "image_caption", text: caption });
+  }
+  const facts = [];
+  for (const item of sources) {
+    facts.push.apply(facts, extractImportantFactsFromText(item.text, {
+      source: item.source,
+      turnId: turn.turn_id || "",
+      traceId: turn.trace_id || ""
+    }));
+  }
+  return facts;
+}
+
+function mergeImportantFacts(previousFacts, newFacts) {
+  const merged = [];
+  const seen = new Set();
+  const source = []
+    .concat(Array.isArray(previousFacts) ? previousFacts : [])
+    .concat(Array.isArray(newFacts) ? newFacts : []);
+
+  for (const raw of source) {
+    const fact = normalizeImportantFact(raw);
+    if (!fact) continue;
+    const key = fact.label.toLowerCase() + ":" + fact.value.toLowerCase();
+    if (seen.has(key)) {
+      const existing = merged.find(function (item) {
+        return item.label.toLowerCase() + ":" + item.value.toLowerCase() === key;
+      });
+      if (existing) existing.updated_at = fact.updated_at;
+      continue;
+    }
+    seen.add(key);
+    merged.push(fact);
+  }
+
+  return merged.slice(-MAX_IMPORTANT_FACTS);
+}
+
+function normalizeImportantFact(raw) {
+  const label = String(raw && (raw.label || raw.type) || "").trim();
+  const value = sanitizeFactText(raw && raw.value || "").trim();
+  if (!label || !value) return null;
+  return {
+    label: label.slice(0, 60),
+    value: value.slice(0, 240),
+    source: String(raw.source || "text").slice(0, 40),
+    turn_id: String(raw.turn_id || raw.turnId || "").slice(0, 80),
+    trace_id: String(raw.trace_id || raw.traceId || "").slice(0, 80),
+    updated_at: String(raw.updated_at || raw.updatedAt || new Date().toISOString())
+  };
+}
+
+function extractImportantFactsFromText(text, meta) {
+  const raw = String(text || "");
+  const clean = sanitizeFactText(raw);
+  const facts = [];
+  const lower = normalizeForFactMatch(clean);
+  const base = {
+    source: meta && meta.source || "text",
+    turn_id: meta && meta.turnId || "",
+    trace_id: meta && meta.traceId || "",
+    updated_at: new Date().toISOString()
+  };
+
+  addMatches(facts, clean, /\b(?:cedula|c[eé]dula|dni|documento)\s*(?:numero|n[uú]mero|#|:)?\s*([0-9][0-9.\-\s]{5,18}[0-9])\b/gi, "cedula", base);
+  addMatches(facts, clean, /\b([0-9]{8,13})\b/g, "numero_identificacion", base);
+  addMatches(facts, clean, /([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/gi, "email", base);
+  addMatches(facts, clean, /\b(?:edad|tiene)\s*(?:de\s*)?(\d{1,3})\s*a[nñ]os\b/gi, "edad", base);
+  addMatches(facts, clean, /\b(\d{1,3})\s*a[nñ]os\b/gi, "edad", base);
+  addMatches(facts, clean, /\b(?:plan|paquete)\s*(?:de\s*)?(\$?\s*\d+(?:[.,]\d{1,2})?\s*(?:d[oó]lares|usd)?)\b/gi, "plan", base);
+  addMatches(facts, clean, /\b(?:se llama|cliente|datos de|los de)\s+([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+(?:\s+[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+){1,3})\b/g, "nombre_cliente", base);
+
+  const platforms = ["google maps", "instagram", "facebook", "whatsapp", "tiktok", "messenger"];
+  const foundPlatforms = platforms.filter(function (platform) { return lower.includes(platform); });
+  if (foundPlatforms.length) {
+    facts.push(Object.assign({}, base, {
+      label: "canales_o_plataformas",
+      value: foundPlatforms.join(", ")
+    }));
+  }
+
+  if (/\b(actualizar|guardar|verificar|datos|cliente|lista)\b/i.test(clean) && clean.length >= 12) {
+    facts.push(Object.assign({}, base, {
+      label: "nota_contexto",
+      value: clean.replace(/\s+/g, " ").slice(0, 240)
+    }));
+  }
+
+  return facts;
+}
+
+function addMatches(facts, text, pattern, label, base) {
+  let match;
+  while ((match = pattern.exec(text))) {
+    const value = sanitizeFactText(match[1] || "").trim();
+    if (!value) continue;
+    facts.push(Object.assign({}, base, {
+      label: label,
+      value: value
+    }));
+  }
+}
+
+function sanitizeFactText(text) {
+  return String(text || "")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/\b(sk-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9-]{12,})\b/g, "[SECRET_REDACTED]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 1000);
+}
+
+function normalizeForFactMatch(text) {
+  return String(text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
 }
 
 export function buildUtilityMemory(utilityState) {

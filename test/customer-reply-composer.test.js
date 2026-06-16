@@ -25,9 +25,12 @@ test("Customer Reply Composer humanizes without inventing", () => {
 
 test("Customer reply model JSON output is parsed as visible text", () => {
   const parsed = parseCustomerReplyModelOutput('{"text":"Claro, reviso las imagenes.","shouldSend":true}');
+  const whatsappLeak = parseCustomerReplyModelOutput('{"text":"Listo, te lo recuerdo en 20 minutos para llamar al cliente.","shouldSend":true}');
 
   assert.equal(parsed.text, "Claro, reviso las imagenes.");
   assert.equal(parsed.shouldSend, true);
+  assert.equal(whatsappLeak.text, "Listo, te lo recuerdo en 20 minutos para llamar al cliente.");
+  assert.equal(whatsappLeak.shouldSend, true);
 });
 
 test("Customer Reply Composer asks useful clarification only when image has no intent", () => {
@@ -78,6 +81,42 @@ test("Customer Reply Composer handles multiple image clarification as a batch", 
   assert.match(reply.text, /compare|texto visible|detalle/i);
 });
 
+test("Customer Reply Composer preserves multi-image evidence instead of generic clarification", () => {
+  const reply = composeCustomerReply({
+    userTurn: { turn_id: "turn_imgs", image_count: 3, combinedUserText: "esas son" },
+    intent: "image_ocr",
+    systemResult: { text: "Claro, te ayudo con eso. Puedo analizarla, extraer el texto o compararla con otra imagen. ¿Qué necesitas exactamente?" },
+    visibleFacts: [
+      { visibleText: "Texto de la primera captura" },
+      { visibleText: "Texto de la segunda captura" },
+      { visibleText: "Texto de la tercera captura" }
+    ]
+  }, {});
+
+  assert.match(reply.text, /Imagen 1/i);
+  assert.match(reply.text, /Imagen 2/i);
+  assert.match(reply.text, /Imagen 3/i);
+  assert.doesNotMatch(reply.text, /Qué necesitas exactamente|que necesitas exactamente/i);
+});
+
+test("Customer Reply Composer replaces singular batch summary with per-image evidence", () => {
+  const reply = composeCustomerReply({
+    userTurn: { turn_id: "turn_imgs_singular", image_count: 3, combinedUserText: "" },
+    intent: "image_question",
+    systemResult: { text: "Veo una captura de una conversacion de WhatsApp y te puedo ayudar con esa imagen." },
+    visibleFacts: [
+      { visibleText: "Primera captura con CRM" },
+      { visibleText: "Segunda captura con anuncio" },
+      { visibleText: "Tercera captura con chat" }
+    ]
+  }, {});
+
+  assert.match(reply.text, /Imagen 1/i);
+  assert.match(reply.text, /Imagen 2/i);
+  assert.match(reply.text, /Imagen 3/i);
+  assert.doesNotMatch(reply.text, /Veo una captura/i);
+});
+
 test("Customer Reply Composer preserves OCR text that looks like assistant stance", () => {
   const reply = composeCustomerReply({
     userTurn: {
@@ -99,6 +138,7 @@ test("Customer Reply Composer preserves OCR text that looks like assistant stanc
 test("CUSTOMER_REPLY_MODEL prefers gpt-4.1-mini and falls back to configured mini", () => {
   assert.equal(getCustomerReplyModel({}), "gpt-4.1-mini");
   assert.equal(getCustomerReplyModel({ CUSTOMER_REPLY_MODEL: "bad-model", FINAL_RESPONSE_MODEL: "gpt-5.4-mini" }), "gpt-5.4-mini");
+  assert.equal(getCustomerReplyModel({ CUSTOMER_REPLY_MODEL: "gpt-5.4" }), "gpt-5.4");
 });
 
 test("Customer Reply Composer blocks secret-like output", () => {

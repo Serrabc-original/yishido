@@ -21,14 +21,31 @@ Woztell webhook
 
 | Purpose | Config | Default |
 | --- | --- | --- |
-| Orchestrator | `ORCHESTRATOR_MODEL` | `gpt-5.4-mini` |
-| Supervisor config | `SUPERVISOR_MODEL` | `gpt-5.4-mini` |
+| Orchestrator | `ORCHESTRATOR_MODEL` | `gpt-5.4` |
+| Supervisor config | `SUPERVISOR_MODEL` | `gpt-5.4` |
 | Vision | `VISION_MODEL` | `gpt-5.4-mini` |
 | Final customer reply | `CUSTOMER_REPLY_MODEL` | `gpt-5.4-mini` |
 | Image generation | `OPENAI_IMAGE_MODEL` | `gpt-image-2` |
 | Audio transcription | `AUDIO_TRANSCRIPTION_MODEL` | `whisper-1` |
 
 Claude/Anthropic compatibility code exists, but production config uses OpenAI as the active orchestrator and has no fallback provider enabled.
+
+## Agent Reliability Pattern
+
+The assistant should behave like an agent, but the reliable base is not a larger prompt alone. The Worker owns orchestration, state, approvals, queues, and tool execution. Models classify, reason over compact context, and compose customer-facing language.
+
+Core principles:
+
+- UserTurn is the atomic input sent to the supervisor/orchestrator.
+- Keep `campaign_assets` as the source of truth for uploaded media batches.
+- Keep memory compact: conversation summary, utility state, customer memory, and recent turn window. Do not send full raw history when compact state is enough.
+- Treat text/audio as the user's intent and images as evidence unless the user only sends images.
+- Use deterministic utility modules for reminders, lists, reset, debug, media clearing, and other actions that should not depend on free-form model behavior.
+- Resolve short follow-ups through compact state first. For example, reminder continuations can use `pendingReminderDraft` plus `customerMemory.last_audio_summary` for phrases like "lo que te dije en el audio".
+- Use structured JSON contracts at model boundaries and repair/guard outputs before sending WhatsApp text.
+- Add regression tests for each real chat failure before touching critical logic.
+
+This follows the production shape recommended by OpenAI's agent guidance: explicit state, tool/action contracts, structured outputs, and evaluations around the behaviors that matter.
 
 ## Orchestrator Contract
 

@@ -35,17 +35,18 @@ function imageMessage(fileId, messageId) {
   });
 }
 
-function planTurn(messages, campaignState, recentConversationWindow, activeContext, turnId) {
+function planTurn(messages, campaignState, recentConversationWindow, activeContext, turnId, activeTask) {
   const turn = buildUserTurn(messages, campaignState || {}, { turnId: turnId || "turn_flow" });
   const plan = createConversationSupervisorPlan({
     currentTurn: turn,
     recentConversationWindow: recentConversationWindow || [],
-    activeContext: activeContext || {}
+    activeContext: activeContext || {},
+    activeTask: activeTask || null
   });
   return { turn, plan };
 }
 
-test("price request followed by three images is treated as one comparison flow", () => {
+test("active price request followed by three images is treated as one comparison flow", () => {
   const recent = [{ turnId: "turn_text", type: "text", summary: "Puedes revisar estos precios?", mediaRefs: {} }];
   const campaignState = {
     campaign_assets: [
@@ -58,7 +59,11 @@ test("price request followed by three images is treated as one comparison flow",
     imageMessage("img_1"),
     imageMessage("img_2"),
     imageMessage("img_3")
-  ], campaignState, recent, { activeIntent: "price_review" }, "turn_imgs");
+  ], campaignState, recent, { activeIntent: "price_review" }, "turn_imgs", {
+    type: "price_review",
+    status: "awaiting_media",
+    expectedInputs: "images"
+  });
 
   assert.equal(plan.intent, "multi_image_price_review");
   assert.equal(plan.mediaScope, "all_pending_batch");

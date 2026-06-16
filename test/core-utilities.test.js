@@ -92,6 +92,31 @@ test("reminder parser handles tomorrow, offsets, missing date and missing time",
   assert.equal(missingTime.missingFields.includes("time"), true);
 });
 
+test("reminder parser handles relative audio wording with dentro de and min", () => {
+  const now = "2026-06-15T23:42:48.000Z";
+  const audio = parseReminderRequest("Ya, gracias. Me puedes poner otro recordatorio? Dentro de 5 minutos vi que tengo que llamar un cliente.", "America/Bogota", { now });
+  const short = parseReminderRequest("En 5 min llamar al cliente", "America/Bogota", { now });
+
+  assert.equal(audio.missingFields.length, 0);
+  assert.equal(audio.title, "llamar un cliente");
+  assert.match(audio.dueAt, /^2026-06-15T23:47:48/);
+  assert.equal(short.missingFields.length, 0);
+  assert.match(short.dueAt, /^2026-06-15T23:47:48/);
+});
+
+test("reminder parser handles spoken corrections and afternoon time", () => {
+  const now = "2026-06-15T23:55:47.000Z";
+  const corrected = parseReminderRequest("Ay, perdon, me puedes poner otro recordatorio en dos minutos? No, que digo? En cinco minutos mejor? Para yo poder enviar un mensaje a un lead, por favor. Entonces, necesito ese recordatorio.", "America/Bogota", { now });
+  const shopping = parseReminderRequest("Me puedes ayudar a acordarme de una lista que tengo que comprar manana en el supermaximo. Esta lista necesito que sean huevos, pan, leche, aceitunas, comida para gato y otros. Hazme acuerdo para manana a las 5 de la tarde.", "America/Bogota", { now });
+
+  assert.equal(corrected.missingFields.length, 0);
+  assert.equal(corrected.title, "enviar un mensaje a un lead");
+  assert.match(corrected.dueAt, /^2026-06-16T00:00:47/);
+  assert.equal(shopping.missingFields.length, 0);
+  assert.match(shopping.title, /^comprar huevos, pan, leche/);
+  assert.match(shopping.dueAt, /^2026-06-16T22:00:00/);
+});
+
 test("reminder parser handles list and cancel actions", () => {
   const list = parseReminderRequest("Muestrame mis recordatorios", "America/Bogota", {
     now: "2026-06-12T12:00:00.000Z"
@@ -104,6 +129,26 @@ test("reminder parser handles list and cancel actions", () => {
   assert.equal(list.missingFields.length, 0);
   assert.equal(cancel.action, "cancel");
   assert.equal(cancel.title, "comprar leche");
+});
+
+test("router treats short reminder follow-up as reminder when a draft is pending", () => {
+  const route = routeCoreUtilityIntent({ current_turn_text: "A las 10 am" }, {
+    timezone: "America/Bogota",
+    now: "2026-06-15T05:00:00.000Z",
+    flags: { enableReminders: true },
+    pendingReminderDraft: {
+      title: "",
+      dueAt: "2026-06-16T05:00:00.000Z",
+      hasDate: true,
+      hasTime: false,
+      missingFields: ["time", "title"]
+    }
+  });
+
+  assert.equal(route.intent, "reminder");
+  assert.equal(route.shouldHandleInCore, true);
+  assert.equal(route.parsed.missingFields.includes("date"), true);
+  assert.equal(route.parsed.missingFields.includes("time"), false);
 });
 
 test("reminder memory store creates and lists mock reminders", async () => {
@@ -280,6 +325,40 @@ test("router separates list and short relative reminder from audio text", () => 
   assert.equal(reminder.parsed.title, "comprar leche");
   assert.equal(reminder.parsed.missingFields.length, 0);
   assert.match(reminder.parsed.dueAt, /^2026-06-13T12:04:00/);
+});
+
+test("router treats dentro de and min relative reminder wording as complete", () => {
+  const dentro = routeCoreUtilityIntent({
+    current_turn_text: "[Audio transcrito]: Me puedes poner un recordatorio dentro de 20 minutos para llamar a un cliente",
+    audio_count: 1
+  }, {
+    flags: { enableLists: true, enableReminders: true },
+    now: "2026-06-15T23:40:00.000Z",
+    timezone: "America/Bogota"
+  });
+  const short = routeCoreUtilityIntent({
+    current_turn_text: "En 5 min",
+    audio_count: 0
+  }, {
+    flags: { enableReminders: true },
+    pendingReminderDraft: {
+      title: "llamar a un cliente",
+      dueAt: "",
+      hasDate: false,
+      hasTime: false,
+      missingFields: ["date", "time"]
+    },
+    now: "2026-06-15T23:40:00.000Z",
+    timezone: "America/Bogota"
+  });
+
+  assert.equal(dentro.intent, "reminder");
+  assert.equal(dentro.parsed.missingFields.length, 0);
+  assert.equal(dentro.parsed.title, "llamar a un cliente");
+  assert.match(dentro.parsed.dueAt, /^2026-06-16T00:00:00/);
+  assert.equal(short.intent, "reminder");
+  assert.deepEqual(short.parsed.missingFields, ["title"]);
+  assert.match(short.parsed.dueAt, /^2026-06-15T23:45:00/);
 });
 
 test("image question response answers the caption instead of only listing visible fields", () => {

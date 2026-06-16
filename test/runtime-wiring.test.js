@@ -20,6 +20,21 @@ function createMemoryState() {
   };
 }
 
+function createMemoryKV(initial) {
+  const storage = new Map(Object.entries(initial || {}));
+  return {
+    async get(key) {
+      return storage.get(key) || null;
+    },
+    async put(key, value) {
+      storage.set(key, value);
+    },
+    dump() {
+      return Object.fromEntries(storage.entries());
+    }
+  };
+}
+
 function basePayload(type, data) {
   return {
     app: "app_runtime",
@@ -455,6 +470,10 @@ test("three images across different turnIds plus listo use recent media fallback
     assert.equal(saved.campaignState.active_turn.counts.image, 3);
     assert.deepEqual(saved.campaignState.active_turn.images.map((image) => image.fileId).sort(), ["img_a", "img_b", "img_c"]);
     assert.deepEqual(captures.visionUrls.sort(), ["https://cdn.test/img_a.jpg", "https://cdn.test/img_b.jpg", "https://cdn.test/img_c.jpg"]);
+    const byFileId = new Map(saved.campaignState.campaign_assets.map((asset) => [asset.file_id, asset]));
+    assert.equal(byFileId.get("img_a").analysis.visible_text, "A");
+    assert.equal(byFileId.get("img_b").analysis.visible_text, "B");
+    assert.equal(byFileId.get("img_c").analysis.visible_text, "C");
   } finally {
     globalThis.fetch = originalFetch;
     clock.restore();
@@ -525,7 +544,49 @@ test("affirmative follow-up reuses recent image batch after visual offer", async
 
     assert.equal(saved.campaignState.active_turn.counts.image, 2);
     assert.deepEqual(captures.visionUrls.sort(), ["https://cdn.test/img_a.jpg", "https://cdn.test/img_b.jpg"]);
+    const byFileId = new Map(saved.campaignState.campaign_assets.map((asset) => [asset.file_id, asset]));
+    assert.equal(byFileId.get("img_a").analysis.visible_text, "A");
+    assert.equal(byFileId.get("img_b").analysis.visible_text, "B");
     assert.doesNotMatch(captures.sentTexts.join("\n"), /que quieres|qué quieres/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("image design request with recent media enqueues uploaded image edit without reasking", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [], imageJobs: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781471680000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const runtimeEnv = Object.assign(env(), {
+    IMAGE_QUEUE: {
+      async send(job) {
+        captures.imageJobs.push(job);
+      }
+    }
+  });
+  const coordinator = new ConversationCoordinator(state, runtimeEnv);
+
+  try {
+    await coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_design_img", "")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    captures.sentTexts.length = 0;
+    captures.visionUrls.length = 0;
+    captures.orchestratorRequests.length = 0;
+    await coordinator.fetch(localMessageRequest(textMessage("Diseñame una imagen bonita con esta foto", "msg_design_text")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    assert.deepEqual(captures.visionUrls, ["https://cdn.test/img_a.jpg"]);
+    assert.equal(captures.orchestratorRequests.length, 0);
+    assert.equal(captures.imageJobs.length, 1);
+    assert.equal(captures.imageJobs[0].type, "edit_image");
+    assert.equal(captures.imageJobs[0].source, "uploaded_image");
+    assert.doesNotMatch(captures.sentTexts.join("\n"), /reenv[ií]a|no veo|qu[eé] quieres/i);
   } finally {
     globalThis.fetch = originalFetch;
     clock.restore();
@@ -858,6 +919,178 @@ test("visible OCR text that says no image does not trigger false no-image guardr
   } finally {
     globalThis.fetch = originalFetch;
     console.log = originalLog;
+    clock.restore();
+  }
+});
+
+test("multi-image OCR sends one WhatsApp message per image", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781475200000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Lee el texto visible de estas imagenes", "msg_ocr_text_multi")));
+    await coordinator.fetch(localMessageRequest(imageMessage("img_a", "msg_ocr_a", "")));
+    await coordinator.fetch(localMessageRequest(imageMessage("img_b", "msg_ocr_b", "")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const imageMessages = captures.sentTexts.filter((text) => /^Imagen \d+/i.test(text));
+    assert.equal(imageMessages.length, 2);
+    assert.match(imageMessages[0], /Texto visible:\nA/i);
+    assert.match(imageMessages[1], /Texto visible:\nB/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("alarm delivery sends due reminders in production alarm mode", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const now = Date.parse("2026-06-15T15:00:00.000Z");
+  const clock = installFakeClock(now);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  await state.storage.put("data", {
+    doName: "channel_runtime:593995660220",
+    channel: "channel_runtime",
+    phone: "593995660220",
+    member: "member_runtime",
+    app: "app_runtime",
+    coreUtilityState: {
+      reminders: [{
+        id: "rem_due",
+        reminderId: "rem_due",
+        title: "comprar huevos",
+        message: "comprar huevos",
+        dueAt: "2026-06-15T15:00:00.000Z",
+        status: "scheduled_alarm",
+        deliveryMode: "alarm",
+        channelId: "channel_runtime",
+        recipientId: "593995660220",
+        memberId: "member_runtime",
+        appId: "app_runtime",
+        lastUserInteractionAt: "2026-06-15T14:50:00.000Z"
+      }]
+    }
+  });
+  const coordinator = new ConversationCoordinator(state, Object.assign(env(), {
+    REMINDERS_DELIVERY_MODE: "alarm"
+  }));
+
+  try {
+    await coordinator.alarm();
+    assert.equal(captures.sentTexts.some((text) => /Recordatorio: comprar huevos/i.test(text)), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("daily usage report sends usage summary after configured hour", async () => {
+  const state = createMemoryState();
+  const usageKey = "usage:daily:2026-06-15:channel_runtime:593995660220";
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const now = Date.parse("2026-06-15T23:01:00.000Z");
+  const clock = installFakeClock(now);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  await state.storage.put("data", {
+    doName: "channel_runtime:593995660220",
+    channel: "channel_runtime",
+    phone: "593995660220",
+    member: "member_runtime",
+    app: "app_runtime",
+    coreUtilityState: { reminders: [], usageReports: {} }
+  });
+  const coordinator = new ConversationCoordinator(state, Object.assign(env(), {
+    REMINDERS_DELIVERY_MODE: "alarm",
+    DAILY_USAGE_REPORT_ENABLED: "true",
+    DAILY_USAGE_REPORT_HOUR: "18",
+    USER_TIMEZONE: "America/Bogota",
+    SESSIONS_KV: createMemoryKV({
+      [usageKey]: JSON.stringify({
+        doName: "channel_runtime:593995660220",
+        reportDate: "2026-06-15",
+        callCount: 3,
+        estimatedUsd: 0.0123,
+        inputTokens: 1000,
+        outputTokens: 500,
+        totalTokens: 1500,
+        byPurpose: { orchestrator: { calls: 2, estimatedUsd: 0.01 }, vision_analysis: { calls: 1, estimatedUsd: 0.0023 } }
+      })
+    })
+  }));
+
+  try {
+    await coordinator.alarm();
+    const sent = captures.sentTexts.join("\n");
+    assert.match(sent, /Reporte diario de créditos IA/i);
+    assert.match(sent, /Llamadas IA: 3/i);
+    assert.match(sent, /Costo estimado: \$0\.0123/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("reminder follow-up uses compact latest audio summary as title", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(Date.parse("2026-06-15T23:55:00.000Z"));
+  globalThis.fetch = mockRuntimeFetch(captures);
+  await state.storage.put("data", {
+    doName: "channel_runtime:593995660220",
+    channel: "channel_runtime",
+    phone: "593995660220",
+    member: "member_runtime",
+    app: "app_runtime",
+    customerMemory: {
+      last_audio_summary: "llamar al cliente"
+    },
+    coreUtilityState: {
+      reminders: [],
+      pendingReminderDraft: {
+        action: "create",
+        title: "",
+        dueAt: "2026-06-16T00:00:00.000Z",
+        timezone: "America/Bogota",
+        context: "En 5 min",
+        reminderOffsets: [],
+        recurrence: null,
+        confidence: 0.65,
+        missingFields: ["title"],
+        hasDate: true,
+        hasTime: true
+      },
+      usageReports: {}
+    }
+  });
+  const coordinator = new ConversationCoordinator(state, Object.assign(env(), {
+    ENABLE_REMINDERS: "true",
+    USER_TIMEZONE: "America/Bogota"
+  }));
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Lo que te dije en el audio", "msg_audio_ref_title")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const saved = await state.storage.get("data");
+    const sent = captures.sentTexts.join("\n");
+    assert.equal(saved.coreUtilityState.reminders.length, 1);
+    assert.equal(saved.coreUtilityState.reminders[0].title, "llamar al cliente");
+    assert.equal(saved.coreUtilityState.pendingReminderDraft, null);
+    assert.match(sent, /Listo, guard[ée] el recordatorio/i);
+    assert.doesNotMatch(sent, /Qu[eé] quieres que te recuerde/i);
+    assert.equal(captures.orchestratorRequests.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
     clock.restore();
   }
 });

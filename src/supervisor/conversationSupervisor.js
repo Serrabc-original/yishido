@@ -102,9 +102,15 @@ export function createConversationSupervisorPlan(input) {
   const hasExplicitContinuationReference = isContinuationReference(currentText);
   const hasAwaitingMediaTask = Boolean(activeTaskContext && activeTaskContext.status === "awaiting_media");
   const activeTaskType = activeTaskContext && activeTaskContext.type || "";
+  const hasActivePriceMediaTask = hasCurrentImages && hasAwaitingMediaTask && activeTaskType === "price_review" && !hasPetMedia;
+  const hasExplicitPriceContinuation = hasCurrentImages &&
+    hasText &&
+    hasExplicitContinuationReference &&
+    previousTask.intent === "price_review" &&
+    !hasPetMedia;
   const isPrice = isPriceReviewIntent(normalized) ||
-    (!hasText && hasCurrentImages && previousTask.intent === "price_review" && !hasPetMedia) ||
-    (hasCurrentImages && activeTaskType === "price_review" && !hasPetMedia);
+    hasActivePriceMediaTask ||
+    hasExplicitPriceContinuation;
   const isProductAdvice = isProductAdviceIntent(normalized) || (hasCurrentImages && hasCommercialMedia && isImageQuestionIntent(normalized));
   const inferredCurrentIntent = inferIntentName({
     isReminder: isReminder,
@@ -185,11 +191,12 @@ export function createConversationSupervisorPlan(input) {
     targetModules = ["memory", "general_llm"];
     responseStrategy = "answer_now";
     actions.push({ type: normalized.includes("como me llamo") || normalized.includes("cual es mi nombre") ? "answer_memory_name" : "update_memory" });
-  } else if (isImageGeneration) {
+  } else if (isImageGeneration && !isMarketing) {
     intent = "image_generation";
     activeTask = "image_generation";
-    targetModules = hasCurrentImages ? ["vision", "image_generation", "general_llm"] : ["image_generation", "general_llm"];
-    mediaScope = hasCurrentImages ? "all_pending_batch" : "none";
+    targetModules = hasCurrentImages || hasPreviousRelevantMedia ? ["vision", "image_generation", "general_llm"] : ["image_generation", "general_llm"];
+    mediaScope = hasCurrentImages ? "all_pending_batch" : hasPreviousRelevantMedia ? "previous_relevant" : "none";
+    shouldUsePreviousMedia = mediaScope === "previous_relevant";
     responseStrategy = "execute_then_confirm";
   } else if (isMarketing) {
     intent = "marketing";
@@ -239,7 +246,7 @@ export function createConversationSupervisorPlan(input) {
     targetModules = ["vision", "general_llm"];
     mediaScope = imageCount > 1 ? "all_pending_batch" : "current_only";
     responseStrategy = "analyze_then_answer";
-  } else if (!hasText && hasCurrentImages && previousTask.intent && previousTask.intent !== "general") {
+  } else if (!hasText && hasCurrentImages && hasAwaitingMediaTask && previousTask.intent && previousTask.intent !== "general") {
     intent = previousTask.intent === "price_review" && !hasPetMedia ? (imageCount > 1 ? "multi_image_price_review" : "price_review") : hasPetMedia ? "pet_photo" : "image_question";
     activeTask = previousTask.intent;
     targetModules = ["vision", "general_llm"];
@@ -297,6 +304,22 @@ export function createConversationSupervisorPlan(input) {
         activeTaskType: activeTaskType,
         imageCount: imageCount
       });
+    } else if (activeTaskType === "image_generation") {
+      intent = "image_generation";
+      activeTask = "image_generation";
+      targetModules = ["vision", "image_generation", "general_llm"];
+      mediaScope = imageCount > 1 ? "all_pending_batch" : "current_only";
+      responseStrategy = "execute_then_confirm";
+      needsClarification = false;
+      clarificationQuestion = "";
+    } else if (["image_review", "pending_media_task"].includes(activeTaskType)) {
+      intent = imageCount > 1 ? "multi_image_review" : "image_question";
+      activeTask = activeTaskType;
+      targetModules = ["vision", "general_llm"];
+      mediaScope = imageCount > 1 ? "all_pending_batch" : "current_only";
+      responseStrategy = "analyze_then_answer";
+      needsClarification = false;
+      clarificationQuestion = "";
     }
   } else if (hasAwaitingMediaTask && isContextSwitch) {
     logEvent("SUPERVISOR_ACTIVE_TASK_IGNORED", {
@@ -312,7 +335,7 @@ export function createConversationSupervisorPlan(input) {
   const currentTextForLegacyContinuation = hasExplicitContinuationReference ? currentText : "";
   const isContinuation = Boolean(!isContextSwitch && (
     previousTask.intent && previousTask.intent === activeTask && activeTask !== "general" ||
-    !hasText && hasCurrentImages && previousTask.intent !== "general" ||
+    !hasText && hasCurrentImages && hasAwaitingMediaTask && previousTask.intent !== "general" ||
     /\b(eso|esto|esta|este|la segunda|la primera|los precios|lo de antes|y este|y esta|cual conviene|cu[aá]l conviene)\b/i.test(currentTextForLegacyContinuation)
   ));
 
@@ -390,7 +413,7 @@ export function normalizeSupervisorPlan(plan) {
     shouldWaitForMoreInputs: contract.shouldWaitForMoreInputs,
     toolPlan: contract.toolPlan,
     memoryPolicy: contract.memoryPolicy,
-    responseStrategy: ["answer_now", "analyze_then_answer", "ask_clarification", "create_utility_then_confirm", "wait_for_more_inputs"].includes(clean.responseStrategy)
+    responseStrategy: ["answer_now", "analyze_then_answer", "ask_clarification", "create_utility_then_confirm", "execute_then_confirm", "wait_for_more_inputs"].includes(clean.responseStrategy)
       ? clean.responseStrategy
       : "answer_now",
     supervisorModel: String(clean.supervisorModel || ""),
@@ -550,7 +573,9 @@ function isOcrIntent(text) {
 }
 
 function isReminderIntent(text) {
-  return /\b(recuerdame|recordarme|recordatorio|recordatorios|avisame|hazme acuerdo|acuerdame)\b/.test(text);
+  return /\b(recuerdame|recordarme|recordatorio|recordatorios|avisame|hazme acuerdo|acuerdame)\b/.test(text) ||
+    /\b(?:para\s+)?(?:en|dentro de)\s+(?:\d+|un|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|quince|veinte|treinta)\s*(min|minuto|minutos|m|hora|horas|h)\b/.test(text) &&
+      /\b(comprar|pagar|llamar|hacer|enviar|mandar|escribir|actualizar|revisar)\b/.test(text);
 }
 
 function isListIntent(text) {
@@ -564,9 +589,11 @@ function isMarketingIntent(text) {
 }
 
 function isImageGenerationIntent(text) {
+  if (!/\b(no quiero|sin)\s+(imagen|foto|diseno)\b/.test(text) && /\b(disena|disename|hazme|crea|generame|edita|modifica)\b.*\b(imagen|foto|diseno|banner|flyer|arte|creativo)\b/.test(text)) return true;
+  if (!/\b(no quiero|sin)\s+(imagen|foto|diseno)\b/.test(text) && /\b(imagen|foto|diseno|banner|flyer|arte|creativo)\b.*\b(disena|disename|hazme|crea|generame|edita|modifica)\b/.test(text)) return true;
   if (/\b(no quiero|sin)\s+(imagen|diseno|dise[ñn]o|foto)\b/.test(text)) return false;
-  return /\b(genera|generame|gen[eé]rame|crea|crear|haz|hacer|disena|dise[ñn]a|editar|edita|modifica|cambia)\b.*\b(imagen|foto|dibujo|dise[ñn]o|banner|flyer|arte|creativo|post visual)\b/.test(text) ||
-    /\b(imagen|foto|dibujo|dise[ñn]o|banner|flyer|arte|creativo)\b.*\b(genera|generame|gen[eé]rame|crea|crear|haz|hacer|disena|dise[ñn]a|editar|edita|modifica|cambia)\b/.test(text);
+  return /\b(genera|generame|gen[eé]rame|crea|crear|haz|hazme|hacer|hacerme|haces|disena|dise[ñn]a|editar|edita|modifica|cambia)\b.*\b(imagen|foto|dibujo|dise[ñn]o|banner|flyer|arte|creativo|post visual)\b/.test(text) ||
+    /\b(imagen|foto|dibujo|dise[ñn]o|banner|flyer|arte|creativo)\b.*\b(genera|generame|gen[eé]rame|crea|crear|haz|hazme|hacer|hacerme|haces|disena|dise[ñn]a|editar|edita|modifica|cambia)\b/.test(text);
 }
 
 function isMemoryIntent(text) {
