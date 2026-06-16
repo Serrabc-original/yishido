@@ -320,11 +320,18 @@ export function buildUtilityMemory(utilityState) {
   const clean = utilityState && typeof utilityState === "object" ? utilityState : {};
   const reminders = Array.isArray(clean.reminders) ? clean.reminders : [];
   const lists = clean.lists && typeof clean.lists === "object" ? clean.lists : {};
+  const tasks = Array.isArray(clean.tasks) ? clean.tasks : [];
+  const leads = Array.isArray(clean.leads) ? clean.leads : [];
+  const clients = Array.isArray(clean.clients) ? clean.clients : [];
 
   return {
     reminder_count: reminders.filter(function (item) {
       return !["cancelled", "done"].includes(item.status);
     }).length,
+    open_task_count: tasks.filter(function (item) { return item.status === "open"; }).length,
+    paused_task_count: tasks.filter(function (item) { return item.status === "paused"; }).length,
+    lead_count: leads.length,
+    client_count: clients.length,
     list_names: Object.values(lists).map(function (list) {
       return list.name || "";
     }).filter(Boolean).slice(0, 20),

@@ -716,7 +716,18 @@ test("control commands expose interactive, lists and reminders safely", async ()
           items: [{ id: "item_1", text: "pan", done: false }]
         }
       },
-      activeList: "super"
+      activeList: "super",
+      tasks: [{
+        taskId: "task_1",
+        type: "follow_up",
+        status: "open",
+        title: "hacer seguimiento a Juan",
+        description: "seguimiento comercial",
+        dueAt: "2026-06-17T10:00:00.000Z",
+        mediaRefs: { fileIds: [], assetIds: [] },
+        createdAt: "2026-06-16T10:00:00.000Z",
+        updatedAt: "2026-06-16T10:00:00.000Z"
+      }]
     }
   });
 
@@ -731,17 +742,20 @@ test("control commands expose interactive, lists and reminders safely", async ()
     const debug = await coordinator.receiveMessage(buildTextWebhookBody("/debug-interactive"));
     const lists = await coordinator.receiveMessage(buildTextWebhookBody("/lists"));
     const reminders = await coordinator.receiveMessage(buildTextWebhookBody("/reminders"));
+    const tasks = await coordinator.receiveMessage(buildTextWebhookBody("/tasks"));
     const clearReminders = await coordinator.receiveMessage(buildTextWebhookBody("/clear-reminders"));
     const saved = await state.storage.get("data");
 
     assert.equal((await debug.json()).status, "debug_interactive_sent");
     assert.equal((await lists.json()).status, "lists_sent");
     assert.equal((await reminders.json()).status, "reminders_sent");
+    assert.equal((await tasks.json()).status, "tasks_sent");
     assert.equal((await clearReminders.json()).status, "reminders_cleared");
     assert.equal(saved.coreUtilityState.reminders.length, 0);
     assert.equal(sentBodies.some((item) => item.body.response && item.body.response[0].type === "QUICK_REPLY"), true);
     assert.equal(sentBodies.some((item) => JSON.stringify(item.body).includes("Listas guardadas")), true);
     assert.equal(sentBodies.some((item) => JSON.stringify(item.body).includes("Recordatorios pendientes")), true);
+    assert.equal(sentBodies.some((item) => JSON.stringify(item.body).includes("Tareas abiertas")), true);
   } finally {
     globalThis.fetch = originalFetch;
   }

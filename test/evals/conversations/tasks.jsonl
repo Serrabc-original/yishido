@@ -1,0 +1,4 @@
+{"id":"task_follow_up_tomorrow","text":"Haz seguimiento mañana a este cliente","expected":{"routeIntent":"task","handled":true,"action":"create_task","taskCount":1,"responseIncludes":"creé la tarea"}}
+{"id":"task_call_client","text":"Llama a este cliente para confirmar la cita","expected":{"routeIntent":"task","handled":true,"action":"create_task","taskCount":1}}
+{"id":"lead_save","text":"Guarda este lead Juan Perez para seguimiento","expected":{"routeIntent":"task","handled":true,"action":"save_lead","leadCount":1}}
+{"id":"multi_image_task_partial_failure","text":"Revisa estas fotos y haz seguimiento mañana","media":[{"fileId":"img_1","assetId":"asset_1","mediaType":"IMAGE","status":"analyzed"},{"fileId":"img_2","assetId":"asset_2","mediaType":"IMAGE","status":"analysis_failed","analysisError":"bad url"}],"expected":{"routeIntent":"task","handled":true,"action":"create_task","taskCount":1,"mediaFileIds":["img_1","img_2"]}}

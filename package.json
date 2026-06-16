@@ -9,6 +9,7 @@
                     "tail":  "npx.cmd wrangler tail",
                     "test":  "node --test test/**/*.test.js",
                     "test:inputs":  "node scripts/test-all-input-cases.js",
+                    "evals:conversations":  "node scripts/run-conversation-evals.js",
                     "logs:latest":  "node scripts/read-latest-logs.js",
                     "logs:analyze":  "node scripts/analyze-logs.js",
                     "bug:report":  "node scripts/export-bug-report.js"

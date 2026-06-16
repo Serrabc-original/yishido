@@ -2,6 +2,9 @@ import { redactForLog } from "../logger.js";
 
 const SUPERVISOR_MEDIA_SCOPES = new Set(["none", "current_only", "previous_relevant", "current_and_previous", "all_pending_batch"]);
 const RESPONSE_STRATEGIES = new Set(["answer_now", "analyze_then_answer", "ask_clarification", "create_utility_then_confirm", "wait_for_more_inputs"]);
+const ACTION_STATUSES = new Set(["planned", "allowed", "blocked", "executed", "failed"]);
+const TASK_STATUSES = new Set(["open", "paused", "cancelled", "closed"]);
+const TASK_TYPES = new Set(["follow_up", "call", "lead", "review_media", "report", "support", "order", "general"]);
 
 export function normalizeConversationIdentity(input) {
   const clean = input || {};
@@ -121,6 +124,59 @@ export function normalizeModuleResult(result) {
   });
 }
 
+export function normalizeActionContract(action) {
+  const clean = action || {};
+  const actionName = String(clean.action || clean.type || "");
+  const entities = clean.entities && typeof clean.entities === "object" ? clean.entities : {};
+  const missingFields = Array.isArray(clean.missingFields || clean.missing_fields)
+    ? (clean.missingFields || clean.missing_fields).map(String).filter(Boolean)
+    : [];
+  const status = ACTION_STATUSES.has(clean.status) ? clean.status : "planned";
+
+  return redactForLog({
+    action: actionName,
+    module: String(clean.module || inferActionModule(actionName)),
+    entities: entities,
+    missingFields: missingFields,
+    confidence: clampConfidence(clean.confidence),
+    requiresApproval: Boolean(clean.requiresApproval || clean.requires_approval),
+    status: status,
+    userFacingSummary: String(clean.userFacingSummary || clean.user_facing_summary || "").slice(0, 1200)
+  });
+}
+
+export function normalizeTaskContract(task) {
+  const clean = task || {};
+  const type = TASK_TYPES.has(clean.type) ? clean.type : "general";
+  const status = TASK_STATUSES.has(clean.status) ? clean.status : "open";
+
+  return redactForLog({
+    taskId: String(clean.taskId || clean.task_id || clean.id || ""),
+    type: type,
+    status: status,
+    title: String(clean.title || "").trim().slice(0, 160),
+    description: String(clean.description || clean.summary || "").trim().slice(0, 1000),
+    clientId: String(clean.clientId || clean.client_id || ""),
+    leadId: String(clean.leadId || clean.lead_id || ""),
+    dueAt: String(clean.dueAt || clean.due_at || ""),
+    priority: clean.priority === "high" ? "high" : "normal",
+    mediaRefs: normalizeMediaRefs(clean.mediaRefs || clean.media_refs || {}),
+    createdAt: String(clean.createdAt || clean.created_at || new Date().toISOString()),
+    updatedAt: String(clean.updatedAt || clean.updated_at || new Date().toISOString())
+  });
+}
+
+export function normalizeAgentMemoryReadModels(input) {
+  const clean = input || {};
+
+  return redactForLog({
+    recentConversation: clean.recentConversation || clean.recent_conversation || null,
+    userMemory: clean.userMemory || clean.user_memory || null,
+    businessMemory: clean.businessMemory || clean.business_memory || null,
+    clientsLeadsTasks: clean.clientsLeadsTasks || clean.clients_leads_tasks || null
+  });
+}
+
 export function buildResponsePlan(input) {
   const clean = input || {};
   const messages = normalizeResponseMessages(clean.messages || (clean.text ? [{ type: "TEXT", text: clean.text }] : []));
@@ -153,15 +209,10 @@ function normalizeToolPlan(toolPlan) {
   const actions = Array.isArray(toolPlan) ? toolPlan : toolPlan.actions;
 
   return {
-    actions: (Array.isArray(actions) ? actions : []).map(function (action) {
-      return redactForLog({
-        type: String(action && action.type || ""),
-        module: String(action && action.module || ""),
-        status: String(action && action.status || "planned")
-      });
-    }).filter(function (action) {
-      return action.type;
-    }).slice(0, 12)
+    actions: (Array.isArray(actions) ? actions : [])
+      .map(normalizeActionContract)
+      .filter(function (action) { return action.action; })
+      .slice(0, 12)
   };
 }
 
@@ -191,4 +242,24 @@ function hashStable(value) {
     hash = ((hash << 5) - hash + text.charCodeAt(index)) | 0;
   }
   return text ? "h_" + Math.abs(hash).toString(36) : "";
+}
+
+function normalizeMediaRefs(refs) {
+  const clean = refs || {};
+  return {
+    fileIds: Array.from(new Set((Array.isArray(clean.fileIds || clean.file_ids) ? clean.fileIds || clean.file_ids : []).map(String).filter(Boolean))),
+    assetIds: Array.from(new Set((Array.isArray(clean.assetIds || clean.asset_ids) ? clean.assetIds || clean.asset_ids : []).map(String).filter(Boolean)))
+  };
+}
+
+function inferActionModule(actionName) {
+  if (["save_lead", "update_client_memory"].includes(actionName)) return "crmLite";
+  if (String(actionName || "").includes("task")) return "tasks";
+  return "";
+}
+
+function clampConfidence(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(1, number));
 }

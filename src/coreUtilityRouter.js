@@ -40,6 +40,10 @@ export function routeCoreUtilityIntent(userTurn, options) {
     return intentResult("image_ocr", 0.82, "vision");
   }
 
+  if (isTaskIntent(normalized)) {
+    return intentResult("task", 0.72, "tasks");
+  }
+
   if (isImageQuestionIntent(normalized, media)) {
     return intentResult("image_question", 0.78, "vision");
   }
@@ -109,6 +113,14 @@ function isImageQuestionIntent(text, media) {
 function isMarketingIntent(text) {
   if (/\b(no quiero|sin)\s+(post|posts|marketing|campana|campanas|contenido)\b/.test(text)) return false;
   return /\b(post|posts|copy|caption|instagram|facebook|tiktok|redes sociales|campana|campanas|anuncio|ads|publicidad|publicacion|publicaciones|hashtag|calendario editorial|calendario de contenido|contenido para redes)\b/.test(text);
+}
+
+function isTaskIntent(text) {
+  if (isReminderIntent(text) || isListIntent(text)) return false;
+  if (/\b(muestra|muestrame|ver|lista|listar)\b.*\b(tareas|pendientes|seguimientos)\b/.test(text)) return true;
+  if (/\b(guarda|guardar|registra|registrar)\b.*\b(lead|cliente|prospecto|contacto)\b/.test(text)) return true;
+  if (/\b(cierra|cerrar|pausa|pausar|cancela|cancelar|termina|terminar|completa|completar)\b.*\b(tarea|pendiente|seguimiento)\b/.test(text)) return true;
+  return /\b(tarea|pendiente|seguimiento|hacer seguimiento|llama|llamar|revisa estas fotos|revisa estas imagenes|reporte diario)\b/.test(text);
 }
 
 function isSupportIntent(text) {

@@ -39,6 +39,8 @@ import { attachUserTurnContract, buildCombinedUserText, cleanUserVisibleText } f
 import { buildMediaBatchFromUserTurn } from "./conversation/mediaBatchBuilder.js";
 import { getCoreFeatureFlags, updateConversationMemory } from "./conversationMemory.js";
 import { routeCoreUtilityIntent } from "./coreUtilityRouter.js";
+import { runAgentRuntime } from "./agent/agentRuntime.js";
+import { formatTasksForWhatsApp, normalizeTaskState } from "./agent/taskEngine.js";
 import { createReminder, listReminders, selectReminderDeliveryPath } from "./modules/reminders/index.js";
 import { addListItems, createList, listItems, markListItemDone, normalizeListState, removeListItems } from "./modules/lists/index.js";
 import { sendWhatsAppInteractiveMessage } from "./whatsapp/sendInteractiveMessage.js";
@@ -702,6 +704,20 @@ export class ConversationCoordinator {
       });
 
       return jsonResponse({ status: "reminders_sent" });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/tasks") {
+      data.coreUtilityState = normalizeCoreUtilityState(data.coreUtilityState);
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: formatTasksForWhatsApp(data.coreUtilityState.tasks)
+      });
+
+      return jsonResponse({ status: "tasks_sent" });
     }
 
     if (normalizeTextForIntent(normalized.text) === "/clear-reminders") {
@@ -2211,6 +2227,48 @@ export class ConversationCoordinator {
 
       if (isVisionUtilityRoute(utilityRoute)) {
         data = await this.handleVisionUtility(data, utilityRoute, userTurn, messages);
+      } else if (isAgentRuntimeRoute(utilityRoute)) {
+        const runtimeResult = runAgentRuntime({
+          data: data,
+          userTurn: userTurn,
+          utilityRoute: utilityRoute
+        });
+        if (runtimeResult.handled) {
+          data = runtimeResult.data;
+          data.activeContext = updateConversationContext(data.activeContext, {
+            userTurn: userTurn,
+            route: utilityRoute,
+            campaignState: data.campaignState,
+            lastUserGoal: runtimeResult.result && runtimeResult.result.task && runtimeResult.result.task.title || utilityRoute.intent,
+            pendingClarification: ""
+          });
+          await sendWoztellTextMessage(this.env, {
+            channelId: data.channel,
+            recipientId: data.phone,
+            memberId: data.member,
+            appId: data.app,
+            text: runtimeResult.responseText || "Listo."
+          });
+        } else {
+          const plan = await callOrchestratorPlan(this.env, {
+            doName: data.doName,
+            channel: data.channel,
+            phone: data.phone,
+            messages: messages,
+            clientProfile: data.clientProfile,
+            campaignState: data.campaignState,
+            conversationSummary: data.conversationSummary,
+            userStyleProfile: data.userStyleProfile,
+            customerMemory: data.customerMemory,
+            utilityMemory: data.utilityMemory,
+            activeContext: data.activeContext,
+            requestContext: requestContext,
+            userTurn: userTurn
+          });
+
+          console.log("ORCHESTRATOR_PLAN:", JSON.stringify(plan));
+          data = await this.executePlan(data, messages, plan, userTurn);
+        }
       } else if (utilityRoute.shouldHandleInCore) {
         data = await this.handleCoreUtility(data, utilityRoute, userTurn);
       } else {
@@ -7750,6 +7808,12 @@ function shouldUseRecentMediaFallbackForMessage(message) {
 function normalizeCoreUtilityState(state) {
   const clean = state && typeof state === "object" ? state : {};
   const listsState = normalizeListState(clean.listsState || { lists: clean.lists || {} });
+  const taskState = normalizeTaskState({
+    tasks: clean.tasks || [],
+    leads: clean.leads || [],
+    clients: clean.clients || [],
+    metrics: clean.taskMetrics || clean.task_metrics || {}
+  });
 
   return {
     reminders: Array.isArray(clean.reminders) ? clean.reminders.slice(-100) : [],
@@ -7757,7 +7821,11 @@ function normalizeCoreUtilityState(state) {
     usageReports: normalizeUsageReportsState(clean.usageReports || clean.usage_reports || {}),
     listsState: listsState,
     lists: listsState.lists,
-    activeList: String(clean.activeList || clean.active_list || "")
+    activeList: String(clean.activeList || clean.active_list || ""),
+    tasks: taskState.tasks,
+    leads: taskState.leads,
+    clients: taskState.clients,
+    taskMetrics: taskState.metrics
   };
 }
 
@@ -7898,6 +7966,9 @@ function buildContextSnapshot(data) {
     lastOfferedAction: context.lastOfferedAction,
     activeList: data && data.coreUtilityState && data.coreUtilityState.activeList || "",
     pendingReminders: countPendingReminders(data && data.coreUtilityState && data.coreUtilityState.reminders || []),
+    openTasks: countOpenTasks(data && data.coreUtilityState && data.coreUtilityState.tasks || []),
+    pausedTasks: countPausedTasks(data && data.coreUtilityState && data.coreUtilityState.tasks || []),
+    leads: data && data.coreUtilityState && Array.isArray(data.coreUtilityState.leads) ? data.coreUtilityState.leads.length : 0,
     currentTurnMedia: context.currentTurnMedia.asset_count,
     previousRelevantMedia: context.previousRelevantMedia.asset_count,
     staleMedia: context.staleMedia.asset_count
@@ -7915,6 +7986,9 @@ function formatContextForWhatsApp(data) {
     "pendingClarification: " + (snapshot.pendingClarification || "(ninguna)"),
     "activeList: " + (snapshot.activeList || "(ninguna)"),
     "pending reminders count: " + snapshot.pendingReminders,
+    "open tasks count: " + snapshot.openTasks,
+    "paused tasks count: " + snapshot.pausedTasks,
+    "leads count: " + snapshot.leads,
     "currentTurnMedia count: " + snapshot.currentTurnMedia,
     "previousRelevantMedia count: " + snapshot.previousRelevantMedia,
     "staleMedia count: " + snapshot.staleMedia
@@ -8331,6 +8405,10 @@ function isVisionUtilityRoute(route) {
   return route && (route.intent === "image_question" || route.intent === "image_ocr");
 }
 
+function isAgentRuntimeRoute(route) {
+  return route && (route.intent === "task" || route.intent === "crm" || route.module === "tasks" || route.module === "crmLite");
+}
+
 function shouldExitMarketingContext(text) {
   const normalized = normalizeTextForIntent(text);
   return /\b(no quiero|ya no quiero|deja de)\s+(post|posts|marketing|campana|campanas|contenido)\b/.test(normalized) ||
@@ -8636,6 +8714,18 @@ function formatRemindersForWhatsApp(reminders, env) {
 function countPendingReminders(reminders) {
   return (Array.isArray(reminders) ? reminders : []).filter(function (item) {
     return !["cancelled", "done"].includes(item.status);
+  }).length;
+}
+
+function countOpenTasks(tasks) {
+  return (Array.isArray(tasks) ? tasks : []).filter(function (item) {
+    return item && item.status === "open";
+  }).length;
+}
+
+function countPausedTasks(tasks) {
+  return (Array.isArray(tasks) ? tasks : []).filter(function (item) {
+    return item && item.status === "paused";
   }).length;
 }
 
@@ -11016,6 +11106,7 @@ function buildVersionDiagnostic(env) {
     SAVE_CONVERSATION_LOGS: String(flags.saveConversationLogs),
     ENABLE_USER_STYLE_PROFILE: String(flags.enableUserStyleProfile),
     ENABLE_CUSTOMER_MEMORY: String(flags.enableCustomerMemory),
+    ENABLE_TASK_ENGINE: "true",
     CORE_UTILITIES_SANDBOX: String(flags.coreUtilitiesSandbox),
     REMINDERS_DELIVERY_MODE: remindersMode,
     DAILY_USAGE_REPORT_ENABLED: String(isDailyUsageReportEnabled(env || {})),
@@ -11028,6 +11119,7 @@ function buildVersionDiagnostic(env) {
     REMINDERS_STATUS: remindersMode === "alarm" ? "production_alarm_enabled" : remindersMode === "cron" ? "production_cron_requires_scheduler" : remindersMode === "disabled" ? "disabled" : "mock_safe_no_real_delivery",
     INTERACTIVE_STATUS: interactiveMode === "safe" ? "safe_with_text_fallback" : interactiveMode,
     MEMORY_STATUS: flags.memoryRetentionMode === "summarized" ? "summarized_no_raw_history" : String(flags.memoryRetentionMode || ""),
+    TASK_ENGINE_STATUS: "local_core_utility_state",
     LOGS_STATUS: flags.logCaptureMode === "console_and_file" ? "console_plus_local_wrapper" : String(flags.logCaptureMode || ""),
     timestamp: now
   };
@@ -11058,6 +11150,7 @@ function formatVersionDiagnosticForWhatsApp(diagnostic) {
     "SAVE_CONVERSATION_LOGS: " + (data.SAVE_CONVERSATION_LOGS || ""),
     "ENABLE_USER_STYLE_PROFILE: " + (data.ENABLE_USER_STYLE_PROFILE || ""),
     "ENABLE_CUSTOMER_MEMORY: " + (data.ENABLE_CUSTOMER_MEMORY || ""),
+    "ENABLE_TASK_ENGINE: " + (data.ENABLE_TASK_ENGINE || ""),
     "CORE_UTILITIES_SANDBOX: " + (data.CORE_UTILITIES_SANDBOX || ""),
     "REMINDERS_DELIVERY_MODE: " + (data.REMINDERS_DELIVERY_MODE || ""),
     "DAILY_USAGE_REPORT_ENABLED: " + (data.DAILY_USAGE_REPORT_ENABLED || ""),
@@ -11069,6 +11162,7 @@ function formatVersionDiagnosticForWhatsApp(diagnostic) {
     "INTERACTIVE_STATUS: " + (data.INTERACTIVE_STATUS || ""),
     "MEMORY_RETENTION_MODE: " + (data.MEMORY_RETENTION_MODE || ""),
     "MEMORY_STATUS: " + (data.MEMORY_STATUS || ""),
+    "TASK_ENGINE_STATUS: " + (data.TASK_ENGINE_STATUS || ""),
     "LOG_CAPTURE_MODE: " + (data.LOG_CAPTURE_MODE || ""),
     "LOGS_STATUS: " + (data.LOGS_STATUS || ""),
     "timestamp: " + (data.timestamp || "")
