@@ -24,7 +24,7 @@ Woztell webhook
 | Orchestrator | `ORCHESTRATOR_MODEL` | `gpt-5.4` |
 | Supervisor config | `SUPERVISOR_MODEL` | `gpt-5.4` |
 | Vision | `VISION_MODEL` | `gpt-5.4-nano` with `gpt-5.4-mini` fallback |
-| Final customer reply | `CUSTOMER_REPLY_MODEL` | `gpt-5.4-mini` |
+| Final customer reply | `CUSTOMER_REPLY_MODEL` | `gpt-4o-mini` |
 | Image generation | `OPENAI_IMAGE_MODEL` | `gpt-image-2` |
 | Audio transcription | `AUDIO_TRANSCRIPTION_MODEL` | `whisper-1` |
 
@@ -42,6 +42,8 @@ Core principles:
 - Treat text/audio as the user's intent and images as evidence unless the user only sends images.
 - Use deterministic utility modules for reminders, lists, reset, debug, media clearing, and other actions that should not depend on free-form model behavior.
 - Resolve short follow-ups through compact state first. For example, reminder continuations can use `pendingReminderDraft` plus `customerMemory.last_audio_summary` for phrases like "lo que te dije en el audio".
+- Retrieve ranked short-term memory before composing the final reply. The composer receives selected turns/media with internal citations, not full raw history.
+- Run the customer-facing text through output quality checks so false media reupload requests, stale reminder leakage, polluted list replies, and robotic/system wording can be repaired before sending.
 - Use structured JSON contracts at model boundaries and repair/guard outputs before sending WhatsApp text.
 - Add regression tests for each real chat failure before touching critical logic.
 

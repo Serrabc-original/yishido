@@ -9,6 +9,7 @@ import {
 } from "../conversationMemory.js";
 import { buildMemoryPolicy } from "./memoryPolicy.js";
 import { normalizeLongTermMemory } from "./longTermMemoryAdapter.js";
+import { buildMemoryRetrievalContext } from "./memoryRetriever.js";
 
 export {
   buildConversationLogEntry,
@@ -44,6 +45,7 @@ export function buildShortTermMemorySnapshot(data, options) {
 export function buildMemoryReadModel(data, options) {
   const clean = data || {};
   const policy = options && options.memoryPolicy || clean.memoryPolicy || buildMemoryPolicy({}, clean, options);
+  const userTurn = options && options.userTurn || clean.userTurn || clean.currentUserTurn || null;
   const longTermMemory = policy.longTerm && policy.longTerm.readAllowed
     ? normalizeLongTermMemory(options && options.longTermMemory || clean.longTermMemory || null)
     : null;
@@ -68,6 +70,12 @@ export function buildMemoryReadModel(data, options) {
         sensitiveDataAllowed: false
       }
     },
+    retrieved: buildMemoryRetrievalContext(clean, userTurn, {
+      maxTurns: options && options.maxTurns || 6,
+      maxMedia: options && options.maxMedia || 6,
+      maxSelectedTurns: options && options.maxSelectedTurns || 4,
+      maxSelectedMedia: options && options.maxSelectedMedia || 4
+    }),
     identity: buildMemoryIdentity(clean)
   };
 }

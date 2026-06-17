@@ -133,6 +133,26 @@ function runWhatsappEvalCase(item) {
     mediaFileIds: userTurn.media_batch && userTurn.media_batch.fileIds || [],
     captions: userTurn.captions || [],
     routeIntent: route.intent,
+    listAction: route.parsed && route.parsed.list
+      ? route.parsed.list.action || ""
+      : route.parsed && route.intent === "list"
+        ? route.parsed.action || ""
+        : "",
+    listItems: route.parsed && route.parsed.list
+      ? route.parsed.list.items || []
+      : route.parsed && route.intent === "list"
+        ? route.parsed.items || []
+        : [],
+    listMissingFields: route.parsed && route.parsed.list
+      ? route.parsed.list.missingFields || []
+      : route.parsed && route.intent === "list"
+        ? route.parsed.missingFields || []
+        : [],
+    reminderTitle: route.parsed && route.parsed.reminder
+      ? route.parsed.reminder.title || ""
+      : route.parsed && route.intent === "reminder"
+        ? route.parsed.title || ""
+        : "",
     executionMode: executionPlan.executionMode,
     plannedToolAction: executionPlan.toolPlan && executionPlan.toolPlan.actions && executionPlan.toolPlan.actions[0]
       ? executionPlan.toolPlan.actions[0].action

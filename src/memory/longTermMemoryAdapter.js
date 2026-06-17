@@ -215,8 +215,34 @@ function normalizeLongTermFacts(facts) {
       updatedAt: sanitizeMemoryText(fact && (fact.updatedAt || fact.updated_at) || new Date().toISOString()).slice(0, 40)
     };
   }).filter(function (fact) {
-    return fact.label && fact.value;
+    return fact.label && fact.value && isSafeLongTermFact(fact);
   }).slice(-20);
+}
+
+function isSafeLongTermFact(fact) {
+  const label = normalizeMemorySearchText(fact && fact.label || "");
+  const value = normalizeMemorySearchText(fact && fact.value || "");
+  const joined = label + " " + value;
+
+  if (/\b(ignore|ignora|olvida|override|system prompt|developer message|jailbreak|prompt injection|api key|token|secret|contrasena)\b/.test(joined)) {
+    return false;
+  }
+  if (/\b(hoy|manana|en \d+\s*(min|minuto|minutos|hora|horas)|dentro de|recordatorio|recuerdame|hazme acuerdo|hacer acuerdo)\b/.test(joined)) {
+    return false;
+  }
+  if (label === "nota_contexto" && /\b(lista|recordatorio|audio|imagen|foto|captura|este turno|esta conversacion)\b/.test(value)) {
+    return false;
+  }
+  return true;
+}
+
+function normalizeMemorySearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function mergeFacts(previousFacts, newFacts) {

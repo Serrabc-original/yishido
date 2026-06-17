@@ -11,7 +11,8 @@ export function parseListCommand(text) {
   const normalized = normalizeText(raw);
   let action = "unknown";
 
-  if (normalized.startsWith("crea una lista") || normalized.startsWith("crear lista")) action = "create";
+  if (isReminderTimingQuestionAboutList(normalized)) action = "unknown";
+  else if (normalized.startsWith("crea una lista") || normalized.startsWith("crear lista")) action = "create";
   else if (/\b(hazme|hacer|prepara|preparame|creame|crear|generar|genera|ayudar a generar|ayudame a generar)\b.*\blista\b/.test(normalized)) action = "add";
   else if (/\bayudame\s+a\s+comprar\b.*\blista\b/.test(normalized)) action = "add";
   else if (normalized.startsWith("agrega") || normalized.startsWith("anota")) action = "add";
@@ -265,7 +266,26 @@ function normalizeItems(items) {
     .map(function (item) {
       return String(item || "").replace(/[.,;:。]+$/g, "").trim();
     })
+    .filter(function (item) {
+      return !isInvalidListItem(item);
+    })
     .filter(Boolean);
+}
+
+function isReminderTimingQuestionAboutList(text) {
+  const clean = normalizeText(text);
+  return /\b(en cuantos minutos|cuando)\b/.test(clean) &&
+    /\b(hacer acuerdo|haces acuerdo|hazme acuerdo|recordar|recuerdame|avisar|avisame)\b/.test(clean) &&
+    /\b(lista|compras|pendientes)\b/.test(clean);
+}
+
+function isInvalidListItem(item) {
+  const clean = normalizeText(item);
+  if (!clean) return true;
+  if (isReminderTimingQuestionAboutList(clean)) return true;
+  if (/\b(en cuantos minutos|me vas a hacer acuerdo|hacer acuerdo de esta lista)\b/.test(clean)) return true;
+  if (/^\?+$/.test(clean)) return true;
+  return false;
 }
 
 function includesGroceryItems(text) {

@@ -246,6 +246,14 @@ test("list parser separates shopping items from reminder wording in compound req
   assert.deepEqual(parsed.items, ["huevos", "leche", "pan", "queso"]);
 });
 
+test("list parser does not turn reminder timing questions into list items", () => {
+  const parsed = parseListCommand("[Audio transcrito]: En cuantos minutos me vas a hacer acuerdo de esta lista de compras?");
+
+  assert.equal(parsed.action, "unknown");
+  assert.deepEqual(parsed.items, []);
+  assert.doesNotMatch(JSON.stringify(parsed), /cuantos minutos|hacer acuerdo/i);
+});
+
 test("reminder parser uses the full shopping list as reminder subject in compound requests", () => {
   const parsed = parseReminderRequest("Hazme una lista de compras con huevos, leche, pan y queso y hazme acuerdo en 10 minutos.", "America/Bogota", {
     now: "2026-06-16T17:48:00.000Z"

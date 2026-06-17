@@ -207,7 +207,7 @@ test("model registry falls back for invalid model ids", () => {
   assert.equal(getSupervisorModel({ SUPERVISOR_MODEL: "gpt-5.5-mini" }), "gpt-5.4-mini");
   assert.equal(getRouterModel({ ROUTER_MODEL: "gpt-5.5-nano" }), "gpt-5.4-nano");
   assert.equal(getFinalResponseModel({ FINAL_RESPONSE_MODEL: "" }), "gpt-5.4-mini");
-  assert.equal(getVisionModel({ VISION_MODEL: "gpt-4o-mini" }), "gpt-5.4-mini");
+  assert.equal(getVisionModel({ VISION_MODEL: "gpt-4o-mini" }), "gpt-4o-mini");
   assert.equal(getImageGenerationModel({ OPENAI_IMAGE_MODEL: "gpt-image-2" }), "gpt-image-2");
 });
 

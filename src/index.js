@@ -126,6 +126,7 @@ import {
   validateSpecialistOutputAgainstIntent
 } from "./ai/finalResponseComposer.js";
 import { buildCustomerReplyPromptPayload, composeCustomerReply } from "./ai/customerReplyComposer.js";
+import { evaluateCustomerReplyQuality } from "./ai/outputQualityEvaluator.js";
 import { getConversationPromptGuidance } from "./ai/conversationStyleProfile.js";
 import {
   getCustomerReplyModel,
@@ -2286,6 +2287,7 @@ export class ConversationCoordinator {
           doName: data.doName,
           userTurn: userTurn,
           recentMediaAssets: data.recentMediaAssets,
+          memoryReadModel: data.memoryReadModel,
           supervisorPlan: supervisorPlan,
           intent: supervisorPlan.intent,
           text: composed.text
@@ -2874,6 +2876,7 @@ export class ConversationCoordinator {
           doName: data.doName,
           userTurn: userTurn,
           recentMediaAssets: data.recentMediaAssets,
+          memoryReadModel: data.memoryReadModel,
           supervisorPlan: route.supervisorPlan || { intent: route.intent || "image_question" },
           intent: route.supervisorPlan && route.supervisorPlan.intent || route.intent || "image_question",
           visibleFacts: buildVisibleFactsFromMediaSummary(analysisResult.summary),
@@ -3150,6 +3153,23 @@ export class ConversationCoordinator {
 
     if (route.intent === "list") {
       const parsed = route.parsed || {};
+      if (parsed.action === "unknown" && isListReminderTimingQuestionText(userTurn && (userTurn.current_turn_text || userTurn.combinedUserText) || "")) {
+        const responseText = buildListReminderTimingRepairText(data.coreUtilityState);
+        await sendWoztellTextMessage(this.env, {
+          channelId: data.channel,
+          recipientId: data.phone,
+          memberId: data.member,
+          appId: data.app,
+          text: responseText
+        });
+        logEvent("LIST_TIMING_QUESTION_REPAIRED", {
+          traceId: userTurn && userTurn.trace_id || "",
+          turnId: userTurn && userTurn.turn_id || "",
+          doName: data.doName,
+          activeList: data.coreUtilityState.activeList || ""
+        });
+        return data;
+      }
       let listName = resolveActiveListName(parsed, data.coreUtilityState);
       let listState = normalizeListState(data.coreUtilityState.listsState);
       let list;
@@ -3557,6 +3577,7 @@ export class ConversationCoordinator {
               doName: data.doName,
               userTurn: userTurn,
               recentMediaAssets: data.recentMediaAssets,
+              memoryReadModel: data.memoryReadModel,
               intent: plan.intent,
               text: text,
               visibleFacts: [analysisResult.summary],
@@ -3635,6 +3656,7 @@ export class ConversationCoordinator {
         doName: data.doName,
         userTurn: userTurn,
         recentMediaAssets: data.recentMediaAssets,
+        memoryReadModel: data.memoryReadModel,
         intent: plan.intent || "image_action",
         text: plan.user_facing_ack,
         visibleFacts: [],
@@ -3992,6 +4014,7 @@ export class ConversationCoordinator {
         doName: data.doName,
         userTurn: userTurn,
         recentMediaAssets: data.recentMediaAssets,
+        memoryReadModel: data.memoryReadModel,
         intent: plan.intent || "general",
         text: fallbackText,
         visibleFacts: [],
@@ -4021,7 +4044,8 @@ export class ConversationCoordinator {
     });
     next.memoryReadModel = buildMemoryReadModel(next, {
       memoryPolicy: policy,
-      longTermMemory: next.longTermMemory
+      longTermMemory: next.longTermMemory,
+      userTurn: userTurn
     });
 
     logEvent("MEMORY_POLICY_EVALUATED", Object.assign({
@@ -4059,7 +4083,8 @@ export class ConversationCoordinator {
     if (!shouldWriteLongTermMemory(policy)) {
       next.memoryReadModel = buildMemoryReadModel(next, {
         memoryPolicy: policy,
-        longTermMemory: next.longTermMemory
+        longTermMemory: next.longTermMemory,
+        userTurn: userTurn
       });
       logEvent("LONG_TERM_MEMORY_WRITE_SKIPPED", {
         traceId: userTurn && userTurn.trace_id || "",
@@ -4074,7 +4099,8 @@ export class ConversationCoordinator {
     next.longTermMemory = writeResult.memory || next.longTermMemory || null;
     next.memoryReadModel = buildMemoryReadModel(next, {
       memoryPolicy: policy,
-      longTermMemory: next.longTermMemory
+      longTermMemory: next.longTermMemory,
+      userTurn: userTurn
     });
     logEvent(writeResult.skipped ? "LONG_TERM_MEMORY_WRITE_SKIPPED" : "LONG_TERM_MEMORY_WRITE_DONE", {
       traceId: userTurn && userTurn.trace_id || "",
@@ -7231,6 +7257,8 @@ async function sendConversationalResponse(env, params) {
     visibleFacts: params && params.visibleFacts || [],
     nextAction: params && params.nextAction || "",
     recentMediaCount: countRecentMediaImages(params && params.recentMediaAssets || []),
+    recentMediaAssets: params && params.recentMediaAssets || [],
+    memoryReadModel: params && params.memoryReadModel || null,
     locale: "es",
     maxChars: maxChars,
     traceId: params && params.traceId || "",
@@ -7244,6 +7272,7 @@ async function sendConversationalResponse(env, params) {
     visibleFacts: baseReplyInput.visibleFacts,
     nextAction: baseReplyInput.nextAction,
     recentMediaCount: baseReplyInput.recentMediaCount,
+    memoryReadModel: baseReplyInput.memoryReadModel,
     locale: baseReplyInput.locale,
     maxChars: baseReplyInput.maxChars,
     traceId: baseReplyInput.traceId,
@@ -7277,6 +7306,7 @@ async function sendConversationalResponse(env, params) {
       visibleFacts: params && params.visibleFacts || [],
       nextAction: params && params.nextAction || "",
       locale: "es",
+      memoryReadModel: params && params.memoryReadModel || null,
       maxChars: maxChars,
       traceId: params && params.traceId || "",
       turnId: params && params.turnId || ""
@@ -7315,6 +7345,7 @@ async function sendConversationalResponse(env, params) {
       visibleFacts: params && params.visibleFacts || [],
       nextAction: params && params.nextAction || "",
       locale: "es",
+      memoryReadModel: params && params.memoryReadModel || null,
       maxChars: maxChars,
       traceId: params && params.traceId || "",
       turnId: params && params.turnId || ""
@@ -7342,10 +7373,38 @@ async function sendConversationalResponse(env, params) {
       visibleFacts: params && params.visibleFacts || [],
       nextAction: params && params.nextAction || "",
       locale: "es",
+      memoryReadModel: params && params.memoryReadModel || null,
       maxChars: maxChars,
       traceId: params && params.traceId || "",
       turnId: params && params.turnId || ""
     }, env || {});
+  }
+  const quality = evaluateCustomerReplyQuality({
+    replyText: reply.text,
+    userTurn: params && params.userTurn || {},
+    intent: params && params.intent || params && params.supervisorPlan && params.supervisorPlan.intent || "",
+    memoryReadModel: params && params.memoryReadModel || null,
+    recentMediaAssets: params && params.recentMediaAssets || []
+  });
+  if (!quality.ok && quality.repairedText) {
+    logEvent("CUSTOMER_REPLY_QUALITY_REPAIRED", {
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || "",
+      doName: params && params.doName || "",
+      reasons: quality.reasons,
+      score: quality.score
+    }, { level: "error", traceId: params && params.traceId || "" });
+    reply = composeCustomerReply(Object.assign({}, baseReplyInput, {
+      systemResult: { text: quality.repairedText }
+    }), env || {});
+  } else if (!quality.ok) {
+    logEvent("CUSTOMER_REPLY_QUALITY_FAILED", {
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || "",
+      doName: params && params.doName || "",
+      reasons: quality.reasons,
+      score: quality.score
+    }, { level: "error", traceId: params && params.traceId || "" });
   }
   if (!reply.shouldSend) return { partCount: 0 };
   const text = reply.text;
@@ -7402,6 +7461,7 @@ async function composeCustomerReplyWithOpenAI(env, params, localDraftText) {
     visibleFacts: params && params.visibleFacts || [],
     nextAction: params && params.nextAction || "",
     recentMediaCount: countRecentMediaImages(params && params.recentMediaAssets || []),
+    memoryReadModel: params && params.memoryReadModel || null,
     locale: "es"
   });
 
@@ -9098,6 +9158,28 @@ function resolveActiveListName(parsed, coreUtilityState) {
   if (state.activeList) return state.activeList;
   if (requested) return requested;
   return "pendientes";
+}
+
+function isListReminderTimingQuestionText(text) {
+  const clean = normalizeTextForIntent(text);
+  return /\b(en cuantos minutos|cuando)\b/.test(clean) &&
+    /\b(hacer acuerdo|haces acuerdo|hazme acuerdo|recordar|recuerdame|avisar|avisame)\b/.test(clean) &&
+    /\b(lista|compras|pendientes)\b/.test(clean);
+}
+
+function buildListReminderTimingRepairText(coreUtilityState) {
+  const state = normalizeCoreUtilityState(coreUtilityState || {});
+  const activeList = state.activeList || "compras";
+  const list = listItems(normalizeListState(state.listsState || { lists: state.lists || {} }), activeList);
+  const itemTexts = (Array.isArray(list.items) ? list.items : []).map(function (item) {
+    return item.text || "";
+  }).filter(Boolean).slice(0, 8);
+
+  if (itemTexts.length) {
+    return "Perdon, mezcle la lista con el recordatorio. La lista que tengo es: " + itemTexts.join(", ") + ".\n\nPara recordartela, dime en cuantos minutos u hora exacta.";
+  }
+
+  return "Perdon, esa era una pregunta sobre el recordatorio, no un item de lista. Dime en cuantos minutos quieres que te recuerde la lista.";
 }
 
 function isGenericListReference(parsed) {

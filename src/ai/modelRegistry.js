@@ -16,6 +16,7 @@ const VALID_MODELS = new Set([
   "gpt-5.4",
   "gpt-5.4-mini",
   "gpt-5.4-nano",
+  "gpt-4o-mini",
   "gpt-4.1-mini",
   "gpt-image-2",
   "whisper-1",
@@ -46,7 +47,7 @@ export function getFinalResponseModel(env) {
 }
 
 export function getCustomerReplyModel(env) {
-  const configured = env && env.CUSTOMER_REPLY_MODEL || "gpt-4.1-mini";
+  const configured = env && env.CUSTOMER_REPLY_MODEL || "gpt-4o-mini";
   const fallback = env && env.FINAL_RESPONSE_MODEL || FALLBACKS.customer_reply;
   return selectModel(configured, fallback, "customer_reply");
 }
