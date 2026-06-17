@@ -66,6 +66,19 @@ El analisis busca:
 - errores agrupados por `traceId`;
 - ultimas conversaciones problematicas.
 
+Si no existe `logs/`, el comando termina con `status: "no_logs_dir"`. Eso no significa que el Worker no tenga observabilidad; significa que no hay archivos locales capturados para analizar.
+
+## Diagnostico desde WhatsApp
+
+El runtime guarda un buffer compacto por conversacion en el Durable Object. Sirve para probar el producto desde WhatsApp sin depender de tener `wrangler tail` abierto.
+
+Comandos:
+
+- `/debug-logs` o `/trace`: envia los ultimos eventos compactos de esa conversacion.
+- `/health`: envia estado de procesamiento, pendientes, errores recientes, media, memoria y utilidades.
+
+Estos comandos no muestran payloads crudos, URLs completas, headers, tokens, audios, imagenes ni cuerpos de Woztell.
+
 ## Como pedirle a Codex que investigue un bug
 
 Primero genera un bundle:

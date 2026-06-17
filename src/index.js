@@ -26,7 +26,36 @@
 // - IMAGE_MESSAGE_WAIT_SECONDS = 8
 // - BUFFER_MAX_WAIT_SECONDS = 15
 import { captureError, createTraceId, logEvent } from "./logger.js";
-import { normalizeInboundEvent, normalizeEventType, shouldIgnoreInboundEvent } from "./conversation/inboundEventCollector.js";
+import {
+  appendTraceEvent,
+  buildProductHealthSnapshot,
+  buildTraceSnapshot,
+  formatProductHealthForWhatsApp,
+  formatTraceSnapshotForWhatsApp,
+  normalizeTraceEvents
+} from "./observability/traceStore.js";
+import { normalizeInboundEvent, shouldIgnoreInboundEvent } from "./channels/woztell/eventNormalizer.js";
+import {
+  buildFileMetadata as buildWoztellFileMetadata,
+  buildLocationMetadata as buildWoztellLocationMetadata,
+  buildVideoMetadata as buildWoztellVideoMetadata,
+  extractMediaFromPayload as extractWoztellMediaFromPayload,
+  extractQuotedMessageReference as extractWoztellQuotedMessageReference,
+  extractWoztellMessage as extractWoztellMessageFromAdapter,
+  normalizeIncomingMessage as normalizeWoztellIncomingMessage
+} from "./channels/woztell/eventNormalizer.js";
+import {
+  buildWoztellSendAttempts as buildOutboundWoztellSendAttempts,
+  fixMojibake as fixOutboundWoztellMojibake,
+  logWoztellSendShape as logOutboundWoztellSendShape,
+  redactWoztellPayloadForLog as redactOutboundWoztellPayloadForLog,
+  selectWoztellSendToken as selectOutboundWoztellSendToken,
+  sendWoztellImageMessage as sendOutboundWoztellImageMessage,
+  sendWoztellResponse as sendOutboundWoztellResponse,
+  sendWoztellTemplateMessage as sendOutboundWoztellTemplateMessage,
+  sendWoztellTextMessage as sendOutboundWoztellTextMessage,
+  shouldRetryWoztellWithMember as shouldOutboundRetryWoztellWithMember
+} from "./channels/woztell/outboundAdapter.js";
 import {
   appendPendingEvent,
   getTurnAggregationTiming,
@@ -37,9 +66,41 @@ import {
 } from "./conversation/turnAggregator.js";
 import { attachUserTurnContract, buildCombinedUserText, cleanUserVisibleText } from "./conversation/userTurnBuilder.js";
 import { buildMediaBatchFromUserTurn } from "./conversation/mediaBatchBuilder.js";
-import { getCoreFeatureFlags, updateConversationMemory } from "./conversationMemory.js";
+import { buildMemoryIdentity, buildMemoryReadModel, getCoreFeatureFlags, updateConversationMemory } from "./memory/shortTermMemory.js";
+import {
+  buildMemoryPolicy,
+  grantLongTermMemoryConsent,
+  revokeLongTermMemoryConsent,
+  shouldReadLongTermMemory,
+  shouldWriteLongTermMemory,
+  summarizeMemoryPolicy
+} from "./memory/memoryPolicy.js";
+import {
+  createLongTermMemoryAdapterFromEnv,
+  readLongTermMemory,
+  writeLongTermMemory
+} from "./memory/longTermMemoryAdapter.js";
+import { appendProcessedMessageIds, buildSeenMessageIds, isDuplicateMessage, markMessagesProcessed } from "./core/idempotencyStore.js";
+import {
+  buildAppendProcessTiming,
+  getBufferTimingConfig as getCoreBufferTimingConfig,
+  hasOpenPendingTurn as hasCoreOpenPendingTurn,
+  shouldHoldMediaTurnForMoreEvents as shouldCoreHoldMediaTurnForMoreEvents
+} from "./core/turnBufferPolicy.js";
+import {
+  buildPendingAudioDecision,
+  buildProcessingLockDecision,
+  finalizeProcessedTurnState,
+  markPendingAudioTimedOut
+} from "./core/turnPipeline.js";
 import { routeCoreUtilityIntent } from "./coreUtilityRouter.js";
-import { runAgentRuntime } from "./agent/agentRuntime.js";
+import { summarizePipelineForLog } from "./agent/intentToolResponsePipeline.js";
+import {
+  buildAgentExecutionPlan,
+  buildPipelineDescriptorFromExecution,
+  runAgentExecutionPlan,
+  summarizeAgentExecutionPlan
+} from "./agent/agentOrchestrationPipeline.js";
 import { formatTasksForWhatsApp, normalizeTaskState } from "./agent/taskEngine.js";
 import { createReminder, listReminders, selectReminderDeliveryPath } from "./modules/reminders/index.js";
 import { addListItems, createList, listItems, markListItemDone, normalizeListState, removeListItems } from "./modules/lists/index.js";
@@ -48,7 +109,6 @@ import { buildRequestContext, buildSupervisorInput } from "./context/requestCont
 import {
   buildWoztellConversationIdentity,
   buildWoztellEventSummary,
-  buildWoztellSendAttempts as buildAdapterWoztellSendAttempts,
   normalizeWoztellMessageEventMeta
 } from "./channels/woztellChannelAdapter.js";
 import {
@@ -104,7 +164,7 @@ const USER_MESSAGES = {
   calendarReady: "Te preparé un calendario de contenido. ¿Lo apruebas completo o quieres cambiar algún post?",
   bulkPostsReady: "Listo, generé los posts del calendario. Puedes aprobar todos, cambiar un número específico o dejarlos listos para publicar.",
   bulkApproved: "Perfecto, aprobé los posts seleccionados ?\n¿Quieres dejarlos listos para publicar?",
-  bulkReadyToPublish: "Listo, los posts seleccionados quedaron como ready_to_publish y scheduled_pending_meta ?"
+  bulkReadyToPublish: "Listo, dejé los posts seleccionados listos para publicar. Todavía no se publican automáticamente."
 };
 
 export default {
@@ -567,9 +627,7 @@ export class ConversationCoordinator {
       hasLastImageUrl: Boolean(data.campaignState.last_image_url)
     }));
 
-    const seenMessageIds = new Set([].concat(data.processedMessageIds || []).concat((data.pendingMessages || []).map(function (msg) {
-      return msg.messageId;
-    })));
+    const seenMessageIds = buildSeenMessageIds(data);
     const ignoreInbound = shouldIgnoreInboundEvent(inboundEvent, seenMessageIds, { traceId: incomingTraceId });
     if (ignoreInbound.ignore) {
       if (inboundEvent && inboundEvent.isUnsupported && String(inboundEvent.errorCode || "") === "131051") {
@@ -589,9 +647,7 @@ export class ConversationCoordinator {
       return jsonResponse({ status: "ignored", reason: ignoreInbound.reason, messageId: messageId });
     }
 
-    if (data.processedMessageIds.includes(messageId) || data.pendingMessages.some(function (msg) {
-      return msg.messageId === messageId;
-    })) {
+    if (isDuplicateMessage(data, messageId)) {
       console.log("DO_DUPLICATE_MESSAGE_IGNORED:", messageId);
       logEvent("INBOUND_EVENT_DEDUPED", {
         traceId: incomingTraceId,
@@ -643,6 +699,42 @@ export class ConversationCoordinator {
         status: "debug_openai_sent",
         ok: diagnostic.ok,
         diagnostic: diagnostic
+      });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/debug-logs" || normalizeTextForIntent(normalized.text) === "/trace") {
+      const traceSnapshot = buildTraceSnapshot(data, { limit: 14 });
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: formatTraceSnapshotForWhatsApp(traceSnapshot)
+      });
+
+      return jsonResponse({
+        status: "debug_logs_sent",
+        trace: traceSnapshot
+      });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/health") {
+      const healthSnapshot = buildProductHealthSnapshot(data, this.env);
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: formatProductHealthForWhatsApp(healthSnapshot)
+      });
+
+      return jsonResponse({
+        status: "health_sent",
+        health: healthSnapshot
       });
     }
 
@@ -800,6 +892,11 @@ export class ConversationCoordinator {
     }
 
     if (normalizeTextForIntent(normalized.text) === "/memory") {
+      data.memoryPolicy = buildMemoryPolicy(this.env, data, { shortTermLimit: 20 });
+      data.memoryReadModel = buildMemoryReadModel(data, {
+        memoryPolicy: data.memoryPolicy,
+        longTermMemory: data.longTermMemory
+      });
       await sendWoztellTextMessage(this.env, {
         channelId: data.channel,
         recipientId: data.phone,
@@ -812,10 +909,68 @@ export class ConversationCoordinator {
       return jsonResponse({ status: "memory_sent" });
     }
 
+    if (normalizeTextForIntent(normalized.text) === "/memory-on") {
+      data = grantLongTermMemoryConsent(data, {
+        source: "whatsapp_command",
+        now: new Date().toISOString()
+      });
+      data.memoryPolicy = buildMemoryPolicy(this.env, data, { shortTermLimit: 20 });
+      data.memoryReadModel = buildMemoryReadModel(data, {
+        memoryPolicy: data.memoryPolicy,
+        longTermMemory: data.longTermMemory
+      });
+      data.updatedAt = new Date().toISOString();
+      await this.saveData(data);
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: "Listo, activé tu permiso para memoria larga opcional. Se usará solo si la configuración del Worker la tiene habilitada."
+      });
+
+      return jsonResponse({ status: "long_term_memory_consent_granted" });
+    }
+
+    if (normalizeTextForIntent(normalized.text) === "/memory-off") {
+      await this.forgetLongTermMemory(data);
+      data = revokeLongTermMemoryConsent(data, {
+        source: "whatsapp_command",
+        now: new Date().toISOString()
+      });
+      data.memoryPolicy = buildMemoryPolicy(this.env, data, { shortTermLimit: 20 });
+      data.memoryReadModel = buildMemoryReadModel(data, {
+        memoryPolicy: data.memoryPolicy,
+        longTermMemory: null
+      });
+      data.updatedAt = new Date().toISOString();
+      await this.saveData(data);
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        swallowErrors: true,
+        text: "Listo, desactivé y borré tu memoria larga opcional. La memoria corta de la conversación seguirá funcionando de forma compacta."
+      });
+
+      return jsonResponse({ status: "long_term_memory_consent_revoked" });
+    }
+
     if (normalizeTextForIntent(normalized.text) === "/forget-memory") {
+      await this.forgetLongTermMemory(data);
+      data = revokeLongTermMemoryConsent(data, {
+        source: "forget_memory_command",
+        now: new Date().toISOString()
+      });
       data.customerMemory = null;
       data.userStyleProfile = null;
       data.conversationSummary = null;
+      data.longTermMemory = null;
+      data.memoryReadModel = null;
       data.updatedAt = new Date().toISOString();
       await this.saveData(data);
 
@@ -853,6 +1008,7 @@ export class ConversationCoordinator {
     }
 
     if (normalizeTextForIntent(normalized.text) === "/forget-all" || isForgetAllText(normalized.text)) {
+      await this.forgetLongTermMemory(data);
       data = forgetAllConversationData(data, "manual_forget_all");
       data.updatedAt = new Date().toISOString();
       await this.saveData(data);
@@ -1180,9 +1336,7 @@ export class ConversationCoordinator {
         pendingCount: data.pendingMessages.length
       });
 
-      const seenMessageIds = new Set([].concat(data.processedMessageIds || []).concat((data.pendingMessages || []).map(function (msg) {
-        return msg.messageId;
-      })));
+      const seenMessageIds = buildSeenMessageIds(data);
       if (seenMessageIds.has(messageId)) {
         logEvent("INBOUND_EVENT_DEDUPED", {
           traceId: incomingTraceId || data.currentTraceId || "",
@@ -1393,10 +1547,6 @@ export class ConversationCoordinator {
         }
       }
 
-      const waitReason = data.hasMedia ? "media_message" : "text_or_audio_transcript";
-      const waitSeconds = data.hasMedia ? timing.imageMessageWaitSeconds : timing.bufferWaitSeconds;
-      const desiredProcessAt = data.lastMessageAt + waitSeconds * 1000;
-      const maxProcessAt = data.firstMessageAt + timing.bufferMaxWaitSeconds * 1000;
       const activeTaskForTiming = normalizeActiveTask(data.campaignState.active_task);
       if (activeTaskForTiming && activeTaskForTiming.taskMediaFileIds.length) {
         const taskFileIds = new Set(activeTaskForTiming.taskMediaFileIds);
@@ -1412,16 +1562,21 @@ export class ConversationCoordinator {
         })
         : null;
 
-      data.processAfter = taskDecision && activeTaskForTiming && activeTaskForTiming.status === "awaiting_media"
-        ? taskDecision.nextProcessAt || Math.min(desiredProcessAt, maxProcessAt)
-        : Math.min(desiredProcessAt, maxProcessAt);
-      const mediaHoldAfterAppend = shouldHoldMediaTurnForMoreEvents(data, data.pendingMessages, this.env);
-      if (mediaHoldAfterAppend.hold) {
-        data.processAfter = mediaHoldAfterAppend.nextProcessAt;
-      }
-      if (userDone && existingOpen) {
-        data.processAfter = now;
-      }
+      const appendTiming = buildAppendProcessTiming({
+        data: data,
+        timing: timing,
+        hasMedia: data.hasMedia,
+        taskDecision: taskDecision,
+        activeTask: activeTaskForTiming,
+        mediaHold: shouldHoldMediaTurnForMoreEvents(data, data.pendingMessages, this.env),
+        userDone: userDone,
+        existingOpen: existingOpen,
+        now: now
+      });
+      const waitReason = appendTiming.waitReason;
+      const desiredProcessAt = appendTiming.desiredProcessAt;
+      const maxProcessAt = appendTiming.maxProcessAt;
+      data.processAfter = appendTiming.processAfter;
       data.updatedAt = new Date().toISOString();
 
       await this.saveData(data);
@@ -1633,16 +1788,15 @@ export class ConversationCoordinator {
 
     if (data.processing) {
       const now = Date.now();
-      const processingStartedAt = Number(data.processingStartedAt || 0);
-      const lockAgeMs = processingStartedAt ? now - processingStartedAt : 0;
+      const lockDecision = buildProcessingLockDecision(data, { now: now });
 
-      if (processingStartedAt && lockAgeMs <= 120000) {
+      if (lockDecision.action === "skip") {
         console.log("DO_PROCESS_BUFFER_SKIPPED:", JSON.stringify({
-          reason: "already_processing",
+          reason: lockDecision.reason,
           doName: data.doName || "",
           pendingCount: data.pendingMessages.length,
           processingStartedAt: data.processingStartedAt || null,
-          lockAgeMs: lockAgeMs
+          lockAgeMs: lockDecision.lockAgeMs
         }));
         return;
       }
@@ -1651,7 +1805,7 @@ export class ConversationCoordinator {
         doName: data.doName || "",
         processingStartedAt: data.processingStartedAt,
         now: now,
-        lockAgeMs: lockAgeMs,
+        lockAgeMs: lockDecision.lockAgeMs,
         pendingCount: data.pendingMessages.length
       }));
 
@@ -1662,18 +1816,11 @@ export class ConversationCoordinator {
 
     let messages = data.pendingMessages.slice();
     const audioWait = getAudioTurnWaitConfig(this.env);
-    const pendingAudioMessages = messages.filter(function (message) {
-      return message.awaitingTranscription;
-    });
+    const audioDecision = buildPendingAudioDecision(messages, audioWait, { now: Date.now() });
 
-    if (pendingAudioMessages.length) {
-      const oldestAudioAt = Math.min.apply(null, pendingAudioMessages.map(function (message) {
-        return Date.parse(message.receivedAt || "") || Date.now();
-      }));
-      const audioWaitAgeMs = Date.now() - oldestAudioAt;
-
-      if (audioWaitAgeMs < audioWait.maxAudioTurnWaitMs) {
-        data.processAfter = Date.now() + audioWait.retryWaitMs;
+    if (audioDecision.action !== "continue") {
+      if (audioDecision.action === "wait") {
+        data.processAfter = audioDecision.nextProcessAt;
         data.updatedAt = new Date().toISOString();
         await this.saveData(data);
         await this.state.storage.setAlarm(data.processAfter);
@@ -1682,45 +1829,37 @@ export class ConversationCoordinator {
           doName: data.doName,
           turnId: data.currentTurnId || "",
           reason: "waiting_audio_transcription",
-          pendingAudioCount: pendingAudioMessages.length,
-          waitAgeMs: audioWaitAgeMs,
-          retryInMs: audioWait.retryWaitMs
+          pendingAudioCount: audioDecision.pendingAudioCount,
+          waitAgeMs: audioDecision.waitAgeMs,
+          retryInMs: audioDecision.retryWaitMs
         }));
         logEvent("TURN_WAITING_AUDIO_TRANSCRIPT", {
           traceId: data.currentTraceId || "",
           turnId: data.currentTurnId || "",
           doName: data.doName,
-          pendingAudioCount: pendingAudioMessages.length,
-          waitAgeMs: audioWaitAgeMs,
-          retryInMs: audioWait.retryWaitMs
+          pendingAudioCount: audioDecision.pendingAudioCount,
+          waitAgeMs: audioDecision.waitAgeMs,
+          retryInMs: audioDecision.retryWaitMs
         });
 
         return;
       }
 
-      data.pendingMessages = data.pendingMessages.map(function (message) {
-        if (!message.awaitingTranscription) return message;
-
-        return Object.assign({}, message, {
-          awaitingTranscription: false,
-          audioStatus: "failed",
-          audioError: "AUDIO_TIMEOUT"
-        });
-      });
+      data.pendingMessages = markPendingAudioTimedOut(data.pendingMessages);
       messages = data.pendingMessages.slice();
 
       console.log("AUDIO_TIMEOUT:", JSON.stringify({
         doName: data.doName,
         turnId: data.currentTurnId || "",
-        pendingAudioCount: pendingAudioMessages.length,
-        waitAgeMs: audioWaitAgeMs
+        pendingAudioCount: audioDecision.pendingAudioCount,
+        waitAgeMs: audioDecision.waitAgeMs
       }));
       logEvent("TURN_AUDIO_TIMEOUT", {
         traceId: data.currentTraceId || "",
         turnId: data.currentTurnId || "",
         doName: data.doName,
-        pendingAudioCount: pendingAudioMessages.length,
-        waitAgeMs: audioWaitAgeMs
+        pendingAudioCount: audioDecision.pendingAudioCount,
+        waitAgeMs: audioDecision.waitAgeMs
       });
     }
 
@@ -1790,8 +1929,7 @@ export class ConversationCoordinator {
           doName: data.doName,
           type: activeTaskBeforeProcessing.type
         });
-        for (const msg of messages) data.processedMessageIds.push(msg.messageId);
-        data.processedMessageIds = data.processedMessageIds.slice(-80);
+        data = markMessagesProcessed(data, messages);
         data.pendingMessages = [];
         data.hasMedia = false;
         data.currentTurnId = "";
@@ -1877,10 +2015,24 @@ export class ConversationCoordinator {
         memberId: data.member || "",
         appId: data.app || ""
       };
+      data = appendTraceEvent(data, "USER_TURN_READY", {
+        traceId: userTurn.trace_id,
+        turnId: userTurn.turn_id,
+        doName: data.doName,
+        inputTypes: userTurn.input_types,
+        textCount: userTurn.text_count,
+        audioCount: userTurn.audio_count,
+        imageCount: userTurn.image_count,
+        videoCount: userTurn.video_count,
+        fileCount: userTurn.file_count,
+        contextPolicy: userTurn.context_policy
+      }, activeLogContext);
       data = updateConversationMemory(data, userTurn, {
         flags: coreFlags,
         utilityState: data.coreUtilityState
       });
+      const memoryLifecycle = await this.prepareMemoryForTurn(data, userTurn, coreFlags);
+      data = memoryLifecycle.data;
       if (shouldExitMarketingContext(userTurn.current_turn_text)) {
         data = resetCampaignState(data, "general_assistant_requested");
       }
@@ -1900,17 +2052,33 @@ export class ConversationCoordinator {
         conversationSummary: data.conversationSummary,
         customerMemory: data.customerMemory,
         utilityMemory: data.utilityMemory,
+        longTermMemory: data.longTermMemory,
+        memoryPolicy: data.memoryPolicy,
+        memoryReadModel: data.memoryReadModel,
         mediaMemorySummary: data.campaignState.media_batch_summary,
         activeTask: userTurn.activeTask,
         recentLimit: 20
       });
       data.requestContext = requestContext;
+      data = appendTraceEvent(data, "REQUEST_CONTEXT_COMPACTED", {
+        traceId: userTurn.trace_id,
+        turnId: userTurn.turn_id,
+        doName: data.doName,
+        recentTurnCount: recentConversationWindow.length,
+        hasConversationSummary: Boolean(data.conversationSummary),
+        hasCustomerMemory: Boolean(data.customerMemory),
+        hasLongTermMemory: Boolean(data.longTermMemory),
+        hasUtilityMemory: Boolean(data.utilityMemory)
+      }, activeLogContext);
       const supervisorPlan = createConversationSupervisorPlan(buildSupervisorInput({
         userTurn: userTurn,
         requestContext: requestContext,
         activeContext: data.activeContext,
         conversationSummary: data.conversationSummary,
         utilityMemory: data.utilityMemory,
+        longTermMemory: data.longTermMemory,
+        memoryPolicy: data.memoryPolicy,
+        memoryReadModel: data.memoryReadModel,
         mediaMemorySummary: data.campaignState.media_batch_summary,
         activeTask: userTurn.activeTask,
         supervisorConfig: getSupervisorConfig(this.env)
@@ -1931,6 +2099,16 @@ export class ConversationCoordinator {
         lastUserGoal: supervisorPlan.currentUserGoal || "",
         pendingClarification: supervisorPlan.needsClarification ? supervisorPlan.clarificationQuestion : ""
       });
+      data = appendTraceEvent(data, "SUPERVISOR_PLAN_CREATED", {
+        traceId: userTurn.trace_id,
+        turnId: userTurn.turn_id,
+        doName: data.doName,
+        intent: supervisorPlan.intent,
+        targetModule: supervisorPlan.targetModule,
+        responseStrategy: supervisorPlan.responseStrategy,
+        mediaScope: supervisorPlan.mediaScope,
+        needsClarification: Boolean(supervisorPlan.needsClarification)
+      }, activeLogContext);
       logSupervisorPlan(supervisorPlan, userTurn, data, recentConversationWindow);
       const mediaBatch = userTurn.media_batch;
       data.campaignState.media_batch_summary = buildMediaBatchSummary(mediaBatch);
@@ -1949,6 +2127,14 @@ export class ConversationCoordinator {
         contextPolicy: userTurn.context_policy,
         inputTypes: userTurn.input_types
       });
+      data = appendTraceEvent(data, "TURN_BUFFER_READY", {
+        traceId: userTurn.trace_id,
+        turnId: userTurn.turn_id,
+        doName: data.doName,
+        messageCount: messages.length,
+        contextPolicy: userTurn.context_policy,
+        inputTypes: userTurn.input_types
+      }, activeLogContext);
       console.log("TURN_INPUT_TYPES:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, inputTypes: userTurn.input_types }));
       console.log("TURN_TEXT_COUNT:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, count: userTurn.text_count }));
       console.log("TURN_AUDIO_COUNT:", JSON.stringify({ doName: data.doName, turnId: userTurn.turn_id, count: userTurn.audio_count }));
@@ -2026,6 +2212,17 @@ export class ConversationCoordinator {
           workflow_status: data.campaignState.workflow_status,
           campaign_type: data.campaignState.campaign_type
         });
+        data = appendTraceEvent(data, "MEDIA_BATCH_CREATED", {
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName,
+          messageCount: messages.length,
+          assetCount: mediaBatch.assets.length,
+          analyzedAssetCount: mediaBatch.analyzedAssetCount,
+          failedAssetCount: mediaBatch.failedAssetCount,
+          workflow_status: data.campaignState.workflow_status,
+          campaign_type: data.campaignState.campaign_type
+        }, activeLogContext);
         console.log("MEDIA_BATCH_ASSET_COUNT:", JSON.stringify({
           doName: data.doName,
           assetCount: mediaBatch.assets.length,
@@ -2184,12 +2381,35 @@ export class ConversationCoordinator {
           assetCount: assetCount
         }));
       } else {
+      const utilityNow = getReminderReferenceNow(data, userTurn);
       const utilityRoute = routeCoreUtilityIntent(userTurn, {
         flags: coreFlags,
         timezone: this.env.USER_TIMEZONE || "America/Bogota",
-        now: getReminderReferenceNow(data, userTurn),
+        now: utilityNow,
         pendingReminderDraft: data.coreUtilityState && data.coreUtilityState.pendingReminderDraft
       });
+      const agentExecutionPlan = buildAgentExecutionPlan({
+        data: data,
+        userTurn: userTurn,
+        utilityRoute: utilityRoute,
+        now: utilityNow
+      });
+      logEvent("AGENT_EXECUTION_PLAN_CREATED", Object.assign({
+        doName: data.doName
+      }, summarizeAgentExecutionPlan(agentExecutionPlan)));
+      data = appendTraceEvent(data, "AGENT_EXECUTION_PLAN_CREATED", Object.assign({
+        traceId: userTurn.trace_id,
+        turnId: userTurn.turn_id,
+        doName: data.doName
+      }, summarizeAgentExecutionPlan(agentExecutionPlan)), activeLogContext);
+      logEvent("INTENT_TOOL_RESPONSE_PIPELINE", Object.assign({
+        doName: data.doName
+      }, summarizePipelineForLog(buildPipelineDescriptorFromExecution({
+        stage: "execution_planned",
+        userTurn: userTurn,
+        utilityRoute: utilityRoute,
+        executionPlan: agentExecutionPlan
+      }))));
       if (isMarketingRoute(utilityRoute, userTurn)) {
         logEvent("LEGACY_MARKETING_PATH_ALLOWED", {
           traceId: userTurn.trace_id,
@@ -2226,15 +2446,28 @@ export class ConversationCoordinator {
         pendingClarification: ""
       });
 
-      if (isVisionUtilityRoute(utilityRoute)) {
+      if (agentExecutionPlan.shouldUseVisionUtility) {
         data = await this.handleVisionUtility(data, utilityRoute, userTurn, messages);
-      } else if (isAgentRuntimeRoute(utilityRoute)) {
-        const runtimeResult = runAgentRuntime({
+      } else if (agentExecutionPlan.shouldUseAgentRuntime) {
+        const execution = runAgentExecutionPlan({
           data: data,
           userTurn: userTurn,
-          utilityRoute: utilityRoute
+          utilityRoute: utilityRoute,
+          executionPlan: agentExecutionPlan,
+          now: utilityNow
         });
-        if (runtimeResult.handled) {
+        const runtimeResult = execution.runtimeResult || { handled: false };
+        if (execution.handled) {
+          logEvent("INTENT_TOOL_RESPONSE_PIPELINE", Object.assign({
+            doName: data.doName
+          }, summarizePipelineForLog(buildPipelineDescriptorFromExecution({
+            stage: "tool_execution_done",
+            userTurn: userTurn,
+            utilityRoute: utilityRoute,
+            executionPlan: agentExecutionPlan,
+            runtimeResult: runtimeResult,
+            finalResponse: execution.finalResponse || { responseText: runtimeResult.responseText || "" }
+          }))));
           data = runtimeResult.data;
           data.activeContext = updateConversationContext(data.activeContext, {
             userTurn: userTurn,
@@ -2270,8 +2503,17 @@ export class ConversationCoordinator {
           console.log("ORCHESTRATOR_PLAN:", JSON.stringify(plan));
           data = await this.executePlan(data, messages, plan, userTurn);
         }
-      } else if (utilityRoute.shouldHandleInCore) {
+      } else if (agentExecutionPlan.shouldUseCoreUtility) {
         data = await this.handleCoreUtility(data, utilityRoute, userTurn);
+        logEvent("INTENT_TOOL_RESPONSE_PIPELINE", Object.assign({
+          doName: data.doName
+        }, summarizePipelineForLog(buildPipelineDescriptorFromExecution({
+          stage: "core_utility_done",
+          userTurn: userTurn,
+          utilityRoute: utilityRoute,
+          executionPlan: agentExecutionPlan,
+          finalResponse: { responseText: "core_utility_result" }
+        }))));
       } else {
       const plan = await callOrchestratorPlan(this.env, {
         doName: data.doName,
@@ -2295,31 +2537,33 @@ export class ConversationCoordinator {
       }
       }
 
-      for (const msg of messages) {
-        data.processedMessageIds.push(msg.messageId);
-      }
-
-      data.processedMessageIds = data.processedMessageIds.slice(-80);
-      data.pendingMessages = data.pendingMessages.filter(function (pending) {
-        return !messages.some(function (processed) {
-          return processed.messageId === pending.messageId;
-        });
+      data = await this.persistMemoryForTurn(data, userTurn, memoryLifecycle);
+      data = finalizeProcessedTurnState(data, messages, {
+        activeTaskBeforeProcessing: activeTaskBeforeProcessing
       });
-      data.hasMedia = data.pendingMessages.some(function (pending) {
-        return pending.fileId || ["IMAGE", "VIDEO"].includes(pending.type || "");
+      logEvent("TURN_PROCESSING_DONE", {
+        traceId: userTurn.trace_id,
+        turnId: userTurn.turn_id,
+        doName: data.doName,
+        messageCount: messages.length,
+        pendingCount: data.pendingMessages.length,
+        intent: supervisorPlan.intent,
+        targetModule: supervisorPlan.targetModule || ""
       });
-      if (!data.pendingMessages.length) {
-        data.currentTurnId = "";
-        data.currentTraceId = "";
-        if (activeTaskBeforeProcessing && activeTaskBeforeProcessing.status === "awaiting_media") {
-          data.campaignState.active_task = null;
-          data.campaignState.task_media_assets = [];
-        }
-      }
-      data.firstMessageAt = data.pendingMessages.length ? Date.now() : 0;
-      data.lastMessageAt = data.pendingMessages.length ? Date.now() : 0;
-      data.processAfter = 0;
-      data.updatedAt = new Date().toISOString();
+      data = appendTraceEvent(data, "TURN_PROCESSING_DONE", {
+        traceId: userTurn.trace_id,
+        turnId: userTurn.turn_id,
+        doName: data.doName,
+        messageCount: messages.length,
+        pendingCount: data.pendingMessages.length,
+        hasMedia: data.hasMedia,
+        intent: supervisorPlan.intent,
+        targetModule: supervisorPlan.targetModule || ""
+      }, {
+        traceId: userTurn.trace_id,
+        turnId: userTurn.turn_id,
+        doName: data.doName
+      });
       success = true;
     } catch (error) {
       const fallbackReason = summarizeErrorForLog(error);
@@ -2336,6 +2580,18 @@ export class ConversationCoordinator {
       console.error("DO_PROCESS_BUFFER_ERROR:", fallbackReason);
 
       data = await this.getData();
+      data = appendTraceEvent(data, "TURN_PROCESSING_FAILED", {
+        traceId: data.currentTraceId || "",
+        turnId: data.currentTurnId || "",
+        doName: data.doName,
+        stage: "processBuffer",
+        reason: fallbackReason
+      }, {
+        level: "error",
+        traceId: data.currentTraceId || "",
+        turnId: data.currentTurnId || "",
+        doName: data.doName
+      });
       data.updatedAt = new Date().toISOString();
       shouldSendFallback = true;
     } finally {
@@ -2380,6 +2636,17 @@ export class ConversationCoordinator {
         doName: data.doName,
         reason: "process_buffer_error",
         fallbackReason: "See FALLBACK_REASON for this traceId"
+      });
+      data = appendTraceEvent(data, "USER_FALLBACK_SENT", {
+        traceId: data.currentTraceId || "",
+        turnId: data.currentTurnId || "",
+        doName: data.doName,
+        reason: "process_buffer_error",
+        fallbackReason: "See FALLBACK_REASON for this traceId"
+      }, {
+        traceId: data.currentTraceId || "",
+        turnId: data.currentTurnId || "",
+        doName: data.doName
       });
 
       data.pendingMessages = data.pendingMessages.filter(function (pending) {
@@ -2688,6 +2955,90 @@ export class ConversationCoordinator {
     const route = utilityRoute || {};
     data.coreUtilityState = normalizeCoreUtilityState(data.coreUtilityState);
 
+    if (route.intent === "list_reminder") {
+      const parsed = route.parsed || {};
+      const listParsed = parsed.list || {};
+      const reminderParsed = parsed.reminder || {};
+      const listName = resolveActiveListName(listParsed, data.coreUtilityState);
+      let listState = normalizeListState(data.coreUtilityState.listsState);
+      listState = addListItems(listState, listName, listParsed.items || []);
+      const list = listItems(listState, listName);
+
+      data.coreUtilityState.listsState = listState;
+      data.coreUtilityState.lists = listState.lists;
+      data.coreUtilityState.activeList = listName;
+
+      const resolvedReminder = resolveReminderReferences(
+        Object.assign({}, reminderParsed, {
+          title: formatListGoal(list),
+          context: [reminderParsed.context || "", formatListGoal(list)].filter(Boolean).join("\n")
+        }),
+        data.activeContext,
+        data.customerMemory,
+        data.coreUtilityState,
+        userTurn
+      );
+      const mergedReminder = mergeReminderDraft(data.coreUtilityState.pendingReminderDraft, resolvedReminder, userTurn);
+
+      if (mergedReminder.missingFields && mergedReminder.missingFields.length) {
+        data.coreUtilityState.pendingReminderDraft = buildPendingReminderDraft(mergedReminder, userTurn);
+        const question = mergedReminder.missingFields.includes("date")
+          ? "¿Para qué fecha quieres que te lo recuerde?"
+          : mergedReminder.missingFields.includes("time")
+            ? "¿A qué hora quieres que te lo recuerde?"
+            : "¿Qué quieres que te recuerde?";
+
+        await sendWoztellTextMessage(this.env, {
+          channelId: data.channel,
+          recipientId: data.phone,
+          memberId: data.member,
+          appId: data.app,
+          text: question
+        });
+        return data;
+      }
+
+      const reminder = createReminder(data.coreUtilityState.reminders, buildReminderForConversation(mergedReminder, data, this.env, userTurn));
+      data.coreUtilityState.reminders = data.coreUtilityState.reminders.concat([reminder]);
+      data.coreUtilityState.pendingReminderDraft = null;
+      await this.scheduleNextReminderAlarm(data);
+
+      const responseText = [
+        formatListConfirmationForWhatsApp(listParsed, list, userTurn),
+        "Te lo recordaré por WhatsApp: " + (reminder.title || formatListGoal(list)) + "."
+      ].join("\n");
+      data.activeContext = updateConversationContext(data.activeContext, {
+        userTurn: userTurn,
+        route: route,
+        campaignState: data.campaignState,
+        lastUserGoal: formatListGoal(list),
+        pendingClarification: ""
+      });
+      data.campaignState.history = appendHistory(data.campaignState.history, {
+        role: "assistant",
+        type: "TEXT",
+        text: responseText,
+        at: new Date().toISOString()
+      });
+
+      await sendWoztellTextMessage(this.env, {
+        channelId: data.channel,
+        recipientId: data.phone,
+        memberId: data.member,
+        appId: data.app,
+        text: responseText
+      });
+      logEvent("LIST_REMINDER_CREATED", {
+        traceId: userTurn && userTurn.trace_id || "",
+        turnId: userTurn && userTurn.turn_id || "",
+        doName: data.doName,
+        listName: list.name,
+        itemCount: Array.isArray(list.items) ? list.items.length : 0,
+        reminderId: reminder.reminderId || reminder.id
+      });
+      return data;
+    }
+
     if (route.intent === "reminder") {
       const parsed = mergeReminderDraft(
         data.coreUtilityState.pendingReminderDraft,
@@ -2799,9 +3150,10 @@ export class ConversationCoordinator {
 
     if (route.intent === "list") {
       const parsed = route.parsed || {};
-      const listName = resolveActiveListName(parsed, data.coreUtilityState);
+      let listName = resolveActiveListName(parsed, data.coreUtilityState);
       let listState = normalizeListState(data.coreUtilityState.listsState);
       let list;
+      let responseParsed = parsed;
 
       if (parsed.action === "create") {
         listState = createList(listState, listName);
@@ -2819,6 +3171,26 @@ export class ConversationCoordinator {
         list = listItems(listState, listName);
       }
 
+      const audioRepair = !list.items.length ? buildAudioListRepairCandidate(data, userTurn) : null;
+      if (audioRepair && audioRepair.items.length) {
+        listName = audioRepair.listName || listName || "compras";
+        listState = addListItems(listState, listName, audioRepair.items);
+        list = listItems(listState, listName);
+        responseParsed = Object.assign({}, parsed, {
+          action: "add",
+          items: audioRepair.items,
+          listName: listName
+        });
+        logEvent("LIST_REPAIRED_FROM_AUDIO_MEMORY", {
+          traceId: userTurn && userTurn.trace_id || "",
+          turnId: userTurn && userTurn.turn_id || "",
+          doName: data.doName,
+          listName: listName,
+          itemCount: audioRepair.items.length,
+          source: audioRepair.source
+        });
+      }
+
       data.coreUtilityState.listsState = listState;
       data.coreUtilityState.lists = listState.lists;
       data.coreUtilityState.activeList = listName;
@@ -2830,7 +3202,7 @@ export class ConversationCoordinator {
         pendingClarification: ""
       });
 
-      const listText = formatListConfirmationForWhatsApp(parsed, list, userTurn);
+      const listText = formatListConfirmationForWhatsApp(responseParsed, list, userTurn);
       await sendWoztellTextMessage(this.env, {
         channelId: data.channel,
         recipientId: data.phone,
@@ -3635,6 +4007,95 @@ export class ConversationCoordinator {
     return data;
   }
 
+  async prepareMemoryForTurn(data, userTurn, coreFlags) {
+    const policy = buildMemoryPolicy(this.env, data, {
+      retentionMode: coreFlags && coreFlags.memoryRetentionMode,
+      shortTermLimit: 20
+    });
+    const identity = buildMemoryIdentity(data);
+    const adapter = createLongTermMemoryAdapterFromEnv(this.env, policy);
+    const readResult = await readLongTermMemory(adapter, identity, policy);
+    const next = Object.assign({}, data || {}, {
+      memoryPolicy: policy,
+      longTermMemory: readResult.memory || null
+    });
+    next.memoryReadModel = buildMemoryReadModel(next, {
+      memoryPolicy: policy,
+      longTermMemory: next.longTermMemory
+    });
+
+    logEvent("MEMORY_POLICY_EVALUATED", Object.assign({
+      traceId: userTurn && userTurn.trace_id || "",
+      turnId: userTurn && userTurn.turn_id || "",
+      doName: next.doName || ""
+    }, summarizeMemoryPolicy(policy)));
+    logEvent(readResult.skipped ? "LONG_TERM_MEMORY_READ_SKIPPED" : "LONG_TERM_MEMORY_READ_DONE", {
+      traceId: userTurn && userTurn.trace_id || "",
+      turnId: userTurn && userTurn.turn_id || "",
+      doName: next.doName || "",
+      reason: readResult.reason || "",
+      hasMemory: Boolean(readResult.memory)
+    });
+
+    return {
+      data: next,
+      policy: policy,
+      identity: identity,
+      adapter: adapter
+    };
+  }
+
+  async persistMemoryForTurn(data, userTurn, memoryLifecycle) {
+    const lifecycle = memoryLifecycle || {};
+    const policy = buildMemoryPolicy(this.env, data, {
+      shortTermLimit: 20
+    });
+    const adapter = lifecycle.adapter || createLongTermMemoryAdapterFromEnv(this.env, policy);
+    const identity = lifecycle.identity || buildMemoryIdentity(data);
+    const next = Object.assign({}, data || {}, {
+      memoryPolicy: policy
+    });
+
+    if (!shouldWriteLongTermMemory(policy)) {
+      next.memoryReadModel = buildMemoryReadModel(next, {
+        memoryPolicy: policy,
+        longTermMemory: next.longTermMemory
+      });
+      logEvent("LONG_TERM_MEMORY_WRITE_SKIPPED", {
+        traceId: userTurn && userTurn.trace_id || "",
+        turnId: userTurn && userTurn.turn_id || "",
+        doName: next.doName || "",
+        reason: policy.longTerm && policy.longTerm.enabled ? "consent_required" : "long_term_disabled"
+      });
+      return next;
+    }
+
+    const writeResult = await writeLongTermMemory(adapter, identity, policy, next, userTurn);
+    next.longTermMemory = writeResult.memory || next.longTermMemory || null;
+    next.memoryReadModel = buildMemoryReadModel(next, {
+      memoryPolicy: policy,
+      longTermMemory: next.longTermMemory
+    });
+    logEvent(writeResult.skipped ? "LONG_TERM_MEMORY_WRITE_SKIPPED" : "LONG_TERM_MEMORY_WRITE_DONE", {
+      traceId: userTurn && userTurn.trace_id || "",
+      turnId: userTurn && userTurn.turn_id || "",
+      doName: next.doName || "",
+      reason: writeResult.reason || "",
+      hasMemory: Boolean(next.longTermMemory)
+    });
+
+    return next;
+  }
+
+  async forgetLongTermMemory(data) {
+    const policy = buildMemoryPolicy(this.env, data, {
+      shortTermLimit: 20
+    });
+    const adapter = createLongTermMemoryAdapterFromEnv(this.env, policy);
+    const identity = buildMemoryIdentity(data);
+    await adapter.forget(identity);
+  }
+
   async getData() {
     const saved = await this.state.storage.get("data");
 
@@ -4145,7 +4606,8 @@ async function openaiOrchestratorProvider(env, params) {
     turnId: context.userTurn.turn_id,
     keys: Object.keys(context.compactInput),
     currentTurnTextLength: context.compactInput.current_turn_text.length,
-    previousStateMode: context.compactInput.relevant_previous_state && context.compactInput.relevant_previous_state.note ? "omitted" : "included"
+    previousStateMode: context.compactInput.relevant_previous_state && context.compactInput.relevant_previous_state.note ? "omitted" : "included",
+    hasLongTermMemory: Boolean(context.compactInput.long_term_memory)
   }));
   logEvent("ORCHESTRATOR_INPUT_COMPACTED", {
     traceId: context.userTurn.trace_id || "",
@@ -4153,7 +4615,8 @@ async function openaiOrchestratorProvider(env, params) {
     doName: params.doName || "",
     provider: "openai",
     keys: Object.keys(context.compactInput),
-    currentTurnTextLength: context.compactInput.current_turn_text.length
+    currentTurnTextLength: context.compactInput.current_turn_text.length,
+    hasLongTermMemory: Boolean(context.compactInput.long_term_memory)
   });
 
   logEvent("OPENAI_REQUEST_START", {
@@ -4426,6 +4889,10 @@ function buildOrchestratorRequestContext(env, params) {
     userStyleProfile: params.userStyleProfile || null,
     customerMemory: params.customerMemory || null,
     utilityMemory: params.utilityMemory || null,
+    longTermMemory: params.longTermMemory || null,
+    memoryPolicy: params.memoryPolicy || null,
+    memoryReadModel: params.memoryReadModel || null,
+    requestContext: params.requestContext || null,
     activeContext: params.activeContext || null
   });
   const orchestratorInputSummary = buildOrchestratorInputSummary({
@@ -4488,6 +4955,8 @@ function buildNeutralOrchestratorPayload(env, params, context) {
     user_style_profile: compactInput.user_style_profile,
     customer_memory: compactInput.customer_memory,
     utility_memory: compactInput.utility_memory,
+    long_term_memory: compactInput.long_term_memory,
+    memory_policy: compactInput.memory_policy,
     uploaded_image_analysis: mediaBatchSummary,
     current_asset_source: compactInput.campaign_state_brief.current_asset_source || "",
     asset_count: mediaBatch.assets.length,
@@ -4556,6 +5025,10 @@ async function callClaudeOrchestratorPlan(env, params) {
     userStyleProfile: params.userStyleProfile || null,
     customerMemory: params.customerMemory || null,
     utilityMemory: params.utilityMemory || null,
+    longTermMemory: params.longTermMemory || null,
+    memoryPolicy: params.memoryPolicy || null,
+    memoryReadModel: params.memoryReadModel || null,
+    requestContext: params.requestContext || null,
     activeContext: params.activeContext || null
   });
   const orchestratorInputSummary = buildOrchestratorInputSummary({
@@ -4592,7 +5065,8 @@ async function callClaudeOrchestratorPlan(env, params) {
     previousStateMode: compactInput.relevant_previous_state && compactInput.relevant_previous_state.note ? "omitted" : "included",
     hasConversationSummary: Boolean(compactInput.conversation_summary),
     hasUserStyleProfile: Boolean(compactInput.user_style_profile),
-    hasCustomerMemory: Boolean(compactInput.customer_memory)
+    hasCustomerMemory: Boolean(compactInput.customer_memory),
+    hasLongTermMemory: Boolean(compactInput.long_term_memory)
   });
 
   const payload = {
@@ -4631,6 +5105,8 @@ async function callClaudeOrchestratorPlan(env, params) {
     user_style_profile: compactInput.user_style_profile,
     customer_memory: compactInput.customer_memory,
     utility_memory: compactInput.utility_memory,
+    long_term_memory: compactInput.long_term_memory,
+    memory_policy: compactInput.memory_policy,
     uploaded_image_analysis: mediaBatchSummary,
     current_asset_source: compactInput.campaign_state_brief.current_asset_source || "",
     asset_count: mediaBatch.assets.length,
@@ -7229,286 +7705,52 @@ function buildForcedDirectGeneralAnswer(userTurn, fallbackText) {
 }
 
 async function sendWoztellTextMessage(env, params) {
-  const parsedReply = parseCustomerReplyModelOutput(params.text);
-  const cleanText = fixMojibake(parsedReply.text || params.text);
-
-  if (parsedReply.text !== String(params.text || "").trim() || parsedReply.shouldSend === false) {
-    logEvent("USER_RESPONSE_JSON_UNWRAPPED", {
-      textLength: cleanText.length,
-      shouldSend: parsedReply.shouldSend
-    });
-  }
-
-  if (!parsedReply.shouldSend || !cleanText.trim()) {
-    logEvent("USER_RESPONSE_BLOCKED_EMPTY", {
-      channelId: params.channelId || "",
-      recipientId: params.recipientId || ""
-    });
-    return { ok: true, blocked: true };
-  }
-
-  console.log("WOZTELL_TEXT_SEND_PREVIEW:", JSON.stringify({
-    channelId: params.channelId || "",
-    recipientId: params.recipientId || "",
-    textPreview: cleanText.slice(0, 1000)
-  }));
-
-  return await sendWoztellResponse(env, {
-    channelId: params.channelId,
-    recipientId: params.recipientId,
-    memberId: params.memberId,
-    appId: params.appId,
-    swallowErrors: params.swallowErrors,
-    response: [
-      {
-        type: "TEXT",
-        text: cleanText
-      }
-    ]
+  return await sendOutboundWoztellTextMessage(env, params, {
+    activeLogContext: activeLogContext,
+    fetchWithTimeout: fetchWithTimeout,
+    logEvent: logEvent,
+    parseCustomerReplyModelOutput: parseCustomerReplyModelOutput
   });
 }
 
 function fixMojibake(text) {
-  if (!text) return "";
-
-  return String(text)
-    .replaceAll("\u00c3\u0192\u00c2\u00a1", "á")
-    .replaceAll("\u00c3\u0192\u00c2\u00a9", "é")
-    .replaceAll("\u00c3\u0192\u00c2\u00ad", "í")
-    .replaceAll("\u00c3\u0192\u00c2\u00b3", "ó")
-    .replaceAll("\u00c3\u0192\u00c2\u00ba", "ú")
-    .replaceAll("\u00c3\u0192\u00c2\u00b1", "ñ")
-    .replaceAll("\u00c3\u0192\u00c2\u0081", "Á")
-    .replaceAll("\u00c3\u0192\u00e2\u20ac\u00b0", "É")
-    .replaceAll("\u00c3\u0192\u00c2\u008d", "Í")
-    .replaceAll("\u00c3\u0192\u00e2\u20ac\u0153", "Ó")
-    .replaceAll("\u00c3\u0192\u00c5\u00a1", "Ú")
-    .replaceAll("\u00c3\u0192\u00e2\u20ac\u02dc", "Ñ")
-    .replaceAll("\u00c3\u201a\u00c2\u00bf", "¿")
-    .replaceAll("\u00c3\u201a\u00c2\u00a1", "¡")
-    .replaceAll("\u00c3\u00a2\u00c5\u201c\u00e2\u20ac\u00a6", "?")
-    .replaceAll("\u00c3\u00a2\u00c5\u201c\u00e2\u20ac\u009d", "?")
-    .replaceAll("\u00c3\u00a2\u00e2\u201a\u00ac\u00e2\u20ac\u0153", "–")
-    .replaceAll("\u00c3\u00a2\u00e2\u201a\u00ac\u00e2\u20ac\u009d", "—")
-    .replaceAll("\u00c3\u00a2\u00e2\u201a\u00ac\u00e2\u201e\u00a2", "’")
-    .replaceAll("\u00c3\u00a2\u00e2\u201a\u00ac\u00c5\u201c", "“")
-    .replaceAll("\u00c3\u00a2\u00e2\u201a\u00ac\u00c2\u009d", "”")
-    .replaceAll("\u00c2\u00bf", "¿")
-    .replaceAll("\u00c2\u00a1", "¡");
+  return fixOutboundWoztellMojibake(text);
 }
 
 async function sendWoztellImageMessage(env, params) {
-  return await sendWoztellResponse(env, {
-    channelId: params.channelId,
-    recipientId: params.recipientId,
-    memberId: params.memberId,
-    appId: params.appId,
-    swallowErrors: params.swallowErrors,
-    logPrefix: "WOZTELL_IMAGE_SEND",
-    response: [
-      {
-        type: "IMAGE",
-        url: params.imageUrl
-      }
-    ]
+  return await sendOutboundWoztellImageMessage(env, params, {
+    activeLogContext: activeLogContext,
+    fetchWithTimeout: fetchWithTimeout,
+    logEvent: logEvent
   });
 }
 
 async function sendWoztellResponse(env, params) {
-  const tokenInfo = selectWoztellSendToken(env);
-
-  if (!tokenInfo.token) {
-    const missingResult = {
-      ok: false,
-      failed: true,
-      status: 0,
-      body: "Missing WOZTELL_ACCESS_TOKEN or WOZTELL_OPEN_API_TOKEN"
-    };
-    console.error("WOZTELL_SEND_FAILED:", JSON.stringify(missingResult));
-    if (params.swallowErrors) return missingResult;
-    return missingResult;
-  }
-
-  const url = "https://bot.api.woztell.com/sendResponses?accessToken=" + encodeURIComponent(tokenInfo.token);
-  const baseParams = Object.assign({}, params, {
-    memberId: params.memberId || activeLogContext.memberId || "",
-    appId: params.appId || activeLogContext.appId || ""
+  return await sendOutboundWoztellResponse(env, params, {
+    activeLogContext: activeLogContext,
+    fetchWithTimeout: fetchWithTimeout,
+    logEvent: logEvent
   });
-  const attempts = buildWoztellSendAttempts(baseParams);
-  let parsed = null;
-  let successStatus = 0;
-  let lastFailure = null;
-
-  console.log("WOZTELL_SEND_ENDPOINT:", JSON.stringify({
-    endpoint: "https://bot.api.woztell.com/sendResponses",
-    hasAccessTokenQuery: true
-  }));
-  console.log("WOZTELL_SEND_AUTH_MODE:", JSON.stringify({
-    tokenType: tokenInfo.mode,
-    hasWoztellAccessToken: Boolean(env.WOZTELL_ACCESS_TOKEN),
-    hasWoztellOpenApiToken: Boolean(env.WOZTELL_OPEN_API_TOKEN)
-  }));
-
-  for (const attempt of attempts) {
-    const payload = attempt.payload;
-
-    logWoztellSendShape(payload, attempt.mode);
-
-    if (params.logPrefix === "WOZTELL_IMAGE_SEND") {
-      console.log("WOZTELL_IMAGE_SEND_PAYLOAD:", JSON.stringify(redactWoztellPayloadForLog(payload)));
-    }
-
-    let res;
-
-    try {
-      res = await fetchWithTimeout(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json; charset=utf-8"
-        },
-        body: JSON.stringify(payload)
-      }, 30000, "WOZTELL_SEND_TIMEOUT");
-    } catch (error) {
-      lastFailure = {
-        ok: false,
-        failed: true,
-        mode: attempt.mode,
-        status: 0,
-        body: String(error.message || error).slice(0, 1000)
-      };
-      console.error("WOZTELL_SEND_FAILED:", JSON.stringify(lastFailure));
-      continue;
-    }
-
-    const responseText = await res.text();
-
-    if (!res.ok) {
-      lastFailure = {
-        ok: false,
-        failed: true,
-        mode: attempt.mode,
-        status: res.status,
-        body: responseText.slice(0, 1000)
-      };
-      console.error("WOZTELL_SEND_FAILED:", JSON.stringify(lastFailure));
-
-      if (params.logPrefix === "WOZTELL_IMAGE_SEND") {
-        console.error("WOZTELL_IMAGE_SEND_ERROR:", JSON.stringify({
-          status: res.status,
-          body: responseText.slice(0, 2000)
-        }));
-      }
-
-      if (!(attempt.mode === "recipientId" && shouldRetryWoztellWithMember(responseText, baseParams.memberId))) {
-        continue;
-      }
-
-      continue;
-    }
-
-    parsed = parseMaybeJson(responseText);
-    successStatus = res.status;
-    break;
-  }
-
-  if (!parsed) {
-    return lastFailure || { ok: false, failed: true, status: 0, body: "WOZTELL_SEND_FAILED" };
-  }
-
-  if (params.logPrefix === "WOZTELL_IMAGE_SEND") {
-    console.log("WOZTELL_IMAGE_SEND_OK:", JSON.stringify({
-      status: successStatus,
-      body: parsed
-    }));
-  }
-
-  console.log("USER_RESPONSE_SENT:", JSON.stringify({
-    channelId: params.channelId || "",
-    recipientId: params.recipientId || "",
-    responseCount: Array.isArray(params.response) ? params.response.length : 0,
-    responseTypes: (Array.isArray(params.response) ? params.response : []).map(function (item) {
-      return item.type || "";
-    })
-  }));
-  logEvent("USER_RESPONSE_SENT", {
-    traceId: params.traceId || activeLogContext.traceId || "",
-    turnId: params.turnId || activeLogContext.turnId || "",
-    doName: params.doName || activeLogContext.doName || "",
-    channelId: params.channelId || "",
-    recipientId: params.recipientId || "",
-    responseCount: Array.isArray(params.response) ? params.response.length : 0,
-    responseTypes: (Array.isArray(params.response) ? params.response : []).map(function (item) {
-      return item.type || "";
-    })
-  });
-
-  return parsed;
 }
 
 function selectWoztellSendToken(env) {
-  if (env.WOZTELL_ACCESS_TOKEN) {
-    return {
-      token: env.WOZTELL_ACCESS_TOKEN,
-      mode: "WOZTELL_ACCESS_TOKEN"
-    };
-  }
-
-  if (env.WOZTELL_OPEN_API_TOKEN) {
-    return {
-      token: env.WOZTELL_OPEN_API_TOKEN,
-      mode: "WOZTELL_OPEN_API_TOKEN"
-    };
-  }
-
-  return {
-    token: "",
-    mode: "none"
-  };
+  return selectOutboundWoztellSendToken(env);
 }
 
 function buildWoztellSendAttempts(params) {
-  return buildAdapterWoztellSendAttempts(params || {});
+  return buildOutboundWoztellSendAttempts(params || {});
 }
 
 function logWoztellSendShape(payload, mode) {
-  console.log("WOZTELL_SEND_BODY_SHAPE:", JSON.stringify({
-    mode: mode,
-    keys: Object.keys(payload),
-    responseCount: Array.isArray(payload.response) ? payload.response.length : 0,
-    responseTypes: (Array.isArray(payload.response) ? payload.response : []).map(function (item) {
-      return item.type || "";
-    })
-  }));
-  console.log("WOZTELL_SEND_CHANNEL_ID:", JSON.stringify({
-    present: Boolean(payload.channelId),
-    valuePreview: String(payload.channelId || "").slice(0, 8)
-  }));
-  console.log("WOZTELL_SEND_MEMBER_ID_PRESENT:", JSON.stringify({
-    present: Boolean(payload.memberId)
-  }));
-  console.log("WOZTELL_SEND_RECIPIENT_ID_PRESENT:", JSON.stringify({
-    present: Boolean(payload.recipientId)
-  }));
-  console.log("WOZTELL_SEND_APP_ID_PRESENT:", JSON.stringify({
-    present: Boolean(payload.appId)
-  }));
+  return logOutboundWoztellSendShape(payload, mode);
 }
 
 function shouldRetryWoztellWithMember(responseText, memberId) {
-  return Boolean(memberId && String(responseText || "").toLowerCase().includes("app could not be found"));
+  return shouldOutboundRetryWoztellWithMember(responseText, memberId);
 }
 
 function redactWoztellPayloadForLog(payload) {
-  return {
-    channelId: payload.channelId || "",
-    hasMemberId: Boolean(payload.memberId),
-    hasRecipientId: Boolean(payload.recipientId),
-    hasAppId: Boolean(payload.appId),
-    responseCount: Array.isArray(payload.response) ? payload.response.length : 0,
-    responseTypes: (Array.isArray(payload.response) ? payload.response : []).map(function (item) {
-      return item.type || "";
-    })
-  };
+  return redactOutboundWoztellPayloadForLog(payload);
 }
 
 async function downloadImageBytes(url) {
@@ -7565,7 +7807,12 @@ function normalizeCoordinatorData(data) {
     userStyleProfile: clean.userStyleProfile || clean.user_style_profile || null,
     customerMemory: clean.customerMemory || clean.customer_memory || null,
     utilityMemory: clean.utilityMemory || clean.utility_memory || null,
+    longTermMemory: clean.longTermMemory || clean.long_term_memory || null,
+    memoryConsent: clean.memoryConsent || clean.memory_consent || null,
+    memoryPolicy: clean.memoryPolicy || clean.memory_policy || null,
+    memoryReadModel: clean.memoryReadModel || clean.memory_read_model || null,
     requestContext: clean.requestContext || clean.request_context || null,
+    traceEvents: normalizeTraceEvents(clean.traceEvents || clean.trace_events || []),
     recentMedia: normalizeRecentMedia(clean.recentMedia || clean.recent_media || []),
     recentMediaAssets: normalizeRecentMediaAssets(clean.recentMediaAssets || clean.recent_media_assets || []),
     coreUtilityState: normalizeCoreUtilityState(clean.coreUtilityState || clean.core_utility_state || {}),
@@ -8068,7 +8315,12 @@ function forgetAllConversationData(data, reason) {
   next.userStyleProfile = null;
   next.conversationSummary = null;
   next.utilityMemory = null;
+  next.longTermMemory = null;
+  next.memoryConsent = null;
+  next.memoryPolicy = null;
+  next.memoryReadModel = null;
   next.conversationLog = [];
+  next.traceEvents = [];
   return next;
 }
 
@@ -8081,13 +8333,19 @@ function formatUserMemoryForWhatsApp(data) {
   const memory = data && data.customerMemory || {};
   const style = data && data.userStyleProfile || {};
   const utility = data && data.utilityMemory || {};
+  const policy = data && data.memoryPolicy || buildMemoryPolicy({}, data || {}, { shortTermLimit: 20 });
+  const summary = summarizeMemoryPolicy(policy);
   const lines = [
     "Memoria guardada",
     "Nombre: " + (memory.name || "(no guardado)"),
     "Idioma: " + (memory.language || style.language || "(no detectado)"),
     "Estilo: " + (memory.response_preference || memory.style_preference || style.tone || "(sin preferencia)"),
     "Listas: " + ((utility.list_names || []).join(", ") || "(sin listas en memoria resumida)"),
-    "Recordatorios pendientes: " + String(utility.reminder_count || 0)
+    "Recordatorios pendientes: " + String(utility.reminder_count || 0),
+    "Memoria corta: ultimos " + String(summary.shortTermMaxTurns || 20) + " turnos compactos",
+    "Memoria larga: " + (summary.longTermEnabled ? "configurada" : "desactivada"),
+    "Permiso memoria larga: " + (summary.longTermConsentStatus || "not_requested"),
+    "Escritura memoria larga: " + (summary.longTermWriteAllowed ? "activa" : "inactiva")
   ];
 
   return lines.join("\n");
@@ -8490,27 +8748,10 @@ function clearCampaignStateForGeneralIntent(campaignState, meta) {
 }
 
 async function sendWoztellTemplateMessage(env, params) {
-  const template = params.template || {};
-  if (!template.name) {
-    throw new Error("REMINDER_TEMPLATE_NAME_REQUIRED");
-  }
-
-  return await sendWoztellResponse(env, {
-    channelId: params.channelId,
-    recipientId: params.recipientId,
-    memberId: params.memberId,
-    appId: params.appId,
-    logPrefix: "WOZTELL_TEMPLATE_SEND",
-    response: [
-      {
-        type: "TEMPLATE",
-        templateName: template.name,
-        language: template.language || "es",
-        namespace: template.namespace || "",
-        paramMode: template.paramMode || "body_text",
-        params: [String(params.message || "")]
-      }
-    ]
+  return await sendOutboundWoztellTemplateMessage(env, params, {
+    activeLogContext: activeLogContext,
+    fetchWithTimeout: fetchWithTimeout,
+    logEvent: logEvent
   });
 }
 
@@ -8597,6 +8838,63 @@ function formatListGoal(list) {
   const clean = list || {};
   const items = Array.isArray(clean.items) ? clean.items.map(function (item) { return item.text; }).filter(Boolean) : [];
   return "lista " + (clean.name || "pendientes") + (items.length ? ": " + items.join(", ") : "");
+}
+
+function buildAudioListRepairCandidate(data, userTurn) {
+  if (!isAudioListReference(userTurn)) return null;
+  const sources = [];
+  const memory = data && data.customerMemory && typeof data.customerMemory === "object" ? data.customerMemory : {};
+  const memoryText = String(memory.last_audio_summary || memory.lastAudioSummary || "").trim();
+  if (memoryText) sources.push({ source: "customerMemory.last_audio_summary", text: memoryText });
+
+  const log = Array.isArray(data && data.conversationLog) ? data.conversationLog.slice(-20) : [];
+  for (let index = log.length - 1; index >= 0; index--) {
+    const entry = log[index] || {};
+    const transcripts = Array.isArray(entry.audioTranscripts) ? entry.audioTranscripts : [];
+    const text = transcripts.concat([entry.textPreview || entry.text || ""]).filter(Boolean).join(" ");
+    if (text) sources.push({ source: "conversationLog.audio", text: text });
+  }
+
+  for (const candidate of sources) {
+    const parsed = parseAudioListText(candidate.text);
+    if (parsed.items.length) {
+      return {
+        source: candidate.source,
+        listName: parsed.listName,
+        items: parsed.items
+      };
+    }
+  }
+
+  return null;
+}
+
+function isAudioListReference(userTurn) {
+  const text = normalizeTextForIntent(userTurn && userTurn.current_turn_text || "");
+  return /\blista\b/.test(text) && /\b(audio|te di|te dije|mande|mand[eé]|lo que dije|lo que te dije)\b/.test(text);
+}
+
+function parseAudioListText(text) {
+  const raw = String(text || "").replace(/^\s*\[Audio transcrito\]:\s*/i, "").trim();
+  const normalized = normalizeTextForIntent(raw);
+  const listName = normalized.includes("compras") || /\b(huevos|leche|pan|queso|arroz|pollo|carne|verduras|fruta)\b/.test(normalized)
+    ? "compras"
+    : "pendientes";
+  const match = raw.match(/\b(?:lista\s+(?:de\s+\w+\s+)?con|con|son|sean)\s+([^.!?]{3,240})/i);
+  const itemText = match ? match[1] : "";
+  const items = itemText
+    .replace(/\b(y\s+)?(?:hazme\s+acuerdo|av[ií]same|avisame|recu[eé]rdame|recuerdame|recordarme)\b.*$/i, "")
+    .split(/\s*,\s*|\s+y\s+/)
+    .map(function (item) {
+      return String(item || "").replace(/[.,;:。]+$/g, "").trim();
+    })
+    .filter(Boolean)
+    .slice(0, 20);
+
+  return {
+    listName: listName,
+    items: items
+  };
 }
 
 function formatVisionUtilityResponse(intent, summary, userTurn) {
@@ -8708,7 +9006,7 @@ function formatListForWhatsApp(list) {
   const items = Array.isArray(clean.items) ? clean.items : [];
 
   if (!items.length) {
-    return "La lista " + clean.name + " está vacía.";
+    return "Todavía no tengo productos guardados en tu lista de " + clean.name + ".";
   }
 
   return ["Lista: " + clean.name].concat(items.map(function (item, index) {
@@ -8723,7 +9021,7 @@ function formatListConfirmationForWhatsApp(parsed, list, userTurn) {
   const action = parsed && parsed.action || "list";
   const fromAudio = userTurn && userTurn.audio_count > 0;
 
-  if (!items.length) return "La lista " + clean.name + " está vacía.";
+  if (!items.length) return "Todavía no tengo productos guardados en tu lista de " + clean.name + ".";
   if (action === "add" || action === "create") {
     return "Listo, " + (fromAudio ? "creé" : "actualicé") + " tu lista de " + clean.name + " con: " + itemTexts.join(", ") + ".";
   }
@@ -8731,7 +9029,7 @@ function formatListConfirmationForWhatsApp(parsed, list, userTurn) {
     return "Listo, actualicé tu lista de " + clean.name + ".\n" + formatListForWhatsApp(clean);
   }
   if (action === "mark_done") {
-    return "Listo, marqué el item en tu lista de " + clean.name + ".\n" + formatListForWhatsApp(clean);
+    return "Listo, marqué ese producto en tu lista de " + clean.name + ".\n" + formatListForWhatsApp(clean);
   }
 
   return formatListForWhatsApp(clean);
@@ -8748,12 +9046,11 @@ function formatListsIndexForWhatsApp(coreUtilityState) {
   return ["Listas guardadas"].concat(lists.map(function (list, index) {
     const count = Array.isArray(list.items) ? list.items.length : 0;
     const active = state.activeList && normalizeSimpleName(state.activeList) === normalizeSimpleName(list.name) ? " (activa)" : "";
-    return (index + 1) + ". " + list.name + active + " - " + count + " item(s)";
+    return (index + 1) + ". " + list.name + active + " - " + count + " pendiente" + (count === 1 ? "" : "s");
   })).join("\n");
 }
 
 function formatRemindersForWhatsApp(reminders, env) {
-  const mode = getReminderDeliveryMode(env);
   const items = listReminders(reminders || []).filter(function (item) {
     return !["cancelled", "done"].includes(item.status);
   });
@@ -8762,8 +9059,9 @@ function formatRemindersForWhatsApp(reminders, env) {
     return "No tienes recordatorios pendientes.";
   }
 
-  return ["Recordatorios pendientes", "modo: " + mode].concat(items.map(function (item, index) {
-    return (index + 1) + ". " + item.title + (item.dueAt ? " - " + item.dueAt : "") + " [" + (item.status || "scheduled_mock") + "]";
+  return ["Recordatorios pendientes"].concat(items.map(function (item, index) {
+    const due = item.dueAt ? " - " + formatReminderDueAtForCustomer(item.dueAt, item.timezone || env && env.USER_TIMEZONE || "America/Bogota") : "";
+    return (index + 1) + ". " + (item.title || "Recordatorio") + due;
   })).join("\n");
 }
 
@@ -8949,21 +9247,33 @@ function isGenericReminderTitle(title) {
 
 function formatReminderCreatedForWhatsApp(reminder, env) {
   const mode = getReminderDeliveryMode(env);
-  const deliveryNote = mode === "alarm"
-    ? "Modo entrega: alarmas del Durable Object."
-    : mode === "cron"
-      ? "Modo entrega: scheduler/cron."
-      : mode === "disabled"
-        ? "Modo entrega: desactivado, solo queda guardado."
-        : "Modo prueba: quedó guardado, no se enviará automáticamente hasta activar scheduler real.";
+  const deliveryNote = mode === "alarm" || mode === "cron"
+    ? "Te lo recordaré por WhatsApp."
+    : mode === "disabled"
+      ? "Quedó guardado, pero los envíos automáticos están desactivados."
+      : "Quedó guardado como recordatorio.";
 
   return [
     "Listo, guardé el recordatorio.",
     "Asunto: " + (reminder.title || ""),
-    reminder.dueAt ? "Fecha: " + reminder.dueAt : "",
+    reminder.dueAt ? "Hora: " + formatReminderDueAtForCustomer(reminder.dueAt, reminder.timezone) : "",
     reminder.reminderOffsets && reminder.reminderOffsets.length ? "Avisos: " + reminder.reminderOffsets.join(", ") : "",
     deliveryNote
   ].filter(Boolean).join("\n");
+}
+
+function formatReminderDueAtForCustomer(dueAt, timezone) {
+  const date = new Date(dueAt || "");
+  if (!Number.isFinite(date.getTime())) return "";
+  try {
+    return new Intl.DateTimeFormat("es-EC", {
+      timeZone: timezone || "America/Bogota",
+      dateStyle: "medium",
+      timeStyle: "short"
+    }).format(date);
+  } catch (error) {
+    return date.toLocaleString("es-EC");
+  }
 }
 
 function getReminderDeliveryMode(env) {
@@ -9878,170 +10188,15 @@ function getLastUploadedImage(state) {
 }
 
 function extractQuotedMessageReference(parsedMessage, woztellPayload) {
-  const parsed = parsedMessage || {};
-  const payload = woztellPayload || {};
-  const data = payload.data || {};
-  const directRefs = [{
-    quotedMessageId: parsed.quotedMessageId || payload.quotedMessageId || data.quotedMessageId,
-    replyToMessageId: parsed.replyToMessageId || payload.replyToMessageId || data.replyToMessageId,
-    fileId: parsed.quotedFileId || payload.quotedFileId || data.quotedFileId,
-    type: parsed.quotedType || payload.quotedType || data.quotedType
-  }];
-  const containers = directRefs.concat([
-    parsed.context,
-    payload.context,
-    data.context,
-    parsed.quotedMessage,
-    payload.quotedMessage,
-    data.quotedMessage,
-    parsed.quoted,
-    payload.quoted,
-    data.quoted,
-    parsed.replyTo,
-    payload.replyTo,
-    data.replyTo,
-    parsed.reply_to,
-    payload.reply_to,
-    data.reply_to
-  ]).filter(function (item) {
-    return item && typeof item === "object";
-  });
-
-  for (const item of containers) {
-    const messageId = String(
-      item.quotedMessageId ||
-      item.replyToMessageId ||
-      item.messageId ||
-      item.message_id ||
-      item.id ||
-      item.mid ||
-      item.stanzaId ||
-      item.stanza_id ||
-      ""
-    ).trim();
-    const fileId = String(
-      item.fileId ||
-      item.file_id ||
-      item.mediaId ||
-      item.media_id ||
-      item.attachment && (item.attachment.fileId || item.attachment.file_id) ||
-      item.file && (item.file.fileId || item.file.file_id) ||
-      ""
-    ).trim();
-    const type = String(item.type || item.messageType || item.message_type || "").toUpperCase();
-    if (messageId || fileId) {
-      return { messageId: messageId, fileId: fileId, type: type };
-    }
-  }
-
-  return { messageId: "", fileId: "", type: "" };
+  return extractWoztellQuotedMessageReference(parsedMessage, woztellPayload);
 }
 
 function normalizeIncomingMessage(parsedMessage, woztellPayload, options) {
-  const parsed = parsedMessage || {};
-  const payload = woztellPayload || {};
-  const type = String(parsed.type || normalizeEventType(payload.type || payload.data && payload.data.type || "", payload) || "UNSUPPORTED").toUpperCase();
-  const fileId = String(parsed.fileId || "");
-  const quoted = extractQuotedMessageReference(parsed, payload);
-  const media = extractMediaFromPayload(parsed, payload);
-  const audio = isAudioMessage(parsed) && fileId ? [{
-    type: type,
-    fileId: fileId,
-    mimeType: String(parsed.mimeType || ""),
-    fileName: String(parsed.fileName || ""),
-    status: parsed.audioStatus || "pending_transcription"
-  }] : [];
-  const video = buildVideoMetadata(parsed, payload);
-  const files = buildFileMetadata(parsed, payload);
-
-  const fallbackText = type === "UNSUPPORTED" ? ""
-    : fileId && !isAudioMessage(parsed)
-    ? "[" + type + " uploaded without caption]"
-    : isAudioMessage(parsed) ? "[AUDIO pending transcription]" : "";
-
-  return {
-    messageId: String(options && options.messageId || parsed.messageId || payload.messageId || randomId(12)),
-    traceId: String(options && options.traceId || parsed.traceId || payload.traceId || ""),
-    type: type,
-    text: String(parsed.text || fallbackText).trim(),
-    fileId: fileId,
-    media: media,
-    audio: audio,
-    video: video,
-    files: files,
-    location: buildLocationMetadata(parsed, payload),
-    captions: collectCaptions(parsed, payload),
-    mimeType: String(parsed.mimeType || ""),
-    fileName: String(parsed.fileName || ""),
-    originalType: parsed.originalType || (type === "AUDIO" ? "AUDIO" : ""),
-    originalFileId: parsed.originalFileId || "",
-    quotedMessageId: quoted.messageId,
-    replyToMessageId: quoted.messageId,
-    quotedFileId: quoted.fileId,
-    quotedType: quoted.type,
-    audioStatus: parsed.audioStatus || (audio.length ? "pending" : ""),
-    audioTranscript: parsed.audioTranscript || "",
-    awaitingTranscription: Boolean(audio.length && !parsed.audioTranscript && parsed.audioStatus !== "failed"),
-    app: String(payload.app || ""),
-    member: String(payload.member || ""),
-    channel: String(payload.channel || ""),
-    from: String(payload.from || ""),
-    to: String(payload.to || ""),
-    receivedAt: String(options && options.receivedAt || new Date().toISOString())
-  };
+  return normalizeWoztellIncomingMessage(parsedMessage, woztellPayload, options);
 }
 
 function extractMediaFromPayload(parsedMessage, woztellPayload) {
-  const parsed = parsedMessage || {};
-  const payload = woztellPayload || {};
-  const data = payload.data || {};
-  const type = String(parsed.type || payload.type || data.type || "TEXT").toUpperCase();
-  const candidates = [];
-  const rawMedia = []
-    .concat(Array.isArray(parsed.media) ? parsed.media : [])
-    .concat(Array.isArray(data.media) ? data.media : [])
-    .concat(Array.isArray(payload.media) ? payload.media : [])
-    .concat(Array.isArray(data.attachments) ? data.attachments : [])
-    .concat(Array.isArray(payload.attachments) ? payload.attachments : []);
-
-  if (parsed.fileId) {
-    rawMedia.unshift({
-      type: type,
-      fileId: parsed.fileId,
-      mimeType: parsed.mimeType || "",
-      fileName: parsed.fileName || "",
-      caption: parsed.caption || parsed.text || ""
-    });
-  }
-
-  for (const item of rawMedia) {
-    const fileId = String(item.fileId || item.file_id || item.mediaId || item.id || "");
-    if (!fileId) continue;
-
-    const itemType = String(item.type || type || "FILE").toUpperCase();
-    const mimeType = String(item.mimeType || item.mime_type || item.contentType || "");
-    const normalizedType = mimeType.startsWith("image/") ? "IMAGE"
-      : mimeType.startsWith("video/") ? "VIDEO"
-      : mimeType.startsWith("audio/") ? "AUDIO"
-      : itemType;
-
-    if (["AUDIO", "VOICE", "PTT"].includes(normalizedType)) continue;
-
-    candidates.push({
-      type: ["IMAGE", "VIDEO", "FILE"].includes(normalizedType) ? normalizedType : "FILE",
-      fileId: fileId,
-      mimeType: mimeType,
-      fileName: String(item.fileName || item.file_name || item.name || ""),
-      caption: String(item.caption || item.text || "")
-    });
-  }
-
-  const seen = new Set();
-  return candidates.filter(function (item) {
-    if (seen.has(item.fileId)) return false;
-    seen.add(item.fileId);
-    return true;
-  });
+  return extractWoztellMediaFromPayload(parsedMessage, woztellPayload);
 }
 
 function collectCaptions(parsedMessage, woztellPayload) {
@@ -10097,55 +10252,15 @@ function buildAudioBatch(messages) {
 }
 
 function buildVideoMetadata(parsedMessage, woztellPayload) {
-  const parsed = parsedMessage || {};
-  const type = String(parsed.type || "").toUpperCase();
-
-  if (type !== "VIDEO") return [];
-
-  return [{
-    fileId: String(parsed.fileId || ""),
-    mimeType: String(parsed.mimeType || ""),
-    fileName: String(parsed.fileName || ""),
-    url: String(parsed.url || ""),
-    duration: parsed.duration || woztellPayload && woztellPayload.duration || "",
-    receivedAt: new Date().toISOString()
-  }].filter(function (item) {
-    return item.fileId || item.url;
-  });
+  return buildWoztellVideoMetadata(parsedMessage, woztellPayload);
 }
 
 function buildFileMetadata(parsedMessage, woztellPayload) {
-  const parsed = parsedMessage || {};
-  const type = String(parsed.type || "").toUpperCase();
-
-  if (type !== "FILE") return [];
-
-  return [{
-    fileId: String(parsed.fileId || ""),
-    mimeType: String(parsed.mimeType || ""),
-    fileName: String(parsed.fileName || ""),
-    url: String(parsed.url || ""),
-    receivedAt: new Date().toISOString()
-  }].filter(function (item) {
-    return item.fileId || item.url;
-  });
+  return buildWoztellFileMetadata(parsedMessage, woztellPayload);
 }
 
 function buildLocationMetadata(parsedMessage, woztellPayload) {
-  const parsed = parsedMessage || {};
-  const payload = woztellPayload || {};
-  const data = payload.data || {};
-  const type = String(parsed.type || payload.type || data.type || "").toUpperCase();
-
-  if (type !== "LOCATION") return null;
-
-  const location = data.location || payload.location || parsed.location || data;
-  return {
-    latitude: Number(location.latitude || location.lat || 0) || null,
-    longitude: Number(location.longitude || location.lng || location.lon || 0) || null,
-    name: String(location.name || ""),
-    address: String(location.address || "")
-  };
+  return buildWoztellLocationMetadata(parsedMessage, woztellPayload);
 }
 
 function shouldStartNewTurn(messages, previousState) {
@@ -10377,6 +10492,9 @@ function buildOrchestratorInput(params) {
     conversationSummary: params.conversationSummary || null,
     customerMemory: params.customerMemory || null,
     utilityMemory: params.utilityMemory || null,
+    longTermMemory: params.longTermMemory || null,
+    memoryPolicy: params.memoryPolicy || null,
+    memoryReadModel: params.memoryReadModel || null,
     mediaMemorySummary: state.media_batch_summary || null
   });
 
@@ -10395,6 +10513,9 @@ function buildOrchestratorInput(params) {
     user_style_profile: params.userStyleProfile || null,
     customer_memory: params.customerMemory || null,
     utility_memory: params.utilityMemory || null,
+    long_term_memory: params.longTermMemory || requestContext.longTermMemory || null,
+    memory_policy: params.memoryPolicy || requestContext.memoryPolicy || null,
+    memory_read_model: params.memoryReadModel || requestContext.memoryReadModel || null,
     relevant_previous_state: buildRelevantPreviousState(state, userTurn),
     allowed_actions: getAllowedOrchestratorActions(),
     active_context: normalizeConversationContext(params.activeContext || params.active_context || {}),
@@ -10756,35 +10877,7 @@ function buildMediaLogPayload(data, messages, summary, usedFallback) {
 }
 
 function extractWoztellMessage(body) {
-  const payload = body || {};
-  const event = normalizeInboundEvent(payload);
-  const data = payload.data || {};
-  const type = event.type || normalizeEventType(payload.type || data.type || "", payload) || "UNSUPPORTED";
-  const text = event.text || event.caption || "";
-  const fileId = data.fileId ||
-    payload.fileId ||
-    data.mediaId ||
-    payload.mediaId ||
-    data.file && data.file.fileId ||
-    payload.file && payload.file.fileId ||
-    data.attachment && data.attachment.fileId ||
-    payload.attachment && payload.attachment.fileId ||
-    data.audio && data.audio.fileId ||
-    payload.audio && payload.audio.fileId ||
-    data.voice && data.voice.fileId ||
-    payload.voice && payload.voice.fileId ||
-    "";
-
-  return {
-    type: type,
-    text: String(text || "").trim(),
-    fileId: String(fileId || ""),
-    caption: event.caption || "",
-    media: Array.isArray(payload.media) ? payload.media : Array.isArray(data.media) ? data.media : [],
-    fileName: data.fileName || payload.fileName || data.file && data.file.fileName || payload.file && payload.file.fileName || "",
-    mimeType: data.mimeType || payload.mimeType || data.file && data.file.mimeType || payload.file && payload.file.mimeType || data.audio && data.audio.mimeType || payload.audio && payload.audio.mimeType || "",
-    messageId: payload.messageId || data.messageId || ""
-  };
+  return extractWoztellMessageFromAdapter(body);
 }
 
 function buildConversationName(woztellPayload) {
@@ -11150,6 +11243,7 @@ function isLocalGoogleOAuthRequest(request, env) {
 function buildVersionDiagnostic(env) {
   const now = new Date().toISOString();
   const flags = getCoreFeatureFlags(env || {});
+  const memoryPolicy = buildMemoryPolicy(env || {}, {}, { shortTermLimit: 20 });
   const remindersMode = String(flags.remindersDeliveryMode || "mock");
   const interactiveMode = String(flags.interactiveDeliveryMode || "safe");
   const reminderTemplateConfigured = Boolean(env && env.REMINDER_TEMPLATE_NAME);
@@ -11184,6 +11278,10 @@ function buildVersionDiagnostic(env) {
     REMINDER_TEMPLATE_STATUS: getReminderTemplateStatus(remindersMode, reminderTemplateConfigured),
     INTERACTIVE_DELIVERY_MODE: interactiveMode,
     MEMORY_RETENTION_MODE: String(flags.memoryRetentionMode || "summarized"),
+    SHORT_TERM_MEMORY_TURNS: String(memoryPolicy.shortTerm.maxTurns || 20),
+    LONG_TERM_MEMORY_MODE: String(memoryPolicy.longTerm.mode || "disabled"),
+    LONG_TERM_MEMORY_ENABLED: String(Boolean(memoryPolicy.longTerm.enabled)),
+    LONG_TERM_MEMORY_REQUIRES_CONSENT: String(Boolean(memoryPolicy.longTerm.requiresConsent)),
     LOG_CAPTURE_MODE: String(flags.logCaptureMode || "console_and_file"),
     REMINDERS_STATUS: remindersMode === "alarm" ? "production_alarm_enabled" : remindersMode === "cron" ? "production_cron_requires_scheduler" : remindersMode === "disabled" ? "disabled" : "mock_safe_no_real_delivery",
     INTERACTIVE_STATUS: interactiveMode === "safe" ? "safe_with_text_fallback" : interactiveMode,
@@ -11230,6 +11328,10 @@ function formatVersionDiagnosticForWhatsApp(diagnostic) {
     "INTERACTIVE_DELIVERY_MODE: " + (data.INTERACTIVE_DELIVERY_MODE || ""),
     "INTERACTIVE_STATUS: " + (data.INTERACTIVE_STATUS || ""),
     "MEMORY_RETENTION_MODE: " + (data.MEMORY_RETENTION_MODE || ""),
+    "SHORT_TERM_MEMORY_TURNS: " + (data.SHORT_TERM_MEMORY_TURNS || ""),
+    "LONG_TERM_MEMORY_MODE: " + (data.LONG_TERM_MEMORY_MODE || ""),
+    "LONG_TERM_MEMORY_ENABLED: " + (data.LONG_TERM_MEMORY_ENABLED || ""),
+    "LONG_TERM_MEMORY_REQUIRES_CONSENT: " + (data.LONG_TERM_MEMORY_REQUIRES_CONSENT || ""),
     "MEMORY_STATUS: " + (data.MEMORY_STATUS || ""),
     "TASK_ENGINE_STATUS: " + (data.TASK_ENGINE_STATUS || ""),
     "LOG_CAPTURE_MODE: " + (data.LOG_CAPTURE_MODE || ""),
@@ -11480,59 +11582,15 @@ function getTaskIntakeTimingConfig(env) {
 }
 
 function getBufferTimingConfig(env) {
-  const timing = getTurnAggregationTiming(env || {});
-  return {
-    bufferWaitSeconds: Math.max(1, Math.round((Number(env && env.BUFFER_WAIT_SECONDS || 0) || timing.minWaitMs / 1000))),
-    imageMessageWaitSeconds: Math.max(1, Math.round((Number(env && env.IMAGE_MESSAGE_WAIT_SECONDS || 0) || timing.silenceMs / 1000))),
-    bufferMaxWaitSeconds: Math.max(1, Math.round((Number(env && env.BUFFER_MAX_WAIT_SECONDS || 0) || timing.maxWaitMs / 1000))),
-    turnSilenceMs: timing.silenceMs,
-    turnMaxWaitMs: timing.maxWaitMs,
-    turnMinWaitMs: timing.minWaitMs
-  };
+  return getCoreBufferTimingConfig(env);
 }
 
 function shouldHoldMediaTurnForMoreEvents(data, messages, env) {
-  const list = Array.isArray(messages) ? messages : [];
-  const hasMedia = list.some(function (message) {
-    return Boolean(message && (message.fileId || message.media && message.media.length || ["IMAGE", "VIDEO", "FILE"].includes(String(message.type || "").toUpperCase())));
-  });
-
-  if (!hasMedia) return { hold: false };
-
-  const hasClearTextOrAudio = list.some(function (message) {
-    const type = String(message && message.type || "").toUpperCase();
-    const text = cleanUserVisibleText(message && (message.audioTranscript || message.text) || "");
-    return Boolean(text && (type === "TEXT" || type === "AUDIO" || message && message.audioTranscript));
-  });
-
-  const combinedText = consolidatedMessagesText(list);
-  if (hasClearTextOrAudio || isUserDoneSignal(combinedText)) return { hold: false };
-
-  const timing = getTurnAggregationTiming(env || {});
-  const firstAt = Number(data && data.firstMessageAt || Date.now());
-  const now = Date.now();
-  const ageMs = now - firstAt;
-  const nextProcessAt = firstAt + timing.maxWaitMs;
-
-  if (ageMs >= timing.maxWaitMs) return { hold: false };
-
-  return {
-    hold: true,
-    reason: "media_only_waiting_for_turn_max",
-    ageMs: ageMs,
-    nextProcessAt: nextProcessAt
-  };
+  return shouldCoreHoldMediaTurnForMoreEvents(data, messages, env);
 }
 
 function hasOpenPendingTurn(data, now, env) {
-  const state = data || {};
-  const pending = Array.isArray(state.pendingMessages) ? state.pendingMessages : [];
-  if (!state.currentTurnId || !pending.length) return false;
-
-  const timing = getTurnAggregationTiming(env || {});
-  const firstAt = Number(state.firstMessageAt || now || Date.now());
-  const ageMs = Number(now || Date.now()) - firstAt;
-  return ageMs <= timing.maxWaitMs;
+  return hasCoreOpenPendingTurn(data, now, env);
 }
 
 function getAudioTurnWaitConfig(env) {

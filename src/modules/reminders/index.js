@@ -1,4 +1,5 @@
 import { captureError, logEvent } from "../../logger.js";
+import { parseListCommand } from "../lists/index.js";
 
 export const REMINDERS_MODULE = {
   name: "reminders",
@@ -397,6 +398,9 @@ function extractReminderTitle(text) {
 
 function extractSmartReminderTitle(text) {
   const raw = String(text || "").replace(/\s+/g, " ");
+  const compoundListTitle = extractCompoundListReminderTitle(raw);
+  if (compoundListTitle) return compoundListTitle;
+
   const explicitShoppingList = raw.match(/\b(?:esta\s+)?lista\s+(?:necesito\s+que\s+)?(?:son|sean)\s+([^.!?]{3,240})/i);
   if (explicitShoppingList) return cleanupReminderTitle("comprar " + explicitShoppingList[1]);
 
@@ -410,6 +414,17 @@ function extractSmartReminderTitle(text) {
   if (actionMatches.length) return cleanupReminderTitle(actionMatches[actionMatches.length - 1][1]);
 
   return "";
+}
+
+function extractCompoundListReminderTitle(text) {
+  const normalized = normalizeText(text);
+  if (!/\blista\b/.test(normalized)) return "";
+  if (!/\b(recuerdame|recordarme|recordatorio|avisame|hazme acuerdo|acuerdame)\b/.test(normalized)) return "";
+
+  const parsedList = parseListCommand(text);
+  if (!parsedList || !Array.isArray(parsedList.items) || !parsedList.items.length) return "";
+  const listName = parsedList.listName || "pendientes";
+  return cleanupReminderTitle("lista " + listName + ": " + parsedList.items.join(", "));
 }
 
 function cleanupReminderTitle(text) {

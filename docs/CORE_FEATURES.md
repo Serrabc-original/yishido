@@ -37,9 +37,13 @@ Configuracion versionada:
 - `REMINDERS_DELIVERY_MODE=alarm`
 - `INTERACTIVE_DELIVERY_MODE=safe`
 - `MEMORY_RETENTION_MODE=summarized`
+- `SHORT_TERM_MEMORY_TURNS=20`
+- `ENABLE_LONG_TERM_MEMORY=false`
+- `LONG_TERM_MEMORY_MODE=disabled`
+- `LONG_TERM_MEMORY_REQUIRES_CONSENT=true`
 - `LOG_CAPTURE_MODE=console_and_file`
 
-`/version` muestra estos flags, el modo de entrega de recordatorios y el estado de plantillas cuando `REMINDERS_DELIVERY_MODE=alarm`.
+`/version` muestra estos flags, el modo de entrega de recordatorios, el estado de plantillas cuando `REMINDERS_DELIVERY_MODE=alarm`, y el estado de memoria corta/larga.
 
 ## Compatibilidad
 

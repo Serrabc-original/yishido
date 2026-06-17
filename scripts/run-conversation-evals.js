@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { routeCoreUtilityIntent } from "../src/coreUtilityRouter.js";
-import { runAgentRuntime } from "../src/agent/agentRuntime.js";
+import { buildAgentExecutionPlan, runAgentExecutionPlan } from "../src/agent/agentOrchestrationPipeline.js";
 
 const evalDir = join(process.cwd(), "test", "evals", "conversations");
 const files = readdirSync(evalDir).filter(function (file) {
@@ -43,20 +43,31 @@ if (failed) process.exit(1);
 
 function runEvalCase(item) {
   const userTurn = buildUserTurn(item);
+  const now = item.now || "2026-06-16T12:00:00.000Z";
   const route = routeCoreUtilityIntent(userTurn, {
     flags: { enableLists: true, enableReminders: true },
-    now: item.now || "2026-06-16T12:00:00.000Z",
+    now: now,
     timezone: "America/Bogota"
   });
-  const runtimeResult = runAgentRuntime({
+  const executionPlan = buildAgentExecutionPlan({
     data: { coreUtilityState: item.initialCoreUtilityState || {} },
     userTurn: userTurn,
     utilityRoute: route,
-    now: item.now || "2026-06-16T12:00:00.000Z"
+    now: now
   });
+  const execution = runAgentExecutionPlan({
+    data: { coreUtilityState: item.initialCoreUtilityState || {} },
+    userTurn: userTurn,
+    utilityRoute: route,
+    executionPlan: executionPlan,
+    now: now
+  });
+  const runtimeResult = execution.runtimeResult || { handled: false, data: { coreUtilityState: item.initialCoreUtilityState || {} } };
   const actual = {
     routeIntent: route.intent,
-    handled: runtimeResult.handled,
+    executionMode: executionPlan.executionMode,
+    toolPermissionStatus: executionPlan.toolPermission && executionPlan.toolPermission.status || "",
+    handled: execution.handled,
     action: runtimeResult.action && runtimeResult.action.action || "",
     taskCount: runtimeResult.data.coreUtilityState && runtimeResult.data.coreUtilityState.tasks && runtimeResult.data.coreUtilityState.tasks.length || 0,
     leadCount: runtimeResult.data.coreUtilityState && runtimeResult.data.coreUtilityState.leads && runtimeResult.data.coreUtilityState.leads.length || 0,

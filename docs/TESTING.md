@@ -34,13 +34,24 @@ Fixtures live in `test/fixtures`.
 
 `npm.cmd test:inputs` runs every fixture through the local User Turn simulator.
 
+## Conversation Evals
+
+Run:
+
+```powershell
+npm.cmd run evals:conversations
+npm.cmd run evals:whatsapp
+```
+
+`evals:whatsapp` replays JSONL cases from `test/evals/whatsapp` through the Woztell normalizer, dedupe gate, User Turn builder, and core intent router.
+
 ## Real WhatsApp Smoke Test
 
 1. Send text only and confirm one response.
 2. Send one image without text and confirm the agent asks what to do with it.
 3. Send three images quickly and confirm there is one grouped response after `IMAGE_MESSAGE_WAIT_SECONDS`.
 4. Send text, then three images quickly, for example: `Hazme 3 posts con estas imagenes`.
-5. Confirm logs show `MEDIA_BATCH_CREATED`, `BUFFER_MEDIA_BATCH_READY`, and `ORCHESTRATOR_INPUT_SUMMARY`.
+5. Confirm logs show `TURN_BUFFER_READY`, `MEDIA_BATCH_CREATED`, and `ORCHESTRATOR_INPUT_SUMMARY`.
 6. Confirm Google Sheets still receives draft/calendar/bulk rows.
 7. Send `/reset` and confirm context resets.
 8. Send audio and confirm `AUDIO_QUEUE` still handles it.

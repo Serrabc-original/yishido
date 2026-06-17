@@ -105,7 +105,7 @@ for (const record of records) {
 
   if (event === "TURN_CREATED" || event === "WEBHOOK_RECEIVED") turn.received = true;
   if (event === "TURN_BUFFER_READY") turn.bufferReady = true;
-  if (event === "USER_RESPONSE_SENT") turn.responseSent = true;
+  if (event === "USER_RESPONSE_SENT" || event === "TURN_PROCESSING_DONE") turn.responseSent = true;
 
   if (event === "TURN_BUFFER_STARTED" && details.reason === "waiting_audio_transcription") {
     turn.pendingAudio = true;

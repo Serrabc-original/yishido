@@ -28,6 +28,8 @@ export function buildAgentMemoryReadModels(input) {
       utilityMemory: data.utilityMemory || null,
       activeList: coreUtilityState.activeList || ""
     },
+    longTermMemory: data.longTermMemory || null,
+    memoryPolicy: data.memoryPolicy || null,
     clientsLeadsTasks: buildTaskMemoryReadModel({
       tasks: coreUtilityState.tasks || [],
       leads: coreUtilityState.leads || [],

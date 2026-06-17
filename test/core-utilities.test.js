@@ -205,10 +205,13 @@ test("lists index and reminders formatting expose empty and populated states", (
   });
 
   assert.match(listsText, /super \(activa\)/);
-  assert.match(listsText, /2 item/);
+  assert.match(listsText, /2 pendiente/);
   assert.match(emptyRemindersText, /No tienes recordatorios pendientes/);
-  assert.match(remindersText, /modo: mock/);
+  assert.match(remindersText, /Recordatorios pendientes/);
   assert.match(remindersText, /comprar leche/);
+  assert.match(remindersText, /13 jun 2026|jun/i);
+  assert.doesNotMatch(remindersText, /modo:|scheduled_|scheduler|Durable Object/i);
+  assert.doesNotMatch(remindersText, /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
 });
 
 test("list parser extracts action, list name and items", () => {
@@ -233,6 +236,24 @@ test("audio transcript list request creates shopping list items", () => {
   assert.equal(parsed.action, "add");
   assert.equal(parsed.listName, "compras");
   assert.deepEqual(parsed.items, ["huevos", "pan", "leche", "carne"]);
+});
+
+test("list parser separates shopping items from reminder wording in compound requests", () => {
+  const parsed = parseListCommand("Hazme una lista de compras con huevos, leche, pan y queso y hazme acuerdo en 10 minutos.");
+
+  assert.equal(parsed.action, "add");
+  assert.equal(parsed.listName, "compras");
+  assert.deepEqual(parsed.items, ["huevos", "leche", "pan", "queso"]);
+});
+
+test("reminder parser uses the full shopping list as reminder subject in compound requests", () => {
+  const parsed = parseReminderRequest("Hazme una lista de compras con huevos, leche, pan y queso y hazme acuerdo en 10 minutos.", "America/Bogota", {
+    now: "2026-06-16T17:48:00.000Z"
+  });
+
+  assert.match(parsed.title, /lista compras: huevos, leche, pan, queso/i);
+  assert.doesNotMatch(parsed.title, /^comprar huevos$/i);
+  assert.equal(parsed.missingFields.length, 0);
 });
 
 test("bug report exports trace bundle, redacts secrets and detects missing events", () => {
@@ -334,6 +355,23 @@ test("router separates list and short relative reminder from audio text", () => 
   assert.equal(reminder.parsed.title, "comprar leche");
   assert.equal(reminder.parsed.missingFields.length, 0);
   assert.match(reminder.parsed.dueAt, /^2026-06-13T12:04:00/);
+});
+
+test("router exposes a compound list_reminder route for list plus reminder in one turn", () => {
+  const route = routeCoreUtilityIntent({
+    current_turn_text: "[Audio transcrito]: Hazme una lista de compras con huevos, leche, pan y queso y hazme acuerdo en 10 minutos.",
+    audio_count: 1
+  }, {
+    flags: { enableLists: true, enableReminders: true },
+    now: "2026-06-16T17:48:00.000Z",
+    timezone: "America/Bogota"
+  });
+
+  assert.equal(route.intent, "list_reminder");
+  assert.equal(route.shouldHandleInCore, true);
+  assert.deepEqual(route.parsed.list.items, ["huevos", "leche", "pan", "queso"]);
+  assert.match(route.parsed.reminder.title, /lista compras: huevos, leche, pan, queso/i);
+  assert.equal(route.parsed.reminder.missingFields.length, 0);
 });
 
 test("router treats dentro de and min relative reminder wording as complete", () => {

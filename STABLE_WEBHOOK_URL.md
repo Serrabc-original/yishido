@@ -74,7 +74,7 @@ Expected response includes:
 - `ENABLE_LISTS: true`
 - `ENABLE_REMINDERS: true`
 - `ENABLE_WHATSAPP_INTERACTIVE: true`
-- `REMINDERS_DELIVERY_MODE: mock`
+- `REMINDERS_DELIVERY_MODE: alarm`
 - `INTERACTIVE_DELIVERY_MODE: safe`
 
 You can also send `/version` from WhatsApp after Woztell points to the deployed URL.

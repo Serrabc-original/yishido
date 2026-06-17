@@ -8,6 +8,30 @@ export function routeCoreUtilityIntent(userTurn, options) {
   const flags = cleanOptions.flags || {};
   const media = getTurnMediaCounts(userTurn);
 
+  if (isListIntent(normalized) && isReminderIntent(normalized)) {
+    const listParsed = parseListCommand(text);
+    const reminderParsed = parseReminderRequest(text, cleanOptions.timezone || "UTC", {
+      now: cleanOptions.now
+    });
+    const missingFields = Array.from(new Set([].concat(
+      listParsed.missingFields || [],
+      reminderParsed.missingFields || []
+    )));
+
+    return {
+      intent: "list_reminder",
+      confidence: Number(Math.max(listParsed.confidence || 0, reminderParsed.confidence || 0, 0.8).toFixed(2)),
+      module: "core",
+      missingFields: missingFields,
+      shouldHandleInCore: Boolean(flags.enableLists && flags.enableReminders),
+      shouldPassToAgent: !Boolean(flags.enableLists && flags.enableReminders),
+      parsed: {
+        list: listParsed,
+        reminder: reminderParsed
+      }
+    };
+  }
+
   if (isReminderIntent(normalized) || cleanOptions.pendingReminderDraft && isReminderContinuation(normalized)) {
     const parsed = parseReminderRequest(text, cleanOptions.timezone || "UTC", {
       now: cleanOptions.now

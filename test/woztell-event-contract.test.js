@@ -3,6 +3,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { normalizeInboundEvent, shouldIgnoreInboundEvent } from "../src/conversation/inboundEventCollector.js";
 import { extractWoztellMessage, normalizeIncomingMessage } from "../src/index.js";
+import {
+  extractWoztellMessage as extractWoztellMessageFromAdapter,
+  normalizeIncomingMessage as normalizeIncomingMessageFromAdapter,
+  normalizeWoztellInboundEvent
+} from "../src/channels/woztell/eventNormalizer.js";
 
 test("Woztell contract doc covers required event and API terms", () => {
   const doc = readFileSync(new URL("../docs/WOZTELL_EVENT_CONTRACT.md", import.meta.url), "utf8");
@@ -93,5 +98,41 @@ test("extract and normalize preserve fileId and caption", () => {
   assert.equal(normalized.media[0].fileId, "file_1");
   assert.equal(normalized.media[0].caption, "caption uno");
   assert.deepEqual(normalized.captions, ["caption uno"]);
+});
+
+test("Woztell event normalizer exposes channel-owned normalized message contract", () => {
+  const payload = {
+    eventType: "INBOUND",
+    type: "IMAGE",
+    app: "app_1",
+    channel: "channel_1",
+    member: "member_1",
+    from: "593",
+    messageId: "msg_img_reply",
+    data: {
+      fileId: "file_1",
+      caption: "caption reply",
+      context: { messageId: "quoted_1", fileId: "quoted_file", type: "IMAGE" }
+    }
+  };
+
+  const event = normalizeWoztellInboundEvent(payload, { traceId: "trace_test" });
+  const parsed = extractWoztellMessageFromAdapter(payload);
+  const normalized = normalizeIncomingMessageFromAdapter(parsed, payload, {
+    messageId: "msg_img_reply",
+    traceId: "trace_test",
+    receivedAt: "2026-06-14T00:00:00.000Z"
+  });
+
+  assert.equal(event.type, "IMAGE");
+  assert.equal(event.channelId, "channel_1");
+  assert.equal(parsed.fileId, "file_1");
+  assert.equal(normalized.messageId, "msg_img_reply");
+  assert.equal(normalized.traceId, "trace_test");
+  assert.equal(normalized.media.length, 1);
+  assert.equal(normalized.media[0].fileId, "file_1");
+  assert.equal(normalized.quotedMessageId, "quoted_1");
+  assert.equal(normalized.quotedFileId, "quoted_file");
+  assert.deepEqual(normalized.captions, ["caption reply"]);
 });
 

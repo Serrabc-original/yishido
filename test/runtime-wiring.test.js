@@ -276,6 +276,14 @@ function installFakeClock(start) {
   };
 }
 
+function assertNoCustomerTechnicalLeak(text) {
+  assert.doesNotMatch(text, /Durable Object/i);
+  assert.doesNotMatch(text, /scheduled_alarm|scheduled_mock/i);
+  assert.doesNotMatch(text, /modo:\s*alarm/i);
+  assert.doesNotMatch(text, /scheduler/i);
+  assert.doesNotMatch(text, /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+}
+
 test("concurrent WhatsApp images append atomically into one pending turn", async () => {
   const state = createMemoryState();
   const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
@@ -1220,6 +1228,193 @@ test("reminder title follow-up can resolve the active shopping list", async () =
   }
 });
 
+test("audio list plus reminder creates the shopping list before scheduling the reminder", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(Date.parse("2026-06-16T17:48:00.000Z"));
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, Object.assign(env(), {
+    ENABLE_LISTS: "true",
+    ENABLE_REMINDERS: "true",
+    REMINDERS_DELIVERY_MODE: "alarm",
+    USER_TIMEZONE: "America/Bogota"
+  }));
+
+  try {
+    await coordinator.fetch(localMessageRequest(audioMessage("aud_list_reminder", "msg_audio_list_reminder")));
+    await coordinator.fetch(toolResultRequest({
+      type: "audio_transcribed",
+      messageId: "msg_audio_list_reminder",
+      transcript: "Hazme una lista de compras con huevos, leche, pan y queso y hazme acuerdo en 10 minutos."
+    }));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const saved = await state.storage.get("data");
+    const list = saved.coreUtilityState.lists && saved.coreUtilityState.lists.compras;
+    const listItems = list && Array.isArray(list.items) ? list.items.map((item) => item.text) : [];
+    const sent = captures.sentTexts.join("\n");
+
+    assert.deepEqual(listItems, ["huevos", "leche", "pan", "queso"]);
+    assert.equal(listItems.includes("hazme acuerdo en 10 minutos"), false);
+    assert.equal(saved.coreUtilityState.reminders.length, 1);
+    assert.match(saved.coreUtilityState.reminders[0].title, /lista compras: huevos, leche, pan, queso/i);
+    assert.equal(saved.coreUtilityState.pendingReminderDraft, null);
+    assert.equal(captures.orchestratorRequests.length, 0);
+    assertNoCustomerTechnicalLeak(sent);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("text list plus reminder creates both artifacts without storing reminder wording as a list item", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(Date.parse("2026-06-16T17:48:00.000Z"));
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, Object.assign(env(), {
+    ENABLE_LISTS: "true",
+    ENABLE_REMINDERS: "true",
+    REMINDERS_DELIVERY_MODE: "alarm",
+    USER_TIMEZONE: "America/Bogota"
+  }));
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Ayudame a comprar huevos, leche, pan, queso, ponme una lista y hazme acuerdo en 10 minutos.", "msg_text_list_reminder")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const saved = await state.storage.get("data");
+    const list = saved.coreUtilityState.lists && saved.coreUtilityState.lists.compras;
+    const listItems = list && Array.isArray(list.items) ? list.items.map((item) => item.text) : [];
+    const sent = captures.sentTexts.join("\n");
+
+    assert.deepEqual(listItems, ["huevos", "leche", "pan", "queso"]);
+    assert.equal(listItems.includes("hazme acuerdo en 10 minutos"), false);
+    assert.equal(saved.coreUtilityState.reminders.length, 1);
+    assert.match(saved.coreUtilityState.reminders[0].title, /lista compras: huevos, leche, pan, queso/i);
+    assert.equal(saved.coreUtilityState.pendingReminderDraft, null);
+    assert.equal(captures.orchestratorRequests.length, 0);
+    assertNoCustomerTechnicalLeak(sent);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("asking which list was given after a compound request returns the real saved list", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(Date.parse("2026-06-16T17:48:00.000Z"));
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, Object.assign(env(), {
+    ENABLE_LISTS: "true",
+    ENABLE_REMINDERS: "true",
+    REMINDERS_DELIVERY_MODE: "alarm",
+    USER_TIMEZONE: "America/Bogota"
+  }));
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Hazme una lista de compras con huevos, leche, pan y queso y hazme acuerdo en 10 minutos.", "msg_compound_before_followup")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    captures.sentTexts.length = 0;
+    await coordinator.fetch(localMessageRequest(textMessage("Cual era la lista que te di??", "msg_which_list")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const saved = await state.storage.get("data");
+    const sent = captures.sentTexts.join("\n");
+    assert.match(sent, /huevos/i);
+    assert.match(sent, /leche/i);
+    assert.match(sent, /pan/i);
+    assert.match(sent, /queso/i);
+    assert.doesNotMatch(sent, /lista .*est[aá] vac[ií]a/i);
+    assert.equal(saved.coreUtilityState.activeList, "compras");
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("audio-list repair does not answer empty when compact memory contains the recent audio list", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(Date.parse("2026-06-16T17:58:00.000Z"));
+  globalThis.fetch = mockRuntimeFetch(captures);
+  await state.storage.put("data", {
+    doName: "channel_runtime:593995660220",
+    channel: "channel_runtime",
+    phone: "593995660220",
+    member: "member_runtime",
+    app: "app_runtime",
+    customerMemory: {
+      last_audio_summary: "lista de compras con huevos, leche, pan y queso"
+    },
+    conversationLog: [{
+      turnId: "turn_recent_audio",
+      role: "user",
+      textPreview: "[Audio transcrito]: Hazme una lista de compras con huevos, leche, pan y queso",
+      audioTranscripts: ["Hazme una lista de compras con huevos, leche, pan y queso"],
+      media: { fileIds: [], assetCount: 0, failedAssetCount: 0 }
+    }],
+    coreUtilityState: {
+      reminders: [],
+      usageReports: {}
+    }
+  });
+  const coordinator = new ConversationCoordinator(state, Object.assign(env(), {
+    ENABLE_LISTS: "true",
+    ENABLE_REMINDERS: "true",
+    USER_TIMEZONE: "America/Bogota"
+  }));
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Te di la lista por audio", "msg_audio_list_repair")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const sent = captures.sentTexts.join("\n");
+    assert.doesNotMatch(sent, /lista .*est[aá] vac[ií]a/i);
+    assert.match(sent, /huevos|leche|pan|queso|confirm/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("alarm reminder creation uses human customer text and hides infrastructure details", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(Date.parse("2026-06-16T17:48:00.000Z"));
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, Object.assign(env(), {
+    ENABLE_REMINDERS: "true",
+    REMINDERS_DELIVERY_MODE: "alarm",
+    USER_TIMEZONE: "America/Bogota"
+  }));
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Recuerdame en 10 minutos comprar huevos", "msg_human_alarm_reminder")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const sent = captures.sentTexts.join("\n");
+    assert.match(sent, /te lo recordar[eé]|te recordar[eé]|WhatsApp/i);
+    assertNoCustomerTechnicalLeak(sent);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
 test("runtime commands /version and /reset keep short-circuit behavior", async () => {
   const state = createMemoryState();
   const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
@@ -1258,6 +1453,46 @@ test("runtime commands /version and /reset keep short-circuit behavior", async (
     assert.equal(saved.pendingMessages.length, 0);
     assert.equal(saved.recentMediaAssets.length, 0);
     assert.equal(saved.currentTurnId, "");
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("runtime commands /debug-logs and /health expose compact trace diagnostics", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781471950000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("agrega huevos y pan a mi lista de compras", "msg_diag_text")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const saved = await state.storage.get("data");
+    assert.equal(Array.isArray(saved.traceEvents), true);
+    assert.equal(saved.traceEvents.some((event) => event.event === "USER_TURN_READY"), true);
+    assert.equal(saved.traceEvents.some((event) => event.event === "AGENT_EXECUTION_PLAN_CREATED"), true);
+    assert.equal(saved.traceEvents.some((event) => event.event === "TURN_PROCESSING_DONE"), true);
+
+    const debugResponse = await coordinator.fetch(localMessageRequest(textMessage("/debug-logs", "msg_debug_logs")));
+    const debugBody = await debugResponse.json();
+    const debugText = captures.sentTexts[captures.sentTexts.length - 1] || "";
+    assert.equal(debugBody.status, "debug_logs_sent");
+    assert.match(debugText, /Debug logs de esta conversacion/);
+    assert.match(debugText, /TURN_PROCESSING_DONE/);
+    assert.equal(debugText.includes("https://cdn.test"), false);
+
+    const healthResponse = await coordinator.fetch(localMessageRequest(textMessage("/health", "msg_health")));
+    const healthBody = await healthResponse.json();
+    const healthText = captures.sentTexts[captures.sentTexts.length - 1] || "";
+    assert.equal(healthBody.status, "health_sent");
+    assert.match(healthText, /Estado del asistente/);
+    assert.match(healthText, /mensajes pendientes: 0/);
+    assert.match(healthText, /errores recientes: 0/);
   } finally {
     globalThis.fetch = originalFetch;
     clock.restore();

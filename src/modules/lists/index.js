@@ -13,6 +13,7 @@ export function parseListCommand(text) {
 
   if (normalized.startsWith("crea una lista") || normalized.startsWith("crear lista")) action = "create";
   else if (/\b(hazme|hacer|prepara|preparame|creame|crear|generar|genera|ayudar a generar|ayudame a generar)\b.*\blista\b/.test(normalized)) action = "add";
+  else if (/\bayudame\s+a\s+comprar\b.*\blista\b/.test(normalized)) action = "add";
   else if (normalized.startsWith("agrega") || normalized.startsWith("anota")) action = "add";
   else if (normalized.startsWith("quita") || normalized.startsWith("elimina")) action = "remove";
   else if (normalized.startsWith("marca como hecho") || normalized.startsWith("marcar como hecho") || /\bmarca\b.*\b(comprado|hecho)\b/.test(normalized)) action = "mark_done";
@@ -205,32 +206,42 @@ function extractListName(raw, normalized, action) {
 
   if (match) {
     const candidate = match[1].replace(/^mi\s+/i, "").trim();
+    if (isGenericListReferenceName(candidate)) return "";
     if (!["", "mi", "la"].includes(normalizeText(candidate))) return candidate;
   }
 
   if (normalized.includes("super") || normalized.includes("supermercado")) return "super";
   if (normalized.includes("compras")) return "compras";
+  if (/\bcomprar\b/.test(normalized) && includesGroceryItems(normalized)) return "compras";
   if (normalized.includes("inventario")) return "inventario";
   if (normalized.includes("pendientes")) return "pendientes";
   return "";
+}
+
+function isGenericListReferenceName(value) {
+  const clean = normalizeText(value);
+  return /^(que te di|que te dije|por audio|en audio|del audio|por el audio|anterior|esa|esta|la)$/.test(clean);
 }
 
 function extractItems(raw, normalized, action, listName) {
   if (action === "list" || action === "create" || action === "unknown") return [];
 
   const source = String(raw || "");
-  const afterListDe = source.match(/\blista\s+de\s+(.+)$/i);
-  const afterCon = source.match(/\bcon\s+(.+)$/i);
+  const listSource = stripReminderClause(source);
+  const afterListDe = listSource.match(/\blista\s+de\s+(.+)$/i);
+  const afterCon = listSource.match(/\bcon\s+(.+)$/i);
   let clean = afterCon && /\blista\b/i.test(raw)
     ? afterCon[1]
     : afterListDe && /[,;]|\s+y\s+/i.test(afterListDe[1])
     ? afterListDe[1]
-    : source
+    : listSource
       .replace(/^\s*(anota|agrega|quita|elimina|marca como hecho|marcar como hecho)\s*/i, "")
       .replace(/^\s*marca\s+/i, "")
       .replace(/\s+como\s+(comprado|hecho).*$/i, "")
+      .replace(/^\s*(me puedes ayudar a\s+)?ayudame\s+a\s+comprar\s+/i, "")
       .replace(/^\s*(me puedes ayudar a\s+)?(hazme|hacer|prepara|preparame|creame|crear|generar|genera|ayudame a generar)\s+(una\s+)?lista\s+(de\s+|del\s+)?[^,.;:]+?\s+con\s+/i, "")
       .replace(/^\s*(me puedes ayudar a\s+)?(hazme|hacer|prepara|preparame|creame|crear|generar|genera|ayudame a generar)\s+(una\s+)?lista\s+(de\s+)?/i, "")
+      .replace(/\bponme\s+(una\s+)?lista\b/ig, "")
       .replace(/\s+(en|a|de)\s+(mi\s+)?lista\s+.*$/i, "")
       .trim();
 
@@ -241,10 +252,18 @@ function extractItems(raw, normalized, action, listName) {
   return normalizeItems(clean.split(/\s*,\s*|\s+y\s+/));
 }
 
+function stripReminderClause(text) {
+  return String(text || "")
+    .replace(/\s+(y\s+)?(?:hazme\s+acuerdo|av[ií]same|avisame|recu[eé]rdame|recuerdame|recordarme)\b.*$/i, "")
+    .replace(/\s*,?\s*(?:ponme|pon|crea|agrega)\s+(?:un\s+)?recordatorio\b.*$/i, "")
+    .replace(/\s*,?\s*(?:para\s+)?(?:en|dentro de)\s+(\d+|un|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|quince|veinte|treinta)\s*(min|minuto|minutos|m|hora|horas|h|d[ií]a|dias|d[ií]as|d)\b.*$/i, "")
+    .trim();
+}
+
 function normalizeItems(items) {
   return (Array.isArray(items) ? items : [items])
     .map(function (item) {
-      return String(item || "").replace(/[.。]+$/g, "").trim();
+      return String(item || "").replace(/[.,;:。]+$/g, "").trim();
     })
     .filter(Boolean);
 }

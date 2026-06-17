@@ -173,6 +173,8 @@ export function normalizeAgentMemoryReadModels(input) {
     recentConversation: clean.recentConversation || clean.recent_conversation || null,
     userMemory: clean.userMemory || clean.user_memory || null,
     businessMemory: clean.businessMemory || clean.business_memory || null,
+    longTermMemory: clean.longTermMemory || clean.long_term_memory || null,
+    memoryPolicy: clean.memoryPolicy || clean.memory_policy || null,
     clientsLeadsTasks: clean.clientsLeadsTasks || clean.clients_leads_tasks || null
   });
 }

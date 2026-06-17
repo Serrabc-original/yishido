@@ -743,6 +743,9 @@ test("control commands expose interactive, lists and reminders safely", async ()
     const lists = await coordinator.receiveMessage(buildTextWebhookBody("/lists"));
     const reminders = await coordinator.receiveMessage(buildTextWebhookBody("/reminders"));
     const tasks = await coordinator.receiveMessage(buildTextWebhookBody("/tasks"));
+    const memory = await coordinator.receiveMessage(buildTextWebhookBody("/memory"));
+    const memoryOn = await coordinator.receiveMessage(buildTextWebhookBody("/memory-on"));
+    const memoryOff = await coordinator.receiveMessage(buildTextWebhookBody("/memory-off"));
     const clearReminders = await coordinator.receiveMessage(buildTextWebhookBody("/clear-reminders"));
     const saved = await state.storage.get("data");
 
@@ -750,12 +753,23 @@ test("control commands expose interactive, lists and reminders safely", async ()
     assert.equal((await lists.json()).status, "lists_sent");
     assert.equal((await reminders.json()).status, "reminders_sent");
     assert.equal((await tasks.json()).status, "tasks_sent");
+    assert.equal((await memory.json()).status, "memory_sent");
+    assert.equal((await memoryOn.json()).status, "long_term_memory_consent_granted");
+    assert.equal((await memoryOff.json()).status, "long_term_memory_consent_revoked");
     assert.equal((await clearReminders.json()).status, "reminders_cleared");
     assert.equal(saved.coreUtilityState.reminders.length, 0);
+    assert.equal(saved.memoryConsent.longTerm.status, "revoked");
     assert.equal(sentBodies.some((item) => item.body.response && item.body.response[0].type === "QUICK_REPLY"), true);
     assert.equal(sentBodies.some((item) => JSON.stringify(item.body).includes("Listas guardadas")), true);
     assert.equal(sentBodies.some((item) => JSON.stringify(item.body).includes("Recordatorios pendientes")), true);
     assert.equal(sentBodies.some((item) => JSON.stringify(item.body).includes("Tareas abiertas")), true);
+    assert.equal(sentBodies.some((item) => JSON.stringify(item.body).includes("Memoria guardada")), true);
+    assert.equal(sentBodies.some((item) => JSON.stringify(item.body).includes("memoria larga opcional")), true);
+    const reminderBody = sentBodies.find((item) => JSON.stringify(item.body).includes("Recordatorios pendientes"));
+    const reminderText = JSON.stringify(reminderBody && reminderBody.body || {});
+    assert.match(reminderText, /comprar leche/);
+    assert.doesNotMatch(reminderText, /scheduled_|modo:|scheduler|Durable Object/i);
+    assert.doesNotMatch(reminderText, /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
   } finally {
     globalThis.fetch = originalFetch;
   }
