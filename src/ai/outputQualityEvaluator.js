@@ -38,13 +38,60 @@ export function evaluateCustomerReplyQuality(input) {
       recentImageCount: recentImageCount
     })
     : "";
+  const score = Number(Math.max(0, 1 - reasons.length * 0.22).toFixed(2));
+  const escalation = decideCustomerReplyEscalation({
+    reasons: reasons,
+    score: score,
+    routeConfidence: clean.routeConfidence || clean.route_confidence || clean.supervisorPlan && clean.supervisorPlan.confidence,
+    intent: intent,
+    imageCount: imageCount,
+    recentImageCount: recentImageCount,
+    memoryReadModel: memoryReadModel,
+    replyText: replyText,
+    userText: userText
+  });
 
   return {
     ok: reasons.length === 0,
-    score: Number(Math.max(0, 1 - reasons.length * 0.22).toFixed(2)),
+    score: score,
     reasons: reasons,
     repairedText: repairedText,
+    escalation: escalation,
     shouldSend: Boolean(replyText || repairedText)
+  };
+}
+
+export function decideCustomerReplyEscalation(input) {
+  const clean = input || {};
+  const reasons = Array.isArray(clean.reasons) ? clean.reasons.map(String) : [];
+  const score = Number.isFinite(Number(clean.score)) ? Number(clean.score) : 1;
+  const routeConfidence = Number.isFinite(Number(clean.routeConfidence)) ? Number(clean.routeConfidence) : 0;
+  const mediaAvailable = Number(clean.imageCount || 0) > 0 ||
+    Number(clean.recentImageCount || 0) > 0 ||
+    hasRetrievedMedia(clean.memoryReadModel || {});
+  const escalationReasons = [];
+
+  if (score < 0.56) escalationReasons.push("low_quality_score");
+  if (routeConfidence > 0 && routeConfidence < 0.55) escalationReasons.push("low_route_confidence");
+  if (reasons.includes("asks_reupload_when_media_exists") && mediaAvailable) escalationReasons.push("media_memory_conflict");
+  if (reasons.includes("stale_reminder_leaked")) escalationReasons.push("memory_context_conflict");
+  if (reasons.includes("robotic_or_system_style")) escalationReasons.push("robotic_output");
+  if ((Number(clean.imageCount || 0) + Number(clean.recentImageCount || 0)) > 1 && reasons.length) escalationReasons.push("multimodal_output_risk");
+
+  const uniqueReasons = Array.from(new Set(escalationReasons));
+  const shouldEscalate = uniqueReasons.length > 0 && (
+    score < 0.78 ||
+    routeConfidence && routeConfidence < 0.55 ||
+    uniqueReasons.includes("media_memory_conflict") ||
+    uniqueReasons.includes("memory_context_conflict")
+  );
+
+  return {
+    shouldEscalate: Boolean(shouldEscalate),
+    target: shouldEscalate ? "stronger_customer_reply" : "",
+    reasons: uniqueReasons,
+    score: Number(Math.max(0, Math.min(1, score)).toFixed(2)),
+    routeConfidence: Number(Math.max(0, Math.min(1, routeConfidence)).toFixed(2))
   };
 }
 
@@ -71,6 +118,9 @@ export function buildQualityRepair(input) {
   }
 
   if (reasons.includes("stale_reminder_leaked")) {
+    if (isImageGenerationRepair(clean, normalizedUserText)) {
+      return "Perdon, mezcle un contexto anterior. Uso la imagen reciente como base y preparo esa version.";
+    }
     if (/\b(audio|lo del audio)\b/i.test(normalizedUserText) && latestAudio) {
       return "Perdon, mezcle el contexto. Lo del audio era: " + latestAudio;
     }
@@ -98,6 +148,16 @@ function getImageCount(userTurn) {
 function hasRetrievedMedia(memoryReadModel) {
   const selected = memoryReadModel && memoryReadModel.retrieved && memoryReadModel.retrieved.selected || {};
   return Array.isArray(selected.media) && selected.media.length > 0;
+}
+
+function isImageGenerationRepair(input, normalizedUserText) {
+  const clean = input || {};
+  const intent = String(clean.intent || "").toLowerCase();
+  return intent === "image_generation" ||
+    Number(clean.imageCount || 0) > 0 ||
+    Number(clean.recentImageCount || 0) > 0 ||
+    hasRetrievedMedia(clean.memoryReadModel || {}) ||
+    /\b(cute|chevere|version|portada|diseno|disena|disenalo|imagen|foto)\b/i.test(normalizedUserText || "");
 }
 
 function findLatestAudioSummary(memoryReadModel) {

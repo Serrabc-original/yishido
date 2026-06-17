@@ -9,7 +9,7 @@ import {
   normalizeIncomingMessage,
   updateTaskIntakeWithMessage
 } from "../src/index.js";
-import { appendPendingEvent, buildTurnReadiness, getTurnAggregationTiming } from "../src/conversation/turnAggregator.js";
+import { appendPendingEvent, buildTurnReadiness, getTurnAggregationTiming, isUserDoneSignal } from "../src/conversation/turnAggregator.js";
 import { createConversationSupervisorPlan } from "../src/supervisor/conversationSupervisor.js";
 
 const basePayload = {
@@ -161,6 +161,29 @@ test("pending events append and readiness handles audio wait plus done signal", 
 
   data.pendingMessages.push(textMessage("listo", "done"));
   assert.equal(buildTurnReadiness(data, { now: 3000, timing }).reason, "user_done");
+});
+
+test("done signal does not close fragmented WhatsApp turns too early", () => {
+  assert.equal(isUserDoneSignal("ya te mando otra imagen"), false);
+  assert.equal(isUserDoneSignal("dale espera que falta otra foto"), false);
+  assert.equal(isUserDoneSignal("revisa cuando te mande todo"), false);
+  assert.equal(isUserDoneSignal("no estoy listo"), false);
+  assert.equal(isUserDoneSignal("listo"), true);
+  assert.equal(isUserDoneSignal("primero dos listo"), true);
+  assert.equal(isUserDoneSignal("eso es todo"), true);
+});
+
+test("fragmented turn waits when user mentions more media is coming", () => {
+  const data = { pendingMessages: [], currentTurnId: "turn_wait", firstMessageAt: 1000, lastMessageAt: 2000 };
+  appendPendingEvent(data, textMessage("ya te mando otra imagen", "wait1"));
+  const timing = getTurnAggregationTiming({
+    TURN_SILENCE_MS: 8000,
+    TURN_MAX_WAIT_MS: 45000,
+    TURN_MIN_WAIT_MS: 5000
+  });
+
+  assert.equal(buildTurnReadiness(data, { now: 3000, timing }).ready, false);
+  assert.equal(buildTurnReadiness(data, { now: 3000, timing }).reason, "waiting_silence");
 });
 
 test("task intake window still accepts media after text request", () => {

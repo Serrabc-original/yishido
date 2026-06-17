@@ -114,6 +114,29 @@ test("design request with previous media is routed to image generation context",
   assert.equal(plan.responseStrategy, "execute_then_confirm");
 });
 
+test("short design format follow-up keeps previous media as image generation context", () => {
+  const turn = buildUserTurn([textMessage("Portada", "design_cover")], {}, { turnId: "turn_design_cover" });
+  turn.previous_relevant_media = { asset_count: 1, image_count: 1, file_ids: ["img_base"] };
+  turn.previousRelevantMedia = turn.previous_relevant_media;
+  const plan = createConversationSupervisorPlan({
+    currentTurn: turn,
+    recentConversationWindow: [{
+      turnId: "turn_generated",
+      type: "image",
+      timestamp: "2026-06-17T01:08:00.000Z",
+      summary: "Listo, te genere esta imagen. Quieres otra version o ajustamos el texto?",
+      mediaRefs: { fileIds: ["img_base"], assetCount: 1 }
+    }],
+    activeContext: { activeIntent: "image_generation" },
+    activeTask: { type: "image_generation", status: "awaiting_media", taskMediaFileIds: ["img_base"] }
+  });
+
+  assert.equal(plan.intent, "image_generation");
+  assert.equal(plan.mediaScope, "previous_relevant");
+  assert.equal(plan.shouldUsePreviousMedia, true);
+  assert.equal(plan.responseStrategy, "execute_then_confirm");
+});
+
 test("final response compares all price images and does not ask what to do", () => {
   const text = generateFinalUserResponse({
     intent: "multi_image_price_review",

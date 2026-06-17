@@ -6,11 +6,14 @@ export function buildMemoryRetrievalContext(data, userTurn, options) {
   const turn = userTurn || {};
   const opts = options || {};
   const query = buildRetrievalQuery(turn);
+  const signals = inferContinuitySignals(turn, clean);
   const rankedTurns = rankConversationTurns(clean.conversationLog || [], turn, {
-    maxTurns: opts.maxTurns || DEFAULT_MAX_TURNS
+    maxTurns: opts.maxTurns || DEFAULT_MAX_TURNS,
+    signals: signals
   });
   const rankedMedia = rankMediaMemory(clean, turn, {
-    maxMedia: opts.maxMedia || DEFAULT_MAX_MEDIA
+    maxMedia: opts.maxMedia || DEFAULT_MAX_MEDIA,
+    signals: signals
   });
   const selected = {
     turns: rankedTurns.filter(function (item) { return item.score >= 0.35; }).slice(0, opts.maxSelectedTurns || 4),
@@ -25,7 +28,7 @@ export function buildMemoryRetrievalContext(data, userTurn, options) {
       selectedTurnLimit: opts.maxSelectedTurns || 4,
       selectedMediaLimit: opts.maxSelectedMedia || 4
     },
-    signals: inferContinuitySignals(turn),
+    signals: signals,
     rankedTurns: rankedTurns,
     rankedMedia: rankedMedia,
     selected: selected,
@@ -37,7 +40,7 @@ export function rankConversationTurns(conversationLog, userTurn, options) {
   const turns = Array.isArray(conversationLog) ? conversationLog.slice(-20) : [];
   const query = buildRetrievalQuery(userTurn || {});
   const queryTokens = tokenize(query.text);
-  const signals = inferContinuitySignals(userTurn || {});
+  const signals = options && options.signals || inferContinuitySignals(userTurn || {});
   const maxTurns = Number(options && options.maxTurns || DEFAULT_MAX_TURNS);
 
   return turns.map(function (turn, index) {
@@ -71,12 +74,13 @@ export function rankMediaMemory(data, userTurn, options) {
   const clean = data || {};
   const turn = userTurn || {};
   const maxMedia = Number(options && options.maxMedia || DEFAULT_MAX_MEDIA);
-  const signals = inferContinuitySignals(turn);
+  const signals = options && options.signals || inferContinuitySignals(turn, clean);
   const all = []
     .concat(mediaFromCampaignAssets(clean.campaignState && clean.campaignState.campaign_assets || [], "campaign_assets"))
     .concat(mediaFromRecentAssets(clean.recentMediaAssets || [], "recentMediaAssets"))
     .concat(mediaFromRecentMedia(clean.recentMedia || [], "recentMedia"))
-    .concat(mediaFromLastUploaded(clean.campaignState || {}));
+    .concat(mediaFromLastUploaded(clean.campaignState || {}))
+    .concat(mediaFromGeneratedImageState(clean.campaignState || {}, clean.activeContext || clean.active_context || {}));
   const unique = dedupeMedia(all);
   const currentFileIds = new Set(normalizeStringArray(turn.media_batch && turn.media_batch.fileIds || [], 30));
   const previousFileIds = new Set(normalizeStringArray(turn.previousRelevantMedia && turn.previousRelevantMedia.file_ids || turn.previous_relevant_media && turn.previous_relevant_media.file_ids || [], 30));
@@ -86,13 +90,20 @@ export function rankMediaMemory(data, userTurn, options) {
     const isPrevious = asset.fileId && previousFileIds.has(asset.fileId);
     const recency = scoreMediaRecency(asset.receivedAt, index, unique.length);
     const continuity = signals.referencesMedia || signals.affirmsPreviousAction ? 1 : 0;
-    const sourceWeight = asset.source === "campaign_assets" ? 0.9 : asset.source === "recentMediaAssets" ? 0.8 : 0.65;
+    const sourceWeight = asset.source === "campaign_assets" ? 0.9
+      : asset.source === "recentMediaAssets" ? 0.8
+        : asset.source === "generated_image" ? 0.78
+          : 0.65;
+    const generatedFollowupBoost = asset.source === "generated_image" && signals.referencesGeneratedImage ? 0.26 : 0;
+    const visualFollowupBoost = signals.referencesMedia && signals.affirmsPreviousAction ? 0.22 : 0;
     const score = clampScore(
       (isCurrent ? 1 : 0) * 0.42 +
       (isPrevious ? 1 : 0) * 0.2 +
       continuity * 0.28 +
       recency * 0.12 +
-      sourceWeight * 0.08
+      sourceWeight * 0.08 +
+      visualFollowupBoost +
+      generatedFollowupBoost
     );
 
     return {
@@ -117,8 +128,10 @@ export function rankMediaMemory(data, userTurn, options) {
   }).sort(sortByScoreThenTime).slice(0, maxMedia);
 }
 
-export function inferContinuitySignals(userTurn) {
+export function inferContinuitySignals(userTurn, data) {
   const turn = userTurn || {};
+  const cleanData = data || {};
+  const activeContext = cleanData.activeContext || cleanData.active_context || {};
   const text = normalizeText([
     turn.current_turn_text || "",
     turn.combinedUserText || "",
@@ -126,12 +139,20 @@ export function inferContinuitySignals(userTurn) {
     (turn.captions || []).join(" ")
   ].join(" "));
 
+  const lastOfferedAction = normalizeText(activeContext.lastOfferedAction || activeContext.last_offered_action || "");
+  const lastOfferedIntent = normalizeText(activeContext.lastOfferedIntent || activeContext.last_offered_intent || activeContext.activeIntent || activeContext.active_intent || "");
+  const hasRecentVisualOffer = /\b(image_generation|image generation|image|imagen|vision|ocr|generation|generacion|dise|diseno|portada|flyer|post)\b/.test(lastOfferedAction + " " + lastOfferedIntent);
+  const shortVisualStyleFollowup = isShortVisualStyleFollowup(text);
+  const referencesGeneratedImage = /\b(la anterior|la ultima|ultima imagen|imagen generada|la que generaste|la que hiciste|otra version|ajustala|edit(?:a|alo|ala)|hazla|mas cute|mas chevere|neon|miami wave|portada)\b/.test(text);
+
   return {
     referencesAudio: /\b(audio|nota de voz|lo del audio|en el audio|por audio)\b/.test(text),
     referencesList: /\b(lista|compras|pendientes|super)\b/.test(text),
     referencesReminder: /\b(recordatorio|recuerdame|hazme acuerdo|hacer acuerdo|avisame)\b/.test(text),
-    referencesMedia: /\b(imagen|foto|captura|portada|version|esa|esta|esto|base)\b/.test(text),
-    affirmsPreviousAction: /^(si|dale|ok|claro|hazlo|disenalo|te la paso|portada|otra version)\b/.test(text)
+    referencesMedia: /\b(imagen|foto|captura|portada|version|esa|esta|esto|base|anterior|ultima|generada)\b/.test(text) || hasRecentVisualOffer && shortVisualStyleFollowup,
+    referencesGeneratedImage: referencesGeneratedImage || hasRecentVisualOffer && shortVisualStyleFollowup,
+    affirmsPreviousAction: /^(si|dale|ok|claro|hazlo|disenalo|te la paso|portada|otra version)\b/.test(text) ||
+      hasRecentVisualOffer && shortVisualStyleFollowup
   };
 }
 
@@ -182,7 +203,15 @@ function scoreContinuityMatch(turn, signals) {
   if (signals.referencesList && /\b(lista|compras|super|pendientes)\b/.test(text)) score += 0.3;
   if (signals.referencesReminder && /\b(recordatorio|recuerdame|hazme acuerdo|avisame)\b/.test(text)) score += 0.2;
   if (signals.referencesMedia && ((turn.media && turn.media.fileIds || []).length || /\bimagen|foto|captura\b/.test(text))) score += 0.3;
+  if (signals.affirmsPreviousAction && ((turn.media && turn.media.fileIds || []).length || /\b(genere|generada|version|portada|diseno|dise)\b/.test(text))) score += 0.4;
   return Math.min(1, score);
+}
+
+function isShortVisualStyleFollowup(text) {
+  const clean = normalizeText(text);
+  if (!clean) return false;
+  if (clean.length > 80) return false;
+  return /\b(portada|version|otra version|mas cute|cute|chevere|neon|miami wave|vintage|realista|oscuro|claro|flyer|post|logo|afiche|banner|como portada|hazlo|disenalo|armalo|preparalo)\b/.test(clean);
 }
 
 function mediaFromCampaignAssets(items, source) {
@@ -253,6 +282,42 @@ function mediaFromLastUploaded(campaignState) {
     turnId: "",
     receivedAt: String(last.receivedAt || last.received_at || "")
   }].filter(validMedia);
+}
+
+function mediaFromGeneratedImageState(campaignState, activeContext) {
+  const state = campaignState || {};
+  const context = activeContext || {};
+  const candidates = [
+    {
+      url: state.last_generated_image_url || state.lastGeneratedImageUrl || "",
+      receivedAt: state.last_generated_image_at || state.lastGeneratedImageAt || state.updated_at || "",
+      summary: "ultima imagen generada"
+    },
+    {
+      url: state.last_image_url || state.lastImageUrl || "",
+      receivedAt: state.last_image_at || state.lastImageAt || state.updated_at || "",
+      summary: "ultima imagen conocida"
+    },
+    {
+      url: context.lastGeneratedImageUrl || context.last_generated_image_url || "",
+      receivedAt: context.lastGeneratedImageAt || context.last_generated_image_at || "",
+      summary: "ultima imagen generada"
+    }
+  ];
+
+  return candidates.map(function (item, index) {
+    return {
+      source: "generated_image",
+      assetId: "generated_image_" + (index + 1),
+      fileId: "",
+      url: String(item.url || ""),
+      mediaType: "IMAGE",
+      caption: "",
+      summary: item.summary,
+      turnId: String(state.last_image_turn_id || state.lastImageTurnId || context.lastTurnId || ""),
+      receivedAt: String(item.receivedAt || "")
+    };
+  }).filter(validMedia);
 }
 
 function validMedia(asset) {

@@ -268,3 +268,98 @@ test("memory retrieval ranks recent audio list and media references without raw 
   assert.equal(context.selected.media[0].fileId, "img_base");
   assert.match(context.selected.media[0].citation, /campaign_assets|recentMediaAssets/);
 });
+
+test("memory retrieval reuses recent image base after short style follow-up", () => {
+  const data = {
+    activeContext: {
+      activeIntent: "image_generation",
+      lastOfferedAction: "image_generation",
+      lastOfferedIntent: "image_generation",
+      lastUserGoal: "crear una portada con la imagen base"
+    },
+    conversationLog: [
+      {
+        turnId: "turn_old_list",
+        inputTypes: ["AUDIO"],
+        textPreview: "[Audio transcrito]: lista de compras con leche y pan",
+        audioTranscripts: ["lista de compras con leche y pan"],
+        media: { fileIds: [] }
+      },
+      {
+        turnId: "turn_image_base",
+        inputTypes: ["IMAGE"],
+        textPreview: "Te la paso",
+        media: { fileIds: ["img_insect_base"] }
+      },
+      {
+        turnId: "turn_generated",
+        inputTypes: ["TEXT"],
+        textPreview: "Listo, te genere esta imagen. Quieres otra version o ajustamos el texto?",
+        media: { fileIds: ["img_insect_base"] }
+      }
+    ],
+    recentMediaAssets: [{
+      fileId: "img_insect_base",
+      mediaType: "IMAGE",
+      receivedAt: "2026-06-17T01:11:00.000Z",
+      turnId: "turn_image_base"
+    }],
+    campaignState: {
+      campaign_assets: [{
+        asset_id: "asset_img_insect_base",
+        file_id: "img_insect_base",
+        media_type: "IMAGE",
+        turn_id: "turn_image_base",
+        received_at: "2026-06-17T01:11:00.000Z",
+        analysis: { main_subject: "insecto sobre piso ceramico" }
+      }]
+    }
+  };
+  const context = buildMemoryRetrievalContext(data, {
+    turn_id: "turn_style_followup",
+    input_types: ["AUDIO"],
+    current_turn_text: "mas cute y chevere, porfa",
+    audio_transcripts: ["mas cute y chevere, porfa"],
+    media_batch: { fileIds: [] }
+  });
+
+  assert.equal(context.signals.affirmsPreviousAction, true);
+  assert.equal(context.selected.media[0].fileId, "img_insect_base");
+  assert.equal(context.selected.media[0].score >= 0.6, true);
+  assert.equal(context.selected.turns.some((turn) => turn.sourceId === "turn_generated"), true);
+  assert.equal(context.selected.turns.some((turn) => /lista de compras/i.test(turn.audioSummary || turn.textPreview)), false);
+});
+
+test("memory retrieval keeps latest generated image for edit follow-ups without resend", () => {
+  const data = {
+    activeContext: {
+      activeIntent: "image_generation",
+      lastOfferedAction: "image_generation",
+      lastOfferedIntent: "image_generation"
+    },
+    conversationLog: [
+      {
+        turnId: "turn_generated",
+        inputTypes: ["TEXT"],
+        textPreview: "Listo, te genere esta imagen. Quieres otra version o ajustamos el texto?",
+        media: { fileIds: [] }
+      }
+    ],
+    campaignState: {
+      last_image_url: "https://cdn.test/generated-neon-insect.png",
+      last_image_at: "2026-06-17T01:15:00.000Z"
+    }
+  };
+  const context = buildMemoryRetrievalContext(data, {
+    turn_id: "turn_generated_followup",
+    input_types: ["AUDIO"],
+    current_turn_text: "hazla mas cute y chevere, porfa",
+    audio_transcripts: ["hazla mas cute y chevere, porfa"],
+    media_batch: { fileIds: [] }
+  });
+
+  assert.equal(context.signals.referencesGeneratedImage, true);
+  assert.equal(context.selected.media[0].source, "generated_image");
+  assert.equal(context.selected.media[0].urlPresent, true);
+  assert.match(context.selected.media[0].citation, /generated_image/);
+});

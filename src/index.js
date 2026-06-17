@@ -7384,8 +7384,21 @@ async function sendConversationalResponse(env, params) {
     userTurn: params && params.userTurn || {},
     intent: params && params.intent || params && params.supervisorPlan && params.supervisorPlan.intent || "",
     memoryReadModel: params && params.memoryReadModel || null,
-    recentMediaAssets: params && params.recentMediaAssets || []
+    recentMediaAssets: params && params.recentMediaAssets || [],
+    routeConfidence: params && params.supervisorPlan && params.supervisorPlan.confidence || 0
   });
+  if (quality.escalation && quality.escalation.shouldEscalate) {
+    logEvent("CUSTOMER_REPLY_ESCALATION_RECOMMENDED", {
+      traceId: params && params.traceId || "",
+      turnId: params && params.turnId || "",
+      doName: params && params.doName || "",
+      reasons: quality.escalation.reasons,
+      target: quality.escalation.target,
+      targetModel: getFinalResponseModel(env || {}),
+      score: quality.score,
+      routeConfidence: quality.escalation.routeConfidence
+    });
+  }
   if (!quality.ok && quality.repairedText) {
     logEvent("CUSTOMER_REPLY_QUALITY_REPAIRED", {
       traceId: params && params.traceId || "",
@@ -11011,7 +11024,7 @@ async function resolveImageSourceUrl(env, job, state, woztellPayload) {
     if (uploadedImage.url) {
       console.log("USING_UPLOADED_IMAGE_FOR_EDIT:", JSON.stringify({
         source: "url",
-        url: uploadedImage.url
+        urlPreview: safeUrlPreview(uploadedImage.url)
       }));
       return uploadedImage.url;
     }
@@ -11025,7 +11038,7 @@ async function resolveImageSourceUrl(env, job, state, woztellPayload) {
       console.log("USING_UPLOADED_IMAGE_FOR_EDIT:", JSON.stringify({
         source: "fileId_resolved",
         fileId: uploadedImage.fileId,
-        url: fileInfo.url || ""
+        urlPreview: safeUrlPreview(fileInfo.url || "")
       }));
 
       return fileInfo.url || "";
@@ -11039,7 +11052,7 @@ async function resolveImageSourceUrl(env, job, state, woztellPayload) {
 
     if (lastGeneratedUrl) {
       console.log("USING_LAST_GENERATED_IMAGE_FOR_EDIT:", JSON.stringify({
-        url: lastGeneratedUrl
+        urlPreview: safeUrlPreview(lastGeneratedUrl)
       }));
     }
 

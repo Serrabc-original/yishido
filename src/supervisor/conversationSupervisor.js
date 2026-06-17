@@ -123,9 +123,11 @@ export function createConversationSupervisorPlan(input) {
     hasCurrentImages: hasCurrentImages,
     normalized: normalized
   });
+  const isImageGenerationFollowup = isImageGenerationContinuation(normalized, previousTask, hasPreviousRelevantMedia, activeTaskContext);
   const isContextSwitch = Boolean(
     hasText &&
     !hasExplicitContinuationReference &&
+    !isImageGenerationFollowup &&
     previousTask.intent &&
     previousTask.intent !== "general" &&
     inferredCurrentIntent !== "unknown" &&
@@ -191,7 +193,7 @@ export function createConversationSupervisorPlan(input) {
     targetModules = ["memory", "general_llm"];
     responseStrategy = "answer_now";
     actions.push({ type: normalized.includes("como me llamo") || normalized.includes("cual es mi nombre") ? "answer_memory_name" : "update_memory" });
-  } else if ((isImageGeneration || isImageGenerationContinuation(normalized, previousTask, hasPreviousRelevantMedia, activeTaskContext)) && !isMarketing) {
+  } else if ((isImageGeneration || isImageGenerationFollowup) && !isMarketing) {
     intent = "image_generation";
     activeTask = "image_generation";
     targetModules = hasCurrentImages || hasPreviousRelevantMedia ? ["vision", "image_generation", "general_llm"] : ["image_generation", "general_llm"];
@@ -520,7 +522,7 @@ function isImageGenerationContinuation(text, previousTask, hasPreviousRelevantMe
   const activeType = String(activeTask && activeTask.type || "");
   if (previousIntent !== "image_generation" && activeType !== "image_generation") return false;
   if (!hasPreviousRelevantMedia) return false;
-  return /\b(mismo texto|texto que|ponlo|ponlo en|pusiste|poniste|usa la foto|usa la imagen|esa foto|esta foto|la foto|esa imagen|esta imagen|la imagen|hazlo|disenalo|armalo|preparalo)\b/.test(text);
+  return /\b(mismo texto|texto que|ponlo|ponlo en|pusiste|poniste|usa la foto|usa la imagen|esa foto|esta foto|la foto|esa imagen|esta imagen|la imagen|hazlo|disenalo|armalo|preparalo|portada|version|otra version|mas cute|cute|chevere|neon|miami wave|vintage|realista|oscuro|flyer|post|logo|afiche|banner)\b/.test(text);
 }
 
 function normalizeActiveTaskForSupervisor(task) {

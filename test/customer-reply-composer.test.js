@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { buildCustomerReplyPromptPayload, composeCustomerReply } from "../src/ai/customerReplyComposer.js";
-import { evaluateCustomerReplyQuality } from "../src/ai/outputQualityEvaluator.js";
+import { decideCustomerReplyEscalation, evaluateCustomerReplyQuality } from "../src/ai/outputQualityEvaluator.js";
 import { getCustomerReplyModel } from "../src/ai/modelRegistry.js";
 import { parseCustomerReplyModelOutput } from "../src/index.js";
 
@@ -186,6 +186,61 @@ test("output evaluator repairs false image reupload request when recent media ex
   assert.match(quality.repairedText, /tengo la imagen|uso la imagen/i);
 });
 
+test("output evaluator repairs false image reupload request when ranked memory has media", () => {
+  const quality = evaluateCustomerReplyQuality({
+    replyText: "Si, te la hago. Reenviame la imagen base para hacer esta version mas cute y chevere, porfa.",
+    userTurn: { current_turn_text: "mas cute y chevere, porfa", image_count: 0 },
+    intent: "image_generation",
+    memoryReadModel: {
+      retrieved: {
+        selected: {
+          turns: [{
+            citation: "conversationLog:turn_generated",
+            score: 0.88,
+            textPreview: "Listo, te genere esta imagen.",
+            mediaFileIds: ["img_base"]
+          }],
+          media: [{
+            citation: "campaign_assets:asset_img_base",
+            score: 0.92,
+            fileId: "img_base",
+            mediaType: "IMAGE",
+            summary: "insecto sobre piso ceramico"
+          }]
+        }
+      }
+    }
+  });
+
+  assert.equal(quality.ok, false);
+  assert.equal(quality.reasons.includes("asks_reupload_when_media_exists"), true);
+  assert.match(quality.repairedText, /uso la imagen|tengo la imagen/i);
+  assert.doesNotMatch(quality.repairedText, /reenvi/i);
+});
+
+test("output evaluator recommends escalation for low confidence media memory conflicts", () => {
+  const quality = evaluateCustomerReplyQuality({
+    replyText: "Reenviame la imagen base y te hago esa version.",
+    userTurn: { current_turn_text: "mas cute y chevere, porfa", image_count: 0 },
+    intent: "image_generation",
+    routeConfidence: 0.42,
+    memoryReadModel: {
+      retrieved: {
+        selected: {
+          media: [{ citation: "campaign_assets:asset_img_base", score: 0.91, fileId: "img_base", mediaType: "IMAGE" }]
+        }
+      }
+    }
+  });
+  const clean = decideCustomerReplyEscalation({ reasons: [], score: 0.96, routeConfidence: 0.9 });
+
+  assert.equal(quality.escalation.shouldEscalate, true);
+  assert.equal(quality.escalation.target, "stronger_customer_reply");
+  assert.equal(quality.escalation.reasons.includes("low_route_confidence"), true);
+  assert.equal(quality.escalation.reasons.includes("media_memory_conflict"), true);
+  assert.equal(clean.shouldEscalate, false);
+});
+
 test("output evaluator repairs stale reminder leak using latest audio summary", () => {
   const quality = evaluateCustomerReplyQuality({
     replyText: "Recordatorio: lista compras: Si me puedes hacer una lista de comida de gatito.",
@@ -203,6 +258,30 @@ test("output evaluator repairs stale reminder leak using latest audio summary", 
   assert.equal(quality.ok, false);
   assert.equal(quality.reasons.includes("stale_reminder_leaked"), true);
   assert.match(quality.repairedText, /leche, pan, huevos/i);
+});
+
+test("output evaluator blocks stale reminder leak during image generation follow-up", () => {
+  const quality = evaluateCustomerReplyQuality({
+    replyText: "Recordatorio: hacer acuerdo de quitar las agujas de mi pie. Si, la hare como portada.",
+    userTurn: { current_turn_text: "Portada" },
+    intent: "image_generation",
+    memoryReadModel: {
+      retrieved: {
+        selected: {
+          media: [{
+            citation: "campaign_assets:asset_img_base",
+            score: 0.9,
+            fileId: "img_base",
+            mediaType: "IMAGE"
+          }]
+        }
+      }
+    }
+  });
+
+  assert.equal(quality.ok, false);
+  assert.equal(quality.reasons.includes("stale_reminder_leaked"), true);
+  assert.doesNotMatch(quality.repairedText, /Recordatorio/i);
 });
 
 test("output evaluator repairs polluted list replies with recent list memory", () => {

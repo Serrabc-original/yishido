@@ -78,6 +78,39 @@ test("interactive message uses memberId/appId when available", async () => {
   assert.equal(Object.hasOwn(sent[0], "recipientId"), false);
 });
 
+test("interactive message uses shared Woztell adapter when transport is not injected", async () => {
+  const calls = [];
+  const result = await sendWhatsAppInteractiveMessage({
+    ENABLE_WHATSAPP_INTERACTIVE: "true",
+    WOZTELL_OPEN_API_TOKEN: "open_token"
+  }, {
+    channelId: "channel",
+    recipientId: "phone",
+    memberId: "member",
+    appId: "app",
+    text: "Confirma",
+    buttons: [{ id: "confirm", title: "Confirmar" }]
+  }, {
+    fetchWithTimeout: async function (url, options) {
+      calls.push({ url, body: JSON.parse(options.body) });
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return "{\"ok\":true}";
+        }
+      };
+    }
+  });
+
+  assert.equal(result.mode, "interactive");
+  assert.match(calls[0].url, /sendResponses\?accessToken=/);
+  assert.equal(calls[0].body.memberId, "member");
+  assert.equal(Object.hasOwn(calls[0].body, "recipientId"), false);
+  assert.equal(calls[0].body.response[0].type, "QUICK_REPLY");
+});
+
+
 test("reminder parser handles tomorrow, offsets, missing date and missing time", () => {
   const now = "2026-06-12T12:00:00.000Z";
   const tomorrow = parseReminderRequest("Recuerdame manana a las 9 llamar a Juan", "America/Bogota", { now });

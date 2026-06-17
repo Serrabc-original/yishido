@@ -131,10 +131,26 @@ export function logFinalEventCounts(userTurn, data) {
 }
 
 export function isUserDoneSignal(text) {
-  return /\b(listo|ya|eso es todo|esas son|dale|revisa)\b/i.test(String(text || ""));
+  const clean = normalizeDoneSignalText(text);
+  if (!clean) return false;
+  if (/\b(no estoy listo|todavia no|aun no|espera|te mando|te envio|voy a mandar|voy a enviar|otra imagen|mas fotos|cuando te mande|cuando te envie|falta)\b/.test(clean)) {
+    return false;
+  }
+  if (/^(ya|dale|ok|va)$/.test(clean)) return true;
+  return /\b(listo|eso es todo|esas son|eso seria todo|ya esta|ya quedo|dale nomas|dale no mas|revisa|revisalo)$/.test(clean);
 }
 
 function numberEnv(value, fallback) {
   const num = Number(value);
   return Number.isFinite(num) && num > 0 ? num : fallback;
+}
+
+function normalizeDoneSignalText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }

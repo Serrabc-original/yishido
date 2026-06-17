@@ -1,4 +1,5 @@
 import { captureError, logEvent, redactForLog } from "../logger.js";
+import { sendWoztellResponse } from "../channels/woztell/outboundAdapter.js";
 
 const MAX_QUICK_REPLY_BUTTONS = 3;
 const MAX_LIST_ROWS = 10;
@@ -211,27 +212,13 @@ async function sendWoztellPayload(env, payload, options) {
     return await options.transport(payload);
   }
 
-  if (!env || !env.WOZTELL_ACCESS_TOKEN) {
-    throw new Error("Missing WOZTELL_ACCESS_TOKEN");
+  const result = await sendWoztellResponse(env, Object.assign({
+    logPrefix: "WHATSAPP_INTERACTIVE_SEND"
+  }, payload), options || {});
+
+  if (result && result.failed) {
+    throw new Error("WOZTELL_INTERACTIVE_SEND_ERROR " + (result.status || 0) + ": " + String(result.body || "send failed"));
   }
 
-  const url = "https://bot.api.woztell.com/sendResponses?accessToken=" + encodeURIComponent(env.WOZTELL_ACCESS_TOKEN);
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json; charset=utf-8"
-    },
-    body: JSON.stringify(payload)
-  });
-  const responseText = await res.text();
-
-  if (!res.ok) {
-    throw new Error("WOZTELL_INTERACTIVE_SEND_ERROR " + res.status + ": " + responseText);
-  }
-
-  try {
-    return JSON.parse(responseText);
-  } catch (error) {
-    return { raw: responseText };
-  }
+  return result;
 }

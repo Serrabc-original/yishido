@@ -132,7 +132,7 @@ function isImageOcrIntent(text, media) {
 function isImageQuestionIntent(text, media) {
   if (media.imageCount <= 0) return false;
   if (isMarketingIntent(text)) return false;
-  return /\b(que ves|que aparece|como funciona|que es|que tal|como lo ves|vale la pena|explica|analiza|revisa|esta maquina|esta foto|esta imagen)\b/.test(text);
+  return /\b(que ves|que aparece|como funciona|que es|que tal|como lo ves|vale la pena|explica|analiza|revisa|esta maquina|esta foto|esta imagen|esa imagen|esa foto|se ve bien|se ve buena|se ve bueno|buena o no|bueno o no|velocidad|calidad)\b/.test(text);
 }
 
 function isMarketingIntent(text) {

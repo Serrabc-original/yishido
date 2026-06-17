@@ -38,9 +38,9 @@ export async function sendWoztellTextMessage(env, params, options) {
   }
 
   console.log("WOZTELL_TEXT_SEND_PREVIEW:", JSON.stringify({
-    channelId: clean.channelId || "",
-    recipientId: clean.recipientId || "",
-    textPreview: prepared.text.slice(0, 1000)
+    channelId: redactIdForConsole(clean.channelId || ""),
+    recipientId: redactIdForConsole(clean.recipientId || ""),
+    textLength: prepared.text.length
   }));
 
   return await sendWoztellResponse(env, Object.assign({}, clean, {
@@ -201,8 +201,8 @@ export async function sendWoztellResponse(env, params, options) {
   }
 
   console.log("USER_RESPONSE_SENT:", JSON.stringify({
-    channelId: clean.channelId || "",
-    recipientId: clean.recipientId || "",
+    channelId: redactIdForConsole(clean.channelId || ""),
+    recipientId: redactIdForConsole(clean.recipientId || ""),
     responseCount: Array.isArray(clean.response) ? clean.response.length : 0,
     responseTypes: (Array.isArray(clean.response) ? clean.response : []).map(function (item) {
       return item.type || "";
@@ -261,7 +261,7 @@ export function logWoztellSendShape(payload, mode) {
   }));
   console.log("WOZTELL_SEND_CHANNEL_ID:", JSON.stringify({
     present: Boolean(payload && payload.channelId),
-    valuePreview: String(payload && payload.channelId || "").slice(0, 8)
+    valuePreview: redactIdForConsole(payload && payload.channelId || "")
   }));
   console.log("WOZTELL_SEND_MEMBER_ID_PRESENT:", JSON.stringify({
     present: Boolean(payload && payload.memberId)
@@ -291,6 +291,13 @@ export function redactWoztellPayloadForLog(payload) {
       return item.type || "";
     })
   };
+}
+
+export function redactIdForConsole(value) {
+  const text = String(value || "");
+  if (!text) return "";
+  if (text.length <= 4) return "***";
+  return text.slice(0, 2) + "***" + text.slice(-2);
 }
 
 export function fixMojibake(text) {
