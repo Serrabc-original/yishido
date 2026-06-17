@@ -129,6 +129,10 @@ import { buildCustomerReplyPromptPayload, composeCustomerReply } from "./ai/cust
 import { evaluateCustomerReplyQuality } from "./ai/outputQualityEvaluator.js";
 import { getConversationPromptGuidance } from "./ai/conversationStyleProfile.js";
 import {
+  buildIntentRouterV2TurnDecision,
+  summarizeIntentRouterV2Decision
+} from "./ai/intentRouterV2Pipeline.js";
+import {
   getCustomerReplyModel,
   getFinalResponseModel,
   getImageGenerationModel,
@@ -2236,7 +2240,50 @@ export class ConversationCoordinator {
         }));
       }
 
-      if (mediaRecount.claimed && !mediaRecount.shouldReanalyze) {
+      const intentRouterV2Decision = buildIntentRouterV2TurnDecision({
+        env: this.env,
+        userTurn: userTurn,
+        conversationState: buildIntentRouterV2ConversationState(data),
+        tenantConfig: buildIntentRouterV2TenantConfig(this.env, data),
+        timezone: this.env.USER_TIMEZONE || "America/Guayaquil",
+        now: new Date().toISOString()
+      });
+      if (intentRouterV2Decision.enabled) {
+        const summary = summarizeIntentRouterV2Decision(intentRouterV2Decision);
+        logEvent("INTENT_ROUTER_V2_DECISION", Object.assign({
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName
+        }, summary));
+        data = appendTraceEvent(data, "INTENT_ROUTER_V2_DECISION", Object.assign({
+          traceId: userTurn.trace_id,
+          turnId: userTurn.turn_id,
+          doName: data.doName
+        }, summary), activeLogContext);
+      }
+
+      if (intentRouterV2Decision.handled) {
+        data = applyIntentRouterV2StateRecommendations(data, intentRouterV2Decision.stateRecommendations);
+        if (intentRouterV2Decision.shouldSend) {
+          await sendWoztellTextMessage(this.env, {
+            channelId: data.channel,
+            recipientId: data.phone,
+            memberId: data.member,
+            appId: data.app,
+            text: intentRouterV2Decision.reply.text
+          });
+        }
+        data.activeContext = updateConversationContext(data.activeContext, {
+          userTurn: userTurn,
+          route: {
+            intent: "intent_router_v2",
+            turnType: intentRouterV2Decision.routerResult && intentRouterV2Decision.routerResult.turn_type || "",
+            policyDecision: intentRouterV2Decision.policyDecision && intentRouterV2Decision.policyDecision.decision || ""
+          },
+          campaignState: data.campaignState,
+          pendingClarification: intentRouterV2Decision.policyDecision && intentRouterV2Decision.policyDecision.oneQuestionToAsk || ""
+        });
+      } else if (mediaRecount.claimed && !mediaRecount.shouldReanalyze) {
         await sendWoztellTextMessage(this.env, {
           channelId: data.channel,
           recipientId: data.phone,
@@ -11150,6 +11197,86 @@ function parseBooleanLike(value, fallback) {
   return fallback;
 }
 
+function buildIntentRouterV2ConversationState(data) {
+  const clean = data || {};
+  const campaignState = clean.campaignState || {};
+  const activeContext = clean.activeContext || {};
+  const coreUtilityState = clean.coreUtilityState || {};
+  return {
+    tenant_id: clean.tenantId || clean.tenant_id || "",
+    user_id: clean.phone || "",
+    conversation_mode: clean.conversationMode || campaignState.conversation_mode || "bot",
+    timezone: clean.timezone || "",
+    campaign_assets: normalizeCampaignAssets(campaignState.campaign_assets || []),
+    last_uploaded_image: campaignState.last_uploaded_image || null,
+    last_generated_image: campaignState.last_generated_image || buildLastGeneratedImageReference(campaignState),
+    pending_action: activeContext.pendingClarification || coreUtilityState.pendingReminderDraft || "",
+    active_task: campaignState.active_task || null
+  };
+}
+
+function buildIntentRouterV2TenantConfig(env, data) {
+  const cleanEnv = env || {};
+  const cleanData = data || {};
+  return {
+    tenant_id: cleanData.tenantId || cleanData.tenant_id || "default",
+    locale: cleanEnv.USER_LOCALE || "es-EC",
+    timezone: cleanEnv.USER_TIMEZONE || "America/Guayaquil",
+    tone: cleanEnv.TENANT_TONE || "warm_whatsapp",
+    enabled_tools: [
+      "list.format",
+      "reminder.create",
+      "crm.search",
+      "crm.update",
+      "crm.delete",
+      "image.edit",
+      "document.search"
+    ],
+    escalation_policy: {
+      human_on_complaint: true,
+      human_on_repeated_error: true
+    },
+    memory_policy: {
+      long_term_personal_data_requires_consent: true
+    }
+  };
+}
+
+function buildLastGeneratedImageReference(campaignState) {
+  const clean = campaignState || {};
+  if (!clean.last_image_url && !clean.last_image_prompt) return null;
+  return {
+    asset_id: "last_generated_image",
+    url: clean.last_image_url || "",
+    prompt: clean.last_image_prompt || ""
+  };
+}
+
+function applyIntentRouterV2StateRecommendations(data, recommendations) {
+  const next = data || {};
+  const recs = recommendations || {};
+  next.campaignState = next.campaignState || {};
+  next.coreUtilityState = normalizeCoreUtilityState(next.coreUtilityState);
+
+  if (recs.clear_pending_action) {
+    next.coreUtilityState.pendingReminderDraft = null;
+    next.activeContext = updateConversationContext(next.activeContext, {
+      campaignState: next.campaignState,
+      pendingClarification: ""
+    });
+  }
+
+  if (recs.suspend_previous_task) {
+    next.campaignState.active_task = null;
+  }
+
+  if (recs.new_active_task_type) {
+    next.campaignState.last_v2_active_task_type = String(recs.new_active_task_type).slice(0, 80);
+  }
+
+  return next;
+}
+
 function jsonResponse(data, status) {
   return new Response(JSON.stringify(data, null, 2), {
     status: status || 200,
@@ -11366,6 +11493,9 @@ function buildVersionDiagnostic(env) {
     ENABLE_CUSTOMER_MEMORY: String(flags.enableCustomerMemory),
     ENABLE_TASK_ENGINE: "true",
     CORE_UTILITIES_SANDBOX: String(flags.coreUtilitiesSandbox),
+    INTENT_ROUTER_V2_ENABLED: String(parseBooleanLike(env && env.INTENT_ROUTER_V2_ENABLED, false)),
+    POLICY_GATE_ENABLED: String(parseBooleanLike(env && env.POLICY_GATE_ENABLED, false)),
+    REPLY_COMPOSER_V2_ENABLED: String(parseBooleanLike(env && env.REPLY_COMPOSER_V2_ENABLED, false)),
     REMINDERS_DELIVERY_MODE: remindersMode,
     DAILY_USAGE_REPORT_ENABLED: String(isDailyUsageReportEnabled(env || {})),
     DAILY_USAGE_REPORT_HOUR: String(getDailyUsageReportHour(env || {})),
@@ -11414,6 +11544,9 @@ function formatVersionDiagnosticForWhatsApp(diagnostic) {
     "ENABLE_CUSTOMER_MEMORY: " + (data.ENABLE_CUSTOMER_MEMORY || ""),
     "ENABLE_TASK_ENGINE: " + (data.ENABLE_TASK_ENGINE || ""),
     "CORE_UTILITIES_SANDBOX: " + (data.CORE_UTILITIES_SANDBOX || ""),
+    "INTENT_ROUTER_V2_ENABLED: " + (data.INTENT_ROUTER_V2_ENABLED || ""),
+    "POLICY_GATE_ENABLED: " + (data.POLICY_GATE_ENABLED || ""),
+    "REPLY_COMPOSER_V2_ENABLED: " + (data.REPLY_COMPOSER_V2_ENABLED || ""),
     "REMINDERS_DELIVERY_MODE: " + (data.REMINDERS_DELIVERY_MODE || ""),
     "DAILY_USAGE_REPORT_ENABLED: " + (data.DAILY_USAGE_REPORT_ENABLED || ""),
     "DAILY_USAGE_REPORT_HOUR: " + (data.DAILY_USAGE_REPORT_HOUR || ""),

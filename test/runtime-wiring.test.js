@@ -179,6 +179,14 @@ function env() {
   };
 }
 
+function v2Env(extra) {
+  return Object.assign(env(), {
+    INTENT_ROUTER_V2_ENABLED: "true",
+    POLICY_GATE_ENABLED: "true",
+    REPLY_COMPOSER_V2_ENABLED: "true"
+  }, extra || {});
+}
+
 function mockRuntimeFetch(captures) {
   return async function fetchMock(url, options) {
     const cleanUrl = String(url);
@@ -950,6 +958,75 @@ test("multi-image OCR sends one WhatsApp message per image", async () => {
     assert.equal(imageMessages.length, 2);
     assert.match(imageMessages[0], /Texto visible:\nA/i);
     assert.match(imageMessages[1], /Texto visible:\nB/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("IntentRouterV2 runtime handles simple list before legacy orchestration", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781475300000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, v2Env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Hazme una lista de leche, pan y huevos", "msg_v2_simple_list")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const sent = captures.sentTexts.join("\n");
+    assert.match(sent, /Listo/);
+    assert.match(sent, /1\. Leche/);
+    assert.match(sent, /2\. Pan/);
+    assert.match(sent, /3\. Huevos/);
+    assert.equal(captures.orchestratorRequests.length, 0);
+
+    const saved = await state.storage.get("data");
+    assert.equal(saved.traceEvents.some((event) => event.event === "INTENT_ROUTER_V2_DECISION"), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("IntentRouterV2 runtime repairs correction without creating tools", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781475310000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  await state.storage.put("data", {
+    doName: "channel_runtime:593995660220",
+    channel: "channel_runtime",
+    phone: "593995660220",
+    member: "member_runtime",
+    app: "app_runtime",
+    coreUtilityState: {
+      pendingReminderDraft: {
+        action: "create",
+        title: "hacer un recordatorio",
+        missingFields: ["dueAt"]
+      },
+      reminders: []
+    }
+  });
+  const coordinator = new ConversationCoordinator(state, v2Env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("No no te estoy preguntando en cuantos minutos me vas a hacer acuerdo", "msg_v2_correction")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const sent = captures.sentTexts.join("\n");
+    assert.match(sent, /Tienes razon/);
+    assert.match(sent, /No voy a crear nada todavia/);
+    assert.equal(captures.orchestratorRequests.length, 0);
+
+    const saved = await state.storage.get("data");
+    assert.equal(saved.coreUtilityState.pendingReminderDraft, null);
   } finally {
     globalThis.fetch = originalFetch;
     clock.restore();
