@@ -1,4 +1,13 @@
-const LOCAL_EXECUTABLE_INTENTS = new Set(["list.format", "reminder.create"]);
+const LOCAL_EXECUTABLE_INTENTS = new Set([
+  "list.format",
+  "reminder.create",
+  "crm.search",
+  "crm.create",
+  "crm.update",
+  "crm.delete",
+  "document.search",
+  "document.send_existing"
+]);
 const LEGACY_DELEGATED_INTENTS = new Set(["image.edit", "image.generate"]);
 
 export function isIntentRouterV2LocalExecutable(intent) {

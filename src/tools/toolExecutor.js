@@ -25,7 +25,8 @@ export function executeIntentRouterV2Tools(input) {
     ? tasks.filter(function (task) { return task && task.status === "ready"; })
     : tasks.filter(function (task) {
       return task && (task.status === "ready" && task.intent === "list.format" ||
-        task.intent === "reminder.create" && task.status === "needs_clarification");
+        task.intent === "reminder.create" && task.status === "needs_clarification" ||
+        isPendingCrmStateTask(task));
     });
 
   if (!executableTasks.length) {
@@ -62,6 +63,12 @@ export function executeIntentRouterV2Tools(input) {
   for (const task of executableTasks) {
     if (task.intent === "reminder.create" && task.status === "needs_clarification") {
       const result = storePendingReminderDraft(task, coreState, now);
+      results.push(result);
+      continue;
+    }
+
+    if (isPendingCrmStateTask(task)) {
+      const result = storePendingCrmAction(task, coreState, now);
       results.push(result);
       continue;
     }
@@ -108,6 +115,49 @@ export function executeIntentRouterV2Tools(input) {
         blockedTools.push("reminder.create");
       }
       results.push(result);
+      continue;
+    }
+
+    if (task.intent === "crm.search") {
+      const result = executeCrmSearch(task, coreState);
+      executedTools.push("crm.search");
+      results.push(result);
+      continue;
+    }
+
+    if (task.intent === "crm.create") {
+      const result = executeCrmCreate(task, coreState, now);
+      if (result.ok) executedTools.push("crm.create");
+      else blockedTools.push("crm.create");
+      results.push(result);
+      continue;
+    }
+
+    if (task.intent === "crm.update") {
+      const result = executeCrmUpdate(task, coreState, now);
+      if (result.ok) executedTools.push("crm.update");
+      else blockedTools.push("crm.update");
+      results.push(result);
+      continue;
+    }
+
+    if (task.intent === "crm.delete") {
+      const result = executeCrmDelete(task, coreState);
+      if (result.ok) executedTools.push("crm.delete");
+      else blockedTools.push("crm.delete");
+      results.push(result);
+      continue;
+    }
+
+    if (task.intent === "document.search" || task.intent === "document.send_existing") {
+      const result = executeDocumentSearch(task, {
+        coreState: coreState,
+        data: data,
+        tenantConfig: clean.tenantConfig || {},
+        userTurn: clean.userTurn || {}
+      });
+      executedTools.push(task.intent);
+      results.push(result);
     }
   }
 
@@ -121,6 +171,10 @@ export function executeIntentRouterV2Tools(input) {
     executedTools: executedTools,
     blockedTools: blockedTools
   };
+}
+
+function isPendingCrmStateTask(task) {
+  return task && /^crm\./.test(String(task.intent || "")) && task.status === "needs_confirmation";
 }
 
 function storePendingReminderDraft(task, coreState, now) {
@@ -145,6 +199,25 @@ function storePendingReminderDraft(task, coreState, now) {
     title: title,
     message: message,
     userVisibleSummary: "Recordatorio pendiente guardado para aclaracion."
+  };
+}
+
+function storePendingCrmAction(task, coreState, now) {
+  const entities = normalizeCrmEntities(task.entities || {});
+  coreState.pendingCrmAction = {
+    intent: String(task.intent || ""),
+    entities: entities,
+    status: "awaiting_confirmation",
+    updatedAt: now,
+    source: "intent_router_v2"
+  };
+  return {
+    intent: String(task.intent || ""),
+    ok: true,
+    stateOnly: true,
+    pending: true,
+    entities: entities,
+    userVisibleSummary: "Accion CRM pendiente de confirmacion."
   };
 }
 
@@ -236,6 +309,280 @@ function executeReminderCreate(task, context) {
   };
 }
 
+function executeCrmSearch(task, coreState) {
+  const query = buildCrmQuery(task.entities || {});
+  const matches = findCrmRecords(coreState, query);
+  return {
+    intent: "crm.search",
+    ok: true,
+    query: query,
+    matches: matches.slice(0, 5),
+    count: matches.length,
+    userVisibleSummary: matches.length ? "Cliente encontrado." : "No encontre clientes con ese dato."
+  };
+}
+
+function executeCrmCreate(task, coreState, now) {
+  const entities = normalizeCrmEntities(task.entities || {});
+  const identifier = entities.cedula || entities.phone || entities.email || entities.name;
+  if (!identifier) {
+    return {
+      intent: "crm.create",
+      ok: false,
+      error: "missing_client_identifier",
+      missingSlots: ["client_identifier"],
+      userVisibleSummary: "Falta identificar el cliente."
+    };
+  }
+
+  const client = buildClientRecord(entities, now);
+  coreState.clients = upsertClient(coreState.clients || [], client);
+  coreState.pendingCrmAction = null;
+  return {
+    intent: "crm.create",
+    ok: true,
+    client: client,
+    userVisibleSummary: "Cliente creado."
+  };
+}
+
+function executeCrmUpdate(task, coreState, now) {
+  const entities = normalizeCrmEntities(task.entities || {});
+  const identifier = entities.clientId || entities.cedula || entities.phone || entities.email || entities.name;
+  if (!identifier) {
+    return {
+      intent: "crm.update",
+      ok: false,
+      error: "missing_client_identifier",
+      missingSlots: ["client_identifier"],
+      userVisibleSummary: "Falta identificar el cliente."
+    };
+  }
+
+  const current = findCrmRecords(coreState, entities)[0] || null;
+  const client = buildClientRecord(Object.assign({}, current && current.raw || {}, entities), now, current && current.id);
+  coreState.clients = upsertClient(coreState.clients || [], client);
+  coreState.pendingCrmAction = null;
+  return {
+    intent: "crm.update",
+    ok: true,
+    client: client,
+    created: !current,
+    userVisibleSummary: current ? "Cliente actualizado." : "Cliente creado desde actualizacion confirmada."
+  };
+}
+
+function executeCrmDelete(task, coreState) {
+  const entities = normalizeCrmEntities(task.entities || {});
+  const matches = findCrmRecords(coreState, entities);
+  if (!matches.length) {
+    return {
+      intent: "crm.delete",
+      ok: false,
+      error: "client_not_found",
+      userVisibleSummary: "No encontre ese cliente para borrar."
+    };
+  }
+  const ids = new Set(matches.map(function (match) { return match.id; }).filter(Boolean));
+  coreState.clients = (coreState.clients || []).filter(function (client) {
+    return !ids.has(getCrmRecordId(client, "client"));
+  });
+  coreState.leads = (coreState.leads || []).filter(function (lead) {
+    return !ids.has(getCrmRecordId(lead, "lead"));
+  });
+  coreState.pendingCrmAction = null;
+  return {
+    intent: "crm.delete",
+    ok: true,
+    deletedCount: ids.size,
+    deleted: matches.slice(0, 5),
+    userVisibleSummary: "Cliente borrado."
+  };
+}
+
+function executeDocumentSearch(task, context) {
+  const entities = task.entities || {};
+  const query = String(entities.query || entities.documentName || entities.document_name || "").trim();
+  const documents = collectExistingDocuments(context);
+  const matches = findDocuments(documents, query);
+  const found = matches[0] || null;
+  return {
+    intent: String(task.intent || "document.search"),
+    ok: true,
+    query: query,
+    count: matches.length,
+    document: found,
+    matches: matches.slice(0, 5),
+    generated: false,
+    userVisibleSummary: found ? "Documento existente encontrado." : "No encontre un documento existente con ese nombre."
+  };
+}
+
+function collectExistingDocuments(context) {
+  const coreState = context.coreState || {};
+  const tenant = context.tenantConfig || {};
+  const data = context.data || {};
+  const campaignState = data.campaignState || {};
+  return []
+    .concat(normalizeDocumentRecords(coreState.documents || []))
+    .concat(normalizeDocumentRecords(coreState.documentCatalog || coreState.document_catalog || []))
+    .concat(normalizeDocumentRecords(tenant.documents || tenant.document_catalog || tenant.documentCatalog || []))
+    .concat(normalizeDocumentRecords(data.documents || data.documentCatalog || []))
+    .concat(normalizeCampaignFileDocuments(campaignState.campaign_assets || []));
+}
+
+function normalizeCampaignFileDocuments(assets) {
+  return (Array.isArray(assets) ? assets : []).filter(function (asset) {
+    return String(asset && (asset.media_type || asset.mediaType) || "").toUpperCase() === "FILE";
+  }).map(function (asset, index) {
+    return {
+      id: String(asset.asset_id || asset.assetId || asset.file_id || asset.fileId || "document_" + (index + 1)),
+      name: String(asset.name || asset.filename || asset.file_name || asset.caption || asset.file_id || "documento existente"),
+      url: String(asset.url || ""),
+      fileId: String(asset.file_id || asset.fileId || ""),
+      source: "campaign_assets"
+    };
+  });
+}
+
+function normalizeDocumentRecords(documents) {
+  return (Array.isArray(documents) ? documents : []).map(function (item, index) {
+    const clean = item || {};
+    return {
+      id: String(clean.id || clean.documentId || clean.document_id || clean.fileId || clean.file_id || "document_" + (index + 1)),
+      name: String(clean.name || clean.title || clean.documentName || clean.document_name || clean.filename || "documento existente"),
+      url: String(clean.url || clean.webUrl || clean.web_url || clean.downloadUrl || clean.download_url || ""),
+      fileId: String(clean.fileId || clean.file_id || ""),
+      source: String(clean.source || "document_catalog")
+    };
+  }).filter(function (doc) { return doc.id || doc.name || doc.url || doc.fileId; });
+}
+
+function findDocuments(documents, query) {
+  const normalizedQuery = normalizeSearchText(query);
+  if (!normalizedQuery) return documents.slice(0, 5);
+  const queryTokens = normalizedQuery.split(" ").filter(function (token) { return token.length > 2; });
+  return documents.map(function (doc) {
+    const haystack = normalizeSearchText([doc.name, doc.id, doc.fileId, doc.source].join(" "));
+    const score = queryTokens.reduce(function (total, token) {
+      return total + (haystack.includes(token) ? 1 : 0);
+    }, haystack.includes(normalizedQuery) ? 2 : 0);
+    return { doc: doc, score: score };
+  }).filter(function (item) { return item.score > 0; })
+    .sort(function (a, b) { return b.score - a.score; })
+    .map(function (item) { return item.doc; });
+}
+
+function normalizeCrmEntities(entities) {
+  const clean = entities || {};
+  return {
+    clientId: String(clean.clientId || clean.client_id || "").trim(),
+    leadId: String(clean.leadId || clean.lead_id || "").trim(),
+    name: String(clean.name || clean.clientName || clean.client_name || "").trim(),
+    cedula: normalizeDigits(clean.cedula || clean.document || clean.documento || clean.dni || ""),
+    phone: normalizeDigits(clean.phone || clean.telefono || clean.telefonoNuevo || clean.telefono_nuevo || ""),
+    email: String(clean.email || clean.correo || "").trim(),
+    interest: String(clean.interest || clean.interes || "").trim(),
+    stage: String(clean.stage || clean.etapa || "").trim(),
+    notes: String(clean.notes || clean.note || clean.nota || "").trim(),
+    source: String(clean.source || clean.fuente || "whatsapp").trim(),
+    responsible: String(clean.responsible || clean.responsable || "").trim()
+  };
+}
+
+function buildCrmQuery(entities) {
+  const clean = normalizeCrmEntities(entities);
+  const query = String(entities.query || entities.q || "").trim();
+  return Object.assign({}, clean, { query: query });
+}
+
+function findCrmRecords(coreState, query) {
+  const cleanQuery = normalizeCrmEntities(query || {});
+  const textQuery = normalizeSearchText(query && query.query || "");
+  const records = normalizeCrmRecords(coreState);
+  return records.filter(function (record) {
+    const raw = record.raw || {};
+    if (cleanQuery.clientId && String(raw.clientId || raw.client_id || "") === cleanQuery.clientId) return true;
+    if (cleanQuery.leadId && String(raw.leadId || raw.lead_id || "") === cleanQuery.leadId) return true;
+    if (cleanQuery.cedula && normalizeDigits(raw.cedula || raw.document || raw.documento || raw.dni || "") === cleanQuery.cedula) return true;
+    if (cleanQuery.phone && normalizeDigits(raw.phone || raw.telefono || "") === cleanQuery.phone) return true;
+    if (cleanQuery.email && normalizeSearchText(raw.email || raw.correo || "") === normalizeSearchText(cleanQuery.email)) return true;
+    if (cleanQuery.name && normalizeSearchText(raw.name || raw.clientName || "").includes(normalizeSearchText(cleanQuery.name))) return true;
+    if (textQuery) return normalizeSearchText(JSON.stringify(raw)).includes(textQuery);
+    return false;
+  });
+}
+
+function normalizeCrmRecords(coreState) {
+  const clients = Array.isArray(coreState.clients) ? coreState.clients : [];
+  const leads = Array.isArray(coreState.leads) ? coreState.leads : [];
+  return clients.map(function (client) {
+    return {
+      id: getCrmRecordId(client, "client"),
+      type: "client",
+      name: client.name || "",
+      raw: client
+    };
+  }).concat(leads.map(function (lead) {
+    return {
+      id: getCrmRecordId(lead, "lead"),
+      type: "lead",
+      name: lead.name || "",
+      raw: lead
+    };
+  }));
+}
+
+function getCrmRecordId(record, prefix) {
+  return String(record && (record.clientId || record.client_id || record.leadId || record.lead_id || record.id) || prefix + "_" + normalizeSearchText(record && record.name || ""));
+}
+
+function buildClientRecord(entities, now, existingId) {
+  const clean = normalizeCrmEntities(entities || {});
+  const id = String(existingId || clean.clientId || "client_" + stableCrmKey(clean));
+  return {
+    clientId: id,
+    name: clean.name || "Cliente sin nombre",
+    cedula: clean.cedula,
+    phone: clean.phone,
+    email: clean.email,
+    interest: clean.interest,
+    stage: clean.stage,
+    notes: clean.notes ? [clean.notes] : [],
+    source: clean.source || "whatsapp",
+    responsible: clean.responsible,
+    createdAt: String(entities.createdAt || entities.created_at || now),
+    updatedAt: now
+  };
+}
+
+function upsertClient(clients, client) {
+  const id = getCrmRecordId(client, "client");
+  const next = (Array.isArray(clients) ? clients : []).filter(function (item) {
+    return getCrmRecordId(item, "client") !== id;
+  });
+  next.push(client);
+  return next.slice(-100);
+}
+
+function stableCrmKey(entities) {
+  const source = entities.cedula || entities.phone || entities.email || entities.name || String(Date.now());
+  return normalizeSearchText(source).replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "nuevo";
+}
+
+function normalizeDigits(value) {
+  return String(value || "").replace(/\D+/g, "");
+}
+
+function normalizeSearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function resolveDueAt(entities, now) {
   const direct = entities.dueAt || entities.due_at || "";
   if (direct && Number.isFinite(Date.parse(direct))) return new Date(direct).toISOString();
@@ -275,7 +622,11 @@ function buildUnavailableResult(task) {
 function normalizeCoreUtilityState(state) {
   const clean = state && typeof state === "object" ? state : {};
   return Object.assign({}, clean, {
-    reminders: Array.isArray(clean.reminders) ? clean.reminders : []
+    reminders: Array.isArray(clean.reminders) ? clean.reminders : [],
+    leads: Array.isArray(clean.leads) ? clean.leads : [],
+    clients: Array.isArray(clean.clients) ? clean.clients : [],
+    documents: Array.isArray(clean.documents) ? clean.documents : [],
+    pendingCrmAction: clean.pendingCrmAction || clean.pending_crm_action || null
   });
 }
 

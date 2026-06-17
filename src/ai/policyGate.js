@@ -44,7 +44,7 @@ export function evaluatePolicyGate(input) {
   }
 
   const confirmationTask = tasks.find(function (task) {
-    return task && (task.status === "needs_confirmation" || SENSITIVE_CONFIRMATION_INTENTS.has(task.intent));
+    return task && (task.status === "needs_confirmation" || router.turn_type !== "confirmation" && SENSITIVE_CONFIRMATION_INTENTS.has(task.intent));
   });
   if (confirmationTask) {
     const reasons = [];
@@ -125,5 +125,6 @@ function collectMissingSlots(tasks) {
 function buildMissingSlotQuestion(missingSlots) {
   if (missingSlots.includes("due_at")) return "Cuando quieres que te lo recuerde?";
   if (missingSlots.includes("items")) return "Que elementos quieres poner en la lista?";
+  if (missingSlots.includes("client_identifier")) return "Que cliente quieres actualizar?";
   return "Que dato falta para continuar?";
 }

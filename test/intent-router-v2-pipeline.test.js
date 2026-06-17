@@ -75,7 +75,7 @@ test("IntentRouterV2 pipeline summarizes decisions without raw user text", () =>
     env: ENABLED_ENV,
     userTurn: {
       channel: "whatsapp",
-      combinedUserText: "Actualiza este cliente con correo mateo@test.com"
+      combinedUserText: "Actualiza el cliente Mateo Serrano con correo mateo@test.com"
     }
   });
   const summary = summarizeIntentRouterV2Decision(decision);

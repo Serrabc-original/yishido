@@ -271,8 +271,14 @@ function normalizeLeads(leads) {
     return redactForLog({
       leadId: String(lead.leadId || lead.lead_id || buildId("lead")),
       name: String(lead.name || "Lead sin nombre").slice(0, 120),
+      cedula: String(lead.cedula || lead.document || lead.documento || lead.dni || "").slice(0, 40),
+      phone: String(lead.phone || lead.telefono || "").slice(0, 40),
+      email: String(lead.email || lead.correo || "").slice(0, 160),
+      interest: String(lead.interest || lead.interes || "").slice(0, 160),
+      stage: String(lead.stage || lead.etapa || "").slice(0, 80),
       note: String(lead.note || "").slice(0, 500),
       source: String(lead.source || "whatsapp"),
+      responsible: String(lead.responsible || lead.responsable || "").slice(0, 120),
       mediaRefs: normalizeMediaRefs(lead.mediaRefs || lead.media_refs || {}),
       createdAt: String(lead.createdAt || lead.created_at || new Date().toISOString()),
       updatedAt: String(lead.updatedAt || lead.updated_at || new Date().toISOString())
@@ -285,7 +291,14 @@ function normalizeClients(clients) {
     return redactForLog({
       clientId: String(client.clientId || client.client_id || buildId("client")),
       name: String(client.name || "cliente").slice(0, 120),
+      cedula: String(client.cedula || client.document || client.documento || client.dni || "").slice(0, 40),
+      phone: String(client.phone || client.telefono || "").slice(0, 40),
+      email: String(client.email || client.correo || "").slice(0, 160),
+      interest: String(client.interest || client.interes || "").slice(0, 160),
+      stage: String(client.stage || client.etapa || "").slice(0, 80),
       notes: Array.isArray(client.notes) ? client.notes.map(String).slice(-12) : [],
+      source: String(client.source || client.fuente || "whatsapp").slice(0, 80),
+      responsible: String(client.responsible || client.responsable || "").slice(0, 120),
       mediaRefs: normalizeMediaRefs(client.mediaRefs || client.media_refs || {}),
       createdAt: String(client.createdAt || client.created_at || new Date().toISOString()),
       updatedAt: String(client.updatedAt || client.updated_at || new Date().toISOString())

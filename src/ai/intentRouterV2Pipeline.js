@@ -129,7 +129,8 @@ function executeLocalToolsIfNeeded(input) {
 
 function hasIntentRouterV2PendingStateWork(tasks) {
   return (Array.isArray(tasks) ? tasks : []).some(function (task) {
-    return task && task.intent === "reminder.create" && task.status === "needs_clarification";
+    return task && (task.intent === "reminder.create" && task.status === "needs_clarification" ||
+      /^crm\./.test(String(task.intent || "")) && task.status === "needs_confirmation");
   });
 }
 

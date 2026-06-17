@@ -1134,6 +1134,91 @@ test("IntentRouterV2 runtime repairs correction without creating tools", async (
   }
 });
 
+test("IntentRouterV2 runtime applies confirmed CRM update locally", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781475320000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  await state.storage.put("data", {
+    doName: "channel_runtime:593995660220",
+    channel: "channel_runtime",
+    phone: "593995660220",
+    member: "member_runtime",
+    app: "app_runtime",
+    coreUtilityState: {
+      clients: [],
+      pendingCrmAction: {
+        intent: "crm.update",
+        entities: {
+          name: "Juan Perez",
+          email: "nuevo@test.com",
+          phone: "0999999999",
+          notes: "quiere plan premium"
+        },
+        status: "awaiting_confirmation"
+      }
+    }
+  });
+  const coordinator = new ConversationCoordinator(state, v2Env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("si guardalo", "msg_v2_crm_confirm")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const sent = captures.sentTexts.join("\n");
+    assert.match(sent, /Actualice el cliente: Juan Perez/i);
+    assert.equal(captures.orchestratorRequests.length, 0);
+
+    const saved = await state.storage.get("data");
+    assert.equal(saved.coreUtilityState.pendingCrmAction, null);
+    assert.equal(saved.coreUtilityState.clients.length, 1);
+    assert.equal(saved.coreUtilityState.clients[0].email, "nuevo@test.com");
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("IntentRouterV2 runtime returns existing document references without generation", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(1781475330000);
+  globalThis.fetch = mockRuntimeFetch(captures);
+  await state.storage.put("data", {
+    doName: "channel_runtime:593995660220",
+    channel: "channel_runtime",
+    phone: "593995660220",
+    member: "member_runtime",
+    app: "app_runtime",
+    coreUtilityState: {
+      documents: [{
+        id: "doc_catalogo",
+        name: "Catalogo actualizado",
+        url: "https://docs.test/catalogo.pdf"
+      }]
+    }
+  });
+  const coordinator = new ConversationCoordinator(state, v2Env());
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Pasame el catalogo actualizado", "msg_v2_document")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const sent = captures.sentTexts.join("\n");
+    assert.match(sent, /Encontre el documento existente/i);
+    assert.match(sent, /https:\/\/docs\.test\/catalogo\.pdf/i);
+    assert.doesNotMatch(sent, /generar/i);
+    assert.equal(captures.orchestratorRequests.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
 test("alarm delivery sends due reminders in production alarm mode", async () => {
   const state = createMemoryState();
   const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };

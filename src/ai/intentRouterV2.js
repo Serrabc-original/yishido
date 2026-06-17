@@ -38,6 +38,44 @@ export function routeIntentV2(input) {
     });
   }
 
+  const pendingCrmAction = getPendingCrmActionReference(state);
+  if (pendingCrmAction && isRejection(normalized)) {
+    return result(base, {
+      turn_type: "rejection",
+      should_not_execute_tools: true,
+      tasks: [replyOnlyTask("rejection")],
+      state_recommendations: { clear_pending_action: true },
+      reply_strategy: {
+        kind: "answer_only",
+        human_summary: "Cancelar accion CRM pendiente sin ejecutar herramientas."
+      }
+    });
+  }
+
+  if (pendingCrmAction && isConfirmation(normalized)) {
+    const isDelete = pendingCrmAction.intent === "crm.delete";
+    const strongDeleteConfirmation = !isDelete || isStrongDeleteConfirmation(normalized);
+    return result(base, {
+      turn_type: "confirmation",
+      tasks: [buildIntentTask({
+        task_id: pendingCrmAction.intent,
+        intent: pendingCrmAction.intent,
+        action_type: pendingCrmAction.intent === "crm.delete" ? "delete" : "write",
+        status: strongDeleteConfirmation ? "ready" : "needs_confirmation",
+        confidence: strongDeleteConfirmation ? 0.92 : 0.65,
+        entities: pendingCrmAction.entities || {},
+        source_evidence: evidenceFromTurn(userTurn, text),
+        user_visible_summary: strongDeleteConfirmation ? "Ejecutar accion CRM confirmada." : "Borrado requiere confirmacion fuerte."
+      })],
+      state_recommendations: { clear_pending_action: strongDeleteConfirmation },
+      reply_strategy: {
+        kind: strongDeleteConfirmation ? "execute_and_confirm" : "ask_confirmation",
+        one_question_to_ask: strongDeleteConfirmation ? null : "Para borrar, escribeme: Confirmo borrar cliente.",
+        human_summary: strongDeleteConfirmation ? "Ejecutar accion CRM confirmada." : "Pedir confirmacion fuerte para borrado."
+      }
+    });
+  }
+
   if (isCorrection(normalized)) {
     return result(base, {
       turn_type: "correction",
@@ -275,6 +313,31 @@ function buildListReminderRoute(base, text, normalized, userTurn, state) {
 }
 
 function buildCrmRoute(base, text, normalized, userTurn) {
+  if (/\b(crea|crear|guarda|guardar|registra|registrar)\b/.test(normalized) && /\b(cliente|lead|contacto|prospecto)\b/.test(normalized)) {
+    const fields = extractCrmFields(text);
+    const hasCritical = Boolean(fields.name || fields.phone || fields.email || fields.cedula);
+    return result(base, {
+      turn_type: "new_request",
+      tasks: [buildIntentTask({
+        task_id: "crm.create",
+        intent: "crm.create",
+        action_type: "write",
+        status: hasCritical ? "needs_confirmation" : "needs_clarification",
+        confidence: hasCritical ? 0.8 : 0.55,
+        entities: fields,
+        required_slots: ["client_identifier"],
+        missing_slots: hasCritical ? [] : ["client_identifier"],
+        source_evidence: evidenceFromTurn(userTurn, text),
+        user_visible_summary: hasCritical ? "Crear cliente requiere confirmacion." : "Faltan datos para crear cliente."
+      })],
+      reply_strategy: {
+        kind: hasCritical ? "ask_confirmation" : "ask_clarification",
+        one_question_to_ask: hasCritical ? "Lo guardo asi?" : "Que nombre, telefono o correo tiene el cliente?",
+        human_summary: hasCritical ? "Resumir cliente y pedir confirmacion antes de guardar." : "Pedir dato minimo de cliente."
+      }
+    });
+  }
+
   if (/\bborra|borrar|elimina|eliminar\b/.test(normalized) && /\b(cliente|lead|contacto)\b/.test(normalized)) {
     const name = extractAfter(text, /\b(?:cliente|lead|contacto)\s+(.+)$/i);
     return result(base, {
@@ -299,28 +362,36 @@ function buildCrmRoute(base, text, normalized, userTurn) {
 
   if (/\b(actualiza|actualizar|cambia|editar|edita)\b/.test(normalized) && /\b(cliente|lead|contacto)\b/.test(normalized)) {
     const fields = extractCrmFields(text);
+    const hasThisClientReference = /\beste\s+cliente\b/.test(normalized);
+    const hasIdentifier = hasThisClientReference
+      ? Boolean(fields.name || fields.cedula)
+      : Boolean(fields.name || fields.cedula || fields.phone || fields.email);
     return result(base, {
       turn_type: "new_request",
       tasks: [buildIntentTask({
         task_id: "crm.update",
         intent: "crm.update",
         action_type: "write",
-        status: "needs_confirmation",
-        confidence: 0.78,
+        status: hasIdentifier ? "needs_confirmation" : "needs_clarification",
+        confidence: hasIdentifier ? 0.78 : 0.58,
         entities: fields,
+        required_slots: ["client_identifier"],
+        missing_slots: hasIdentifier ? [] : ["client_identifier"],
         source_evidence: evidenceFromTurn(userTurn, text),
-        user_visible_summary: "Actualizar cliente requiere confirmacion con datos estructurados."
+        user_visible_summary: hasIdentifier ? "Actualizar cliente requiere confirmacion con datos estructurados." : "Falta identificar que cliente actualizar."
       })],
       reply_strategy: {
-        kind: "ask_confirmation",
-        one_question_to_ask: "Lo guardo asi?",
-        human_summary: "Resumir datos estructurados y pedir confirmacion."
+        kind: hasIdentifier ? "ask_confirmation" : "ask_clarification",
+        one_question_to_ask: hasIdentifier ? "Lo guardo asi?" : "Que cliente quieres actualizar?",
+        human_summary: hasIdentifier ? "Resumir datos estructurados y pedir confirmacion." : "Pedir identificador del cliente."
       }
     });
   }
 
   if (/\b(busca|buscame|buscar|encuentra)\b/.test(normalized) && /\b(cliente|lead|contacto|cedula)\b/.test(normalized)) {
     const cedula = (text.match(/\b(\d{10,13})\b/) || [])[1] || "";
+    const fields = extractCrmFields(text);
+    const query = cleanupTrailing(text.replace(/^\s*(busca|buscame|buscar|encuentra)\s*/i, ""));
     return result(base, {
       turn_type: "new_request",
       tasks: [buildIntentTask({
@@ -329,7 +400,7 @@ function buildCrmRoute(base, text, normalized, userTurn) {
         action_type: "read",
         status: "ready",
         confidence: cedula ? 0.9 : 0.68,
-        entities: cedula ? { cedula: cedula } : { query: text },
+        entities: Object.assign({}, fields, cedula ? { cedula: cedula } : { query: query || text }),
         source_evidence: evidenceFromTurn(userTurn, text),
         user_visible_summary: "Buscar cliente."
       })],
@@ -602,6 +673,20 @@ function getPendingReminderReference(state) {
   };
 }
 
+function getPendingCrmActionReference(state) {
+  const clean = state && typeof state === "object" ? state : {};
+  const pending = clean.pending_crm_action || clean.pendingCrmAction ||
+    clean.pending_action && clean.pending_action.intent && /^crm\./.test(clean.pending_action.intent) && clean.pending_action ||
+    null;
+  if (!pending || typeof pending !== "object") return null;
+  const intent = String(pending.intent || "");
+  if (!/^crm\./.test(intent)) return null;
+  return {
+    intent: intent,
+    entities: pending.entities && typeof pending.entities === "object" ? pending.entities : {}
+  };
+}
+
 function normalizeListReference(value) {
   const clean = value && typeof value === "object" ? value : {};
   const items = cleanListItems(Array.isArray(clean.items) ? clean.items : []);
@@ -737,14 +822,29 @@ function cleanupReminderSubject(text) {
 function extractCrmFields(text) {
   const email = (text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [])[0] || "";
   const phone = (text.match(/\b0\d{8,10}\b/) || [])[0] || "";
-  const name = extractAfter(text, /\bcliente\s+([^,.;]+?)(?:,|\s+el\s+correo|\s+correo|\s+telefono|\s+tel[eé]fono|$)/i);
+  const cedula = (text.match(/\b(?:cedula|c[eé]dula|dni|documento)\s*(?:numero|n[uú]mero|#|:)?\s*([0-9][0-9.\-\s]{5,18}[0-9])\b/i) || [])[1] || "";
+  const rawName = extractAfter(text, /\bcliente\s+([^,.;]+?)(?:,|\s+con\s+correo|\s+el\s+correo|\s+correo|\s+telefono|\s+tel[eé]fono|$)/i);
+  const name = /^(con|este|esta|ese|esa)$/i.test(rawName) ? "" : rawName;
   const noteMatch = text.match(/\b(?:anota|nota|interes|inter[eé]s)\s+(?:que\s+)?(.+)$/i);
   const entities = {};
   if (name) entities.name = name;
+  if (cedula) entities.cedula = cedula.replace(/\D+/g, "");
   if (email) entities.email = email;
   if (phone) entities.phone = phone;
   if (noteMatch && noteMatch[1]) entities.notes = cleanupTrailing(noteMatch[1]);
   return entities;
+}
+
+function isConfirmation(text) {
+  return /\b(si|s[ií]|confirmo|correcto|dale|ok|okay|guardalo|gu[aá]rdalo|hazlo)\b/.test(text);
+}
+
+function isRejection(text) {
+  return /\b(no|cancela|cancelar|mejor no|no lo hagas|no guardes|no borres)\b/.test(text);
+}
+
+function isStrongDeleteConfirmation(text) {
+  return /\b(confirmo\s+(borrar|eliminar)|borrar\s+cliente|eliminar\s+cliente|borralo|b[oó]rralo|eliminalo|elim[ií]nalo)\b/.test(text);
 }
 
 function extractAfter(text, pattern) {

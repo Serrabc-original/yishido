@@ -50,6 +50,16 @@ export function composeReplyV2(input) {
     return buildReply(buildExecutedListReply(executedList), true, "answer_only", maxChars);
   }
 
+  const crmResult = findFirstResult(toolResults, ["crm.search", "crm.create", "crm.update", "crm.delete"]);
+  if (crmResult && crmResult.ok) {
+    return buildReply(buildCrmResultReply(crmResult), true, "execute_and_confirm", maxChars);
+  }
+
+  const documentResult = findFirstResult(toolResults, ["document.search", "document.send_existing"]);
+  if (documentResult && documentResult.ok) {
+    return buildReply(buildDocumentResultReply(documentResult), true, "execute_and_confirm", maxChars);
+  }
+
   const imageTask = findTask(tasks, "image.edit") || findTask(tasks, "image.generate");
   if (imageTask) {
     return buildReply(buildImageReply(imageTask), true, "execute_and_confirm", maxChars);
@@ -108,6 +118,15 @@ function buildConfirmationReply(tasks, policy) {
     const body = lines.length
       ? "Entendi estos datos para actualizar el cliente:\n" + lines.join("\n")
       : "Entendi que quieres actualizar un cliente, pero necesito confirmar los datos.";
+    return body + "\nLo guardo asi?";
+  }
+
+  const createTask = findTask(tasks, "crm.create");
+  if (createTask) {
+    const lines = formatCrmFields(createTask.entities || {});
+    const body = lines.length
+      ? "Entendi estos datos para crear el cliente:\n" + lines.join("\n")
+      : "Entendi que quieres crear un cliente, pero necesito confirmar los datos.";
     return body + "\nLo guardo asi?";
   }
 
@@ -172,6 +191,46 @@ function buildExecutionAck(tasks) {
   return "Listo " + SMILE + " Lo hago y te confirmo.";
 }
 
+function buildCrmResultReply(result) {
+  if (result.intent === "crm.search") {
+    const matches = Array.isArray(result.matches) ? result.matches : [];
+    if (!matches.length) return "No encontre ese cliente todavia " + SMILE;
+    const lines = matches.slice(0, 3).map(function (match, index) {
+      const raw = match.raw || match.client || match || {};
+      const name = raw.name || match.name || "Cliente";
+      const phone = raw.phone || raw.telefono || "";
+      const email = raw.email || raw.correo || "";
+      const extra = [phone, email].filter(Boolean).join(" | ");
+      return String(index + 1) + ". " + name + (extra ? " - " + extra : "");
+    });
+    return ["Listo " + SMILE + " Encontre:", lines.join("\n")].join("\n");
+  }
+
+  if (result.intent === "crm.create") {
+    return "Listo " + SMILE + " Guarde el cliente: " + formatCrmRecordName(result.client) + ".";
+  }
+
+  if (result.intent === "crm.update") {
+    return "Listo " + SMILE + " Actualice el cliente: " + formatCrmRecordName(result.client) + ".";
+  }
+
+  if (result.intent === "crm.delete") {
+    return "Listo " + SMILE + " Borre el cliente confirmado.";
+  }
+
+  return "Listo " + SMILE + " Actualice el CRM.";
+}
+
+function buildDocumentResultReply(result) {
+  const document = result.document || {};
+  if (!document || !document.name && !document.url && !document.fileId) {
+    return "No encontre ese documento existente " + SMILE + " No voy a generar uno nuevo.";
+  }
+  const name = document.name || "documento";
+  const ref = document.url || document.fileId || document.id || "";
+  return "Listo " + SMILE + " Encontre el documento existente: " + name + (ref ? "\n" + ref : "");
+}
+
 function buildUnavailableToolReply(tasks, toolResults) {
   const unavailable = toolResults.find(function (result) { return result && result.error === "tool_not_connected"; }) || {};
   const intent = unavailable.intent || "";
@@ -228,6 +287,13 @@ function findResult(results, intent) {
   }) || null;
 }
 
+function findFirstResult(results, intents) {
+  const wanted = new Set(Array.isArray(intents) ? intents : []);
+  return (Array.isArray(results) ? results : []).find(function (result) {
+    return result && wanted.has(result.intent);
+  }) || null;
+}
+
 function hasUnavailableTool(results) {
   return (Array.isArray(results) ? results : []).some(function (result) {
     return result && result.error === "tool_not_connected";
@@ -257,6 +323,10 @@ function polishText(text) {
     .replace(/\bResponder sin herramienta\.?/ig, "Claro, te ayudo.")
     .replace(/\bNo hay intencion clara\.?/ig, "No tengo claro que necesitas.")
     .trim();
+}
+
+function formatCrmRecordName(record) {
+  return record && (record.name || record.clientName || record.client_name) || "cliente";
 }
 
 function buildFallbackReply(summary) {

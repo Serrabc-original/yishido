@@ -66,9 +66,22 @@ test("ReplyComposerV2 uses available uploaded image for cover followup", () => {
   assert.doesNotMatch(normalize(reply.text), /reenvi|mandamela|no tengo la imagen/);
 });
 
-test("ReplyComposerV2 summarizes CRM update and asks confirmation", () => {
+test("ReplyComposerV2 asks for client identity before ambiguous CRM update", () => {
   const reply = composeFromTurn({
     combinedUserText: "Actualiza este cliente con correo mateo@test.com telefono 0999999999 y nota interesado en soporte",
+    audio_count: 1,
+    channel: "whatsapp"
+  });
+
+  assert.equal(reply.shouldSend, true);
+  assert.match(normalize(reply.text), /que cliente quieres actualizar/);
+  assert.doesNotMatch(normalize(reply.text), /lo guardo asi/);
+  assert.equal((reply.text.match(/\?/g) || []).length, 1);
+});
+
+test("ReplyComposerV2 summarizes identified CRM update and asks confirmation", () => {
+  const reply = composeFromTurn({
+    combinedUserText: "Actualiza el cliente Juan Perez con correo mateo@test.com telefono 0999999999 y nota interesado en soporte",
     audio_count: 1,
     channel: "whatsapp"
   });
@@ -77,7 +90,6 @@ test("ReplyComposerV2 summarizes CRM update and asks confirmation", () => {
   assert.match(reply.text, /mateo@test\.com/);
   assert.match(reply.text, /0999999999/);
   assert.match(normalize(reply.text), /lo guardo asi/);
-  assert.equal((reply.text.match(/\?/g) || []).length, 1);
 });
 
 test("ReplyComposerV2 stays silent in live chat mode", () => {

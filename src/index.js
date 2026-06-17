@@ -8203,6 +8203,8 @@ function normalizeCoreUtilityState(state) {
   return {
     reminders: Array.isArray(clean.reminders) ? clean.reminders.slice(-100) : [],
     pendingReminderDraft: normalizePendingReminderDraft(clean.pendingReminderDraft || clean.pending_reminder_draft || null),
+    pendingCrmAction: normalizePendingCrmAction(clean.pendingCrmAction || clean.pending_crm_action || null),
+    documents: normalizeExistingDocuments(clean.documents || clean.documentCatalog || clean.document_catalog || []),
     usageReports: normalizeUsageReportsState(clean.usageReports || clean.usage_reports || {}),
     listsState: listsState,
     lists: listsState.lists,
@@ -9312,6 +9314,34 @@ function normalizePendingReminderDraft(draft) {
     hasTime: draft.hasTime === true,
     updatedAt: String(draft.updatedAt || new Date().toISOString())
   };
+}
+
+function normalizePendingCrmAction(action) {
+  if (!action || typeof action !== "object") return null;
+  const intent = String(action.intent || "");
+  if (!/^crm\./.test(intent)) return null;
+  return {
+    intent: intent,
+    entities: action.entities && typeof action.entities === "object" ? action.entities : {},
+    status: String(action.status || "awaiting_confirmation"),
+    updatedAt: String(action.updatedAt || new Date().toISOString()),
+    source: String(action.source || "intent_router_v2")
+  };
+}
+
+function normalizeExistingDocuments(documents) {
+  return (Array.isArray(documents) ? documents : []).map(function (item, index) {
+    const clean = item && typeof item === "object" ? item : {};
+    return {
+      id: String(clean.id || clean.documentId || clean.document_id || clean.fileId || clean.file_id || "document_" + (index + 1)),
+      name: String(clean.name || clean.title || clean.documentName || clean.document_name || clean.filename || "documento existente"),
+      url: String(clean.url || clean.webUrl || clean.web_url || clean.downloadUrl || clean.download_url || ""),
+      fileId: String(clean.fileId || clean.file_id || ""),
+      source: String(clean.source || "core_utility_state")
+    };
+  }).filter(function (doc) {
+    return doc.id || doc.name || doc.url || doc.fileId;
+  }).slice(-100);
 }
 
 function normalizeUsageReportsState(state) {
@@ -11229,7 +11259,9 @@ function buildIntentRouterV2ConversationState(data) {
     last_uploaded_image: campaignState.last_uploaded_image || null,
     last_generated_image: campaignState.last_generated_image || buildLastGeneratedImageReference(campaignState),
     latest_list: getLatestListFromCoreUtilityState(coreUtilityState),
-    pending_action: coreUtilityState.pendingReminderDraft || activeContext.pendingClarification || "",
+    pending_action: coreUtilityState.pendingCrmAction || coreUtilityState.pendingReminderDraft || activeContext.pendingClarification || "",
+    pending_crm_action: coreUtilityState.pendingCrmAction || null,
+    documents: Array.isArray(coreUtilityState.documents) ? coreUtilityState.documents : [],
     active_task: campaignState.active_task || null
   };
 }
@@ -11246,10 +11278,12 @@ function buildIntentRouterV2TenantConfig(env, data) {
       "list.format",
       "reminder.create",
       "crm.search",
+      "crm.create",
       "crm.update",
       "crm.delete",
       "image.edit",
-      "document.search"
+      "document.search",
+      "document.send_existing"
     ],
     escalation_policy: {
       human_on_complaint: true,
@@ -11279,6 +11313,7 @@ function applyIntentRouterV2StateRecommendations(data, recommendations) {
 
   if (recs.clear_pending_action) {
     next.coreUtilityState.pendingReminderDraft = null;
+    next.coreUtilityState.pendingCrmAction = null;
     next.activeContext = updateConversationContext(next.activeContext, {
       campaignState: next.campaignState,
       pendingClarification: ""
