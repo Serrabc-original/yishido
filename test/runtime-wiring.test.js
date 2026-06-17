@@ -992,6 +992,107 @@ test("IntentRouterV2 runtime handles simple list before legacy orchestration", a
   }
 });
 
+test("IntentRouterV2 runtime creates list reminder without copying audio filler", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(Date.parse("2026-06-17T22:00:00.000Z"));
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, v2Env({ REMINDERS_DELIVERY_MODE: "alarm" }));
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Gracias eh a ver queria que me ayudes a generar una lista y que esa lista me hagas acuerdo en diez minutos ah esta lista eh es para unas compras de eh Supermaxi entonces lo que necesito es pollo, carne, pescado, aceite ah comida para peces, sal, y pan. Eso necesito comprar, pero acuerdame diez minutos.", "msg_v2_audio_supermaxi")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const sent = captures.sentTexts.join("\n");
+    assert.match(sent, /Te guarde la lista y te la recuerdo en 10 minutos/i);
+    assert.match(sent, /1\. Pollo/);
+    assert.match(sent, /5\. Comida para peces/);
+    assert.doesNotMatch(sent, /Gracias eh|queria que me ayudes|creo que eso/i);
+    assert.equal(captures.orchestratorRequests.length, 0);
+
+    const saved = await state.storage.get("data");
+    assert.equal(saved.coreUtilityState.reminders.length, 1);
+    assert.equal(saved.coreUtilityState.reminders[0].title, "lista super");
+    assert.match(saved.coreUtilityState.reminders[0].message, /pollo, carne, pescado, aceite, comida para peces, sal, pan/i);
+    assert.doesNotMatch(saved.coreUtilityState.reminders[0].message, /Gracias eh|queria que me ayudes/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("IntentRouterV2 runtime remembers ephemeral list for follow-up reminder", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(Date.parse("2026-06-17T22:10:00.000Z"));
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, v2Env({ REMINDERS_DELIVERY_MODE: "alarm" }));
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("me puedes caer una lista quiero hacer eh una lista para Supermaxi que sea de huevos, pan, carne, queso ah leche crema zanahoria en blanca ah y creo que eso", "msg_v2_supermaxi_list")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    await coordinator.fetch(localMessageRequest(textMessage("Me puedes hacer acuerdo de esa lista en 20 minutos??", "msg_v2_supermaxi_followup")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const sent = captures.sentTexts.join("\n");
+    assert.match(sent, /1\. Huevos/);
+    assert.match(sent, /7\. Zanahoria en blanca/);
+    assert.match(sent, /Te recuerdo lista super en 20 minutos/i);
+    assert.doesNotMatch(sent, /actualice tu lista de en 20 minutos|lista de en 20 minutos/i);
+    assert.equal(captures.orchestratorRequests.length, 0);
+
+    const saved = await state.storage.get("data");
+    assert.equal(saved.coreUtilityState.reminders.length, 1);
+    assert.equal(saved.coreUtilityState.reminders[0].title, "lista super");
+    assert.match(saved.coreUtilityState.reminders[0].message, /huevos, pan, carne, queso, leche, crema, zanahoria en blanca/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
+test("IntentRouterV2 runtime completes pending reminder clarification", async () => {
+  const state = createMemoryState();
+  const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };
+  const originalFetch = globalThis.fetch;
+  const clock = installFakeClock(Date.parse("2026-06-17T22:20:00.000Z"));
+  globalThis.fetch = mockRuntimeFetch(captures);
+  const coordinator = new ConversationCoordinator(state, v2Env({ REMINDERS_DELIVERY_MODE: "alarm" }));
+
+  try {
+    await coordinator.fetch(localMessageRequest(textMessage("Oye me puedes hacer acuerdo de un correo que debo enviar a un cliente que diga que le estoy haciendo seguimiento para poder dar la reunion entonces ahi le puedes mandar mi link por favor", "msg_v2_email_reminder")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    let saved = await state.storage.get("data");
+    assert.equal(saved.coreUtilityState.pendingReminderDraft.title, "correo de seguimiento al cliente");
+
+    await coordinator.fetch(localMessageRequest(textMessage("me lo puedes recordar en dos minutos por favor y tambien me puedes enviar el correo", "msg_v2_email_reminder_time")));
+    clock.tick(100);
+    await coordinator.processBuffer();
+
+    const sent = captures.sentTexts.join("\n");
+    assert.match(sent, /Cuando quieres que te lo recuerde/i);
+    assert.match(sent, /Te recuerdo correo de seguimiento al cliente en 2 minutos/i);
+    assert.doesNotMatch(sent, /Responder sin herramienta|No hay intencion clara/i);
+    assert.equal(captures.orchestratorRequests.length, 0);
+
+    saved = await state.storage.get("data");
+    assert.equal(saved.coreUtilityState.pendingReminderDraft, null);
+    assert.equal(saved.coreUtilityState.reminders.length, 1);
+    assert.equal(saved.coreUtilityState.reminders[0].title, "correo de seguimiento al cliente");
+  } finally {
+    globalThis.fetch = originalFetch;
+    clock.restore();
+  }
+});
+
 test("IntentRouterV2 runtime repairs correction without creating tools", async () => {
   const state = createMemoryState();
   const captures = { sentTexts: [], visionUrls: [], orchestratorRequests: [] };

@@ -132,6 +132,8 @@ import {
   buildIntentRouterV2TurnDecision,
   summarizeIntentRouterV2Decision
 } from "./ai/intentRouterV2Pipeline.js";
+import { getLatestListFromCoreUtilityState, normalizeV2ListReference } from "./ai/taskStateManager.js";
+import { executeIntentRouterV2Tools } from "./tools/toolExecutor.js";
 import {
   getCustomerReplyModel,
   getFinalResponseModel,
@@ -2240,13 +2242,20 @@ export class ConversationCoordinator {
         }));
       }
 
+      const intentRouterV2Now = new Date().toISOString();
       const intentRouterV2Decision = buildIntentRouterV2TurnDecision({
         env: this.env,
         userTurn: userTurn,
         conversationState: buildIntentRouterV2ConversationState(data),
         tenantConfig: buildIntentRouterV2TenantConfig(this.env, data),
         timezone: this.env.USER_TIMEZONE || "America/Guayaquil",
-        now: new Date().toISOString()
+        now: intentRouterV2Now,
+        toolExecutor: (executionInput) => executeIntentRouterV2Tools(Object.assign({}, executionInput || {}, {
+          data: data,
+          env: this.env,
+          now: intentRouterV2Now,
+          userTurn: userTurn
+        }))
       });
       if (intentRouterV2Decision.enabled) {
         const summary = summarizeIntentRouterV2Decision(intentRouterV2Decision);
@@ -2263,15 +2272,23 @@ export class ConversationCoordinator {
       }
 
       if (intentRouterV2Decision.handled) {
+        if (intentRouterV2Decision.updatedData) {
+          data = mergeIntentRouterV2UpdatedData(data, intentRouterV2Decision.updatedData);
+        }
         data = applyIntentRouterV2StateRecommendations(data, intentRouterV2Decision.stateRecommendations);
         if (intentRouterV2Decision.shouldSend) {
-          await sendWoztellTextMessage(this.env, {
-            channelId: data.channel,
-            recipientId: data.phone,
-            memberId: data.member,
-            appId: data.app,
-            text: intentRouterV2Decision.reply.text
-          });
+          const splitMessages = intentRouterV2Decision.reply && Array.isArray(intentRouterV2Decision.reply.splitMessages) && intentRouterV2Decision.reply.splitMessages.length
+            ? intentRouterV2Decision.reply.splitMessages
+            : [intentRouterV2Decision.reply.text];
+          for (const text of splitMessages) {
+            await sendWoztellTextMessage(this.env, {
+              channelId: data.channel,
+              recipientId: data.phone,
+              memberId: data.member,
+              appId: data.app,
+              text: text
+            });
+          }
         }
         data.activeContext = updateConversationContext(data.activeContext, {
           userTurn: userTurn,
@@ -8190,6 +8207,7 @@ function normalizeCoreUtilityState(state) {
     listsState: listsState,
     lists: listsState.lists,
     activeList: String(clean.activeList || clean.active_list || ""),
+    lastEphemeralList: normalizeV2ListReference(clean.lastEphemeralList || clean.last_ephemeral_list || null),
     tasks: taskState.tasks,
     leads: taskState.leads,
     clients: taskState.clients,
@@ -11210,7 +11228,8 @@ function buildIntentRouterV2ConversationState(data) {
     campaign_assets: normalizeCampaignAssets(campaignState.campaign_assets || []),
     last_uploaded_image: campaignState.last_uploaded_image || null,
     last_generated_image: campaignState.last_generated_image || buildLastGeneratedImageReference(campaignState),
-    pending_action: activeContext.pendingClarification || coreUtilityState.pendingReminderDraft || "",
+    latest_list: getLatestListFromCoreUtilityState(coreUtilityState),
+    pending_action: coreUtilityState.pendingReminderDraft || activeContext.pendingClarification || "",
     active_task: campaignState.active_task || null
   };
 }
@@ -11275,6 +11294,16 @@ function applyIntentRouterV2StateRecommendations(data, recommendations) {
   }
 
   return next;
+}
+
+function mergeIntentRouterV2UpdatedData(currentData, updatedData) {
+  const current = currentData || {};
+  const updated = updatedData || {};
+  return Object.assign({}, updated, {
+    traceEvents: Array.isArray(current.traceEvents) ? current.traceEvents : updated.traceEvents,
+    productHealth: current.productHealth || updated.productHealth,
+    lastTraceSnapshot: current.lastTraceSnapshot || updated.lastTraceSnapshot
+  });
 }
 
 function jsonResponse(data, status) {

@@ -17,7 +17,11 @@ const EXPECTED_CASE_IDS = [
   "J_crm_delete_requires_strong_confirmation",
   "K_context_switch_pending_reminder_to_image",
   "L_live_chat_no_bot_reply",
-  "M_document_existing_request"
+  "M_document_existing_request",
+  "N_audio_supermaxi_clean_items",
+  "O_followup_existing_list_reminder",
+  "P_audio_supermaxi_list_plus_reminder",
+  "Q_pending_reminder_clarification_answer"
 ];
 
 test("IntentRouterV2 golden eval file covers the real WhatsApp failure set", () => {

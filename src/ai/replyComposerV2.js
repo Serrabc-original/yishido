@@ -7,6 +7,7 @@ export function composeReplyV2(input) {
   const router = clean.routerResult || clean.intentRouterResult || {};
   const policy = clean.policyDecision || clean.policyGateDecision || {};
   const tasks = Array.isArray(router.tasks) ? router.tasks : [];
+  const toolResults = Array.isArray(clean.toolResults) ? clean.toolResults : Array.isArray(policy.toolResults) ? policy.toolResults : [];
   const tenant = clean.tenantConfig || {};
   const maxChars = Number(clean.maxChars || tenant.max_reply_chars || tenant.maxReplyChars || 650);
 
@@ -31,6 +32,24 @@ export function composeReplyV2(input) {
     return buildReply(buildConfirmationReply(tasks, policy), true, "ask_confirmation", maxChars);
   }
 
+  if (toolResults.length && hasUnavailableTool(toolResults)) {
+    return buildReply(buildUnavailableToolReply(tasks, toolResults), true, "tool_unavailable", maxChars);
+  }
+
+  const executedList = findResult(toolResults, "list.format");
+  const executedReminder = findResult(toolResults, "reminder.create");
+  if (executedList && executedList.ok && executedReminder && executedReminder.ok) {
+    return buildReply(buildExecutedListReminderReply(executedList, executedReminder), true, "execute_and_confirm", maxChars);
+  }
+
+  if (executedReminder && executedReminder.ok) {
+    return buildReply(buildExecutedReminderReply(executedReminder), true, "execute_and_confirm", maxChars);
+  }
+
+  if (executedList && executedList.ok) {
+    return buildReply(buildExecutedListReply(executedList), true, "answer_only", maxChars);
+  }
+
   const imageTask = findTask(tasks, "image.edit") || findTask(tasks, "image.generate");
   if (imageTask) {
     return buildReply(buildImageReply(imageTask), true, "execute_and_confirm", maxChars);
@@ -51,7 +70,7 @@ export function composeReplyV2(input) {
   }
 
   const strategy = router.reply_strategy || {};
-  return buildReply(strategy.human_summary || "Claro, te ayudo.", true, "answer_only", maxChars);
+  return buildReply(buildFallbackReply(strategy.human_summary), true, "answer_only", maxChars);
 }
 
 function buildReply(text, shouldSend, finalReplyType, maxChars) {
@@ -118,6 +137,24 @@ function buildListReply(listTask) {
   return ["Listo " + SMILE + " Te ordene la lista:", list].filter(Boolean).join("\n");
 }
 
+function buildExecutedListReply(result) {
+  const list = buildNumberedList(result.items || []);
+  return ["Listo " + SMILE + " Te ordene la lista:", list].filter(Boolean).join("\n");
+}
+
+function buildExecutedListReminderReply(listResult, reminderResult) {
+  const list = buildNumberedList(listResult.items || []);
+  const due = formatRelativeDue(reminderResult.relativeDue || "");
+  const intro = "Listo " + SMILE + " Te guarde la lista y te la recuerdo" + (due ? " en " + due : "") + ":";
+  return [intro, list].filter(Boolean).join("\n");
+}
+
+function buildExecutedReminderReply(result) {
+  const due = formatRelativeDue(result.relativeDue || "");
+  const title = result.title || "eso";
+  return "Listo " + SMILE + " Te recuerdo " + title + (due ? " en " + due : "") + ".";
+}
+
 function buildExecutionAck(tasks) {
   const crmSearch = findTask(tasks, "crm.search");
   if (crmSearch) return "Listo " + SMILE + " Busco ese cliente y te paso lo que encuentre.";
@@ -133,6 +170,20 @@ function buildExecutionAck(tasks) {
   }
 
   return "Listo " + SMILE + " Lo hago y te confirmo.";
+}
+
+function buildUnavailableToolReply(tasks, toolResults) {
+  const unavailable = toolResults.find(function (result) { return result && result.error === "tool_not_connected"; }) || {};
+  const intent = unavailable.intent || "";
+  const crm = findTask(tasks, "crm.search") || findTask(tasks, "crm.create") || findTask(tasks, "crm.update") || findTask(tasks, "crm.delete");
+  if (crm || /^crm\./.test(intent)) {
+    return "Claro " + SMILE + " Entendi la solicitud de cliente, pero esa herramienta aun no esta conectada aqui. No voy a guardar ni borrar nada todavia.";
+  }
+  const doc = findTask(tasks, "document.search") || findTask(tasks, "document.send_existing");
+  if (doc || /^document\./.test(intent)) {
+    return "Claro " + SMILE + " Puedo buscar un documento existente cuando esa fuente este conectada. No voy a generar un archivo nuevo.";
+  }
+  return "Claro " + SMILE + " Entendi la solicitud, pero esa herramienta aun no esta conectada aqui.";
 }
 
 function buildNumberedList(items) {
@@ -171,6 +222,18 @@ function findTask(tasks, intent) {
   }) || null;
 }
 
+function findResult(results, intent) {
+  return (Array.isArray(results) ? results : []).find(function (result) {
+    return result && result.intent === intent;
+  }) || null;
+}
+
+function hasUnavailableTool(results) {
+  return (Array.isArray(results) ? results : []).some(function (result) {
+    return result && result.error === "tool_not_connected";
+  });
+}
+
 function hasMissingSlot(task, slot) {
   const missing = Array.isArray(task && task.missing_slots) ? task.missing_slots : [];
   return missing.includes(slot);
@@ -191,7 +254,17 @@ function polishText(text) {
   return String(text || "")
     .replace(/\n{3,}/g, "\n\n")
     .replace(/[ \t]+/g, " ")
+    .replace(/\bResponder sin herramienta\.?/ig, "Claro, te ayudo.")
+    .replace(/\bNo hay intencion clara\.?/ig, "No tengo claro que necesitas.")
     .trim();
+}
+
+function buildFallbackReply(summary) {
+  const clean = String(summary || "").trim();
+  if (!clean || /responder sin herramienta|no hay intencion clara/i.test(clean)) {
+    return "Claro " + SMILE + " No tengo claro si quieres que haga algo o solo te responda. Me explicas un poco mas?";
+  }
+  return clean;
 }
 
 function normalizeText(text) {

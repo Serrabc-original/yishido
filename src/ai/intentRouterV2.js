@@ -88,7 +88,7 @@ export function routeIntentV2(input) {
   const crm = buildCrmRoute(base, text, normalized, userTurn);
   if (crm) return crm;
 
-  const utility = buildListReminderRoute(base, text, normalized, userTurn);
+  const utility = buildListReminderRoute(base, text, normalized, userTurn, state);
   if (utility) return utility;
 
   return result(base, {
@@ -96,19 +96,90 @@ export function routeIntentV2(input) {
     tasks: [replyOnlyTask("unknown")],
     reply_strategy: {
       kind: "answer_only",
-      human_summary: normalized ? "Responder sin herramienta." : "No hay intencion clara."
+      human_summary: normalized ? "No tengo claro si quieres que cree algo o solo responda." : "No me llego suficiente contexto para responder."
     }
   });
 }
 
-function buildListReminderRoute(base, text, normalized, userTurn) {
+function buildListReminderRoute(base, text, normalized, userTurn, state) {
   const hasList = /\b(lista|compras|pendientes)\b/.test(normalized) && !isCorrection(normalized) && !isMetaQuestion(normalized);
   const hasListCreation = isListCreationIntent(normalized);
   const hasReminder = isReminderIntent(normalized);
+  const listDetails = hasListCreation ? extractListDetails(text) : { listName: "compras", items: [] };
+
+  if (hasReminder && referencesExistingList(normalized) && !hasListCreation) {
+    const due = extractRelativeDue(normalized);
+    const latestList = getLatestListReference(state);
+    const items = latestList && latestList.items || [];
+    const listName = latestList && latestList.name || "compras";
+
+    return result(base, {
+      turn_type: "new_request",
+      tasks: [buildIntentTask({
+        task_id: "reminder.create",
+        intent: "reminder.create",
+        action_type: "schedule",
+        status: due && items.length ? "ready" : "needs_clarification",
+        confidence: due && items.length ? 0.88 : 0.58,
+        entities: {
+          title: latestList && latestList.title || formatListReminderTitle(listName),
+          message: items.length ? items.join(", ") : "esa lista",
+          items: items,
+          listName: listName,
+          relativeDue: due || "",
+          timezone: base.timezone
+        },
+        required_slots: ["title", "due_at", "timezone"],
+        missing_slots: due ? items.length ? [] : ["items"] : ["due_at"],
+        source_evidence: evidenceFromTurn(userTurn, text),
+        user_visible_summary: due ? "Crear recordatorio de la lista reciente." : "Falta cuando recordar la lista."
+      })],
+      state_recommendations: {
+        continue_active_task: Boolean(latestList)
+      },
+      reply_strategy: {
+        kind: due && items.length ? "execute_and_confirm" : "ask_clarification",
+        one_question_to_ask: due ? "Que lista quieres que te recuerde?" : "Cuando quieres que te recuerde esa lista?",
+        human_summary: due && items.length ? "Programar recordatorio de la lista reciente." : "Pedir dato faltante para recordar lista reciente."
+      }
+    });
+  }
+
+  const pendingReminder = getPendingReminderReference(state);
+  if (hasReminder && pendingReminder && !hasList && !hasListCreation) {
+    const due = extractRelativeDue(normalized);
+    return result(base, {
+      turn_type: "clarification_answer",
+      tasks: [buildIntentTask({
+        task_id: "reminder.create",
+        intent: "reminder.create",
+        action_type: "schedule",
+        status: due ? "ready" : "needs_clarification",
+        confidence: due ? 0.88 : 0.6,
+        entities: {
+          title: pendingReminder.title,
+          message: pendingReminder.message || pendingReminder.title,
+          relativeDue: due || "",
+          timezone: base.timezone
+        },
+        required_slots: ["title", "due_at", "timezone"],
+        missing_slots: due ? [] : ["due_at"],
+        source_evidence: evidenceFromTurn(userTurn, text),
+        user_visible_summary: due ? "Completar recordatorio pendiente." : "Sigue faltando cuando recordar."
+      })],
+      state_recommendations: {
+        clear_pending_action: Boolean(due)
+      },
+      reply_strategy: {
+        kind: due ? "execute_and_confirm" : "ask_clarification",
+        one_question_to_ask: due ? null : "Cuando quieres que te lo recuerde?",
+        human_summary: due ? "Crear recordatorio pendiente con la hora recibida." : "Pedir hora del recordatorio pendiente."
+      }
+    });
+  }
 
   if (hasList && hasReminder && hasListCreation) {
-    const list = parseListCommand(text);
-    const items = cleanListItems(Array.isArray(list.items) ? list.items : []);
+    const items = listDetails.items;
     const due = extractRelativeDue(normalized);
     const listTask = buildIntentTask({
       task_id: "list.format",
@@ -116,7 +187,7 @@ function buildListReminderRoute(base, text, normalized, userTurn) {
       action_type: "reply_only",
       status: items.length ? "ready" : "needs_clarification",
       confidence: items.length ? 0.9 : 0.55,
-      entities: { listName: list.listName || "compras", items: items },
+      entities: { listName: listDetails.listName, items: items },
       missing_slots: items.length ? [] : ["items"],
       source_evidence: evidenceFromTurn(userTurn, text),
       user_visible_summary: "Ordenar lista en texto."
@@ -128,8 +199,10 @@ function buildListReminderRoute(base, text, normalized, userTurn) {
       status: due ? "ready" : "needs_clarification",
       confidence: due ? 0.9 : 0.62,
       entities: {
-        title: "lista de compras",
+        title: formatListReminderTitle(listDetails.listName),
         message: items.length ? items.join(", ") : text,
+        items: items,
+        listName: listDetails.listName,
         relativeDue: due || "",
         timezone: base.timezone
       },
@@ -152,8 +225,7 @@ function buildListReminderRoute(base, text, normalized, userTurn) {
   }
 
   if (hasList && hasListCreation) {
-    const list = parseListCommand(text);
-    const items = cleanListItems(Array.isArray(list.items) ? list.items : []);
+    const items = listDetails.items;
     return result(base, {
       turn_type: "new_request",
       tasks: [buildIntentTask({
@@ -162,7 +234,7 @@ function buildListReminderRoute(base, text, normalized, userTurn) {
         action_type: "reply_only",
         status: items.length ? "ready" : "needs_clarification",
         confidence: items.length ? 0.88 : 0.55,
-        entities: { listName: list.listName || "compras", items: items },
+        entities: { listName: listDetails.listName, items: items },
         missing_slots: items.length ? [] : ["items"],
         source_evidence: evidenceFromTurn(userTurn, text),
         user_visible_summary: "Ordenar lista en texto."
@@ -321,7 +393,7 @@ function replyOnlyTask(reason) {
     status: "ready",
     confidence: 0.8,
     entities: { reason: reason || "reply_only" },
-    user_visible_summary: "Responder sin herramientas."
+    user_visible_summary: "Responder sin ejecutar herramientas."
   });
 }
 
@@ -358,7 +430,7 @@ function isMetaQuestion(text) {
 }
 
 function isReminderIntent(text) {
-  return /\b(recuerdame|recuerdamela|recordarme|recordatorio|avisame|hazme\s+acuerdo|hacer\s+acuerdo|acuerdame|me\s+puedes\s+hacer\s+acuerdo)\b/.test(text);
+  return /\b(recuerdame|recuerdamela|recordarme|recordar|recordatorio|avisame|hazme\s+acuerdo|hacer\s+acuerdo|acuerdame|me\s+puedes\s+hacer\s+acuerdo|me\s+lo\s+puedes\s+recordar|me\s+puedes\s+recordar)\b/.test(text);
 }
 
 function isListCreationIntent(text) {
@@ -370,10 +442,176 @@ function isListCreationIntent(text) {
 }
 
 function cleanListItems(items) {
-  return (Array.isArray(items) ? items : []).filter(function (item) {
+  return (Array.isArray(items) ? items : [])
+    .map(sanitizeListItem)
+    .flatMap(expandCompoundListItem)
+    .filter(function (item) {
     const clean = normalizeText(item);
-    return clean && !/\b(recuerdame|recuerdamela|recordarme|hazme\s+acuerdo|hacer\s+acuerdo)\b/.test(clean);
+    return isUsableListItem(clean);
   });
+}
+
+function extractListDetails(text) {
+  const parsed = parseListCommand(text);
+  const parsedItems = cleanListItems(Array.isArray(parsed.items) ? parsed.items : []);
+  const naturalItems = extractNaturalListItems(text);
+  const items = shouldPreferNaturalItems(parsedItems, naturalItems) ? naturalItems : parsedItems;
+  return {
+    listName: inferListNameForV2(text, parsed.listName || ""),
+    items: items
+  };
+}
+
+function shouldPreferNaturalItems(parsedItems, naturalItems) {
+  if (!naturalItems.length) return false;
+  if (!parsedItems.length) return true;
+  if (parsedItems.some(function (item) { return !isUsableListItem(normalizeText(item)); })) return true;
+  if (parsedItems.some(function (item) { return normalizeText(item).split(" ").length > 7; })) return true;
+  return naturalItems.length >= parsedItems.length;
+}
+
+function extractNaturalListItems(text) {
+  let segment = String(text || "")
+    .replace(/^\s*\[Audio transcrito\]:\s*/i, "")
+    .replace(/^["'\s]+|["'\s]+$/g, "")
+    .trim();
+
+  segment = takeAfterBestListMarker(segment);
+  segment = stripAfterReminderClause(segment);
+  segment = segment
+    .replace(/\s+\b(ah|eh)\b\s+/ig, ", ")
+    .replace(/\b(entonces|por favor|gracias|ahi|ah)\b/ig, " ")
+    .replace(/\b(eso necesito comprar|eso necesito|creo que eso|y creo que eso)\b/ig, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return cleanListItems(segment.split(/\s*,\s*|\s+y\s+/i));
+}
+
+function takeAfterBestListMarker(text) {
+  const source = String(text || "");
+  const markers = [
+    /\blo que necesito es\s+/i,
+    /\blo que necesito comprar es\s+/i,
+    /\bnecesito comprar\s+/i,
+    /\bnecesito es\s+/i,
+    /\bque sea de\s+/i,
+    /\blista\s+(?:de|con)\s+/i,
+    /\bcompras?\s+(?:de|con)\s+/i
+  ];
+
+  let bestIndex = -1;
+  let bestEnd = -1;
+  for (const marker of markers) {
+    const match = source.match(marker);
+    if (!match) continue;
+    const index = match.index || 0;
+    if (index >= bestIndex) {
+      bestIndex = index;
+      bestEnd = index + match[0].length;
+    }
+  }
+  if (bestEnd >= 0) return source.slice(bestEnd).trim();
+
+  return source
+    .replace(/^\s*(me\s+puedes\s+|puedes\s+|quiero\s+|queria\s+que\s+|ayudame\s+a\s+|ayudes\s+a\s+)*/i, "")
+    .replace(/^\s*(hacer|hazme|crear|creame|generar|genera|preparar|prepara)\s+(una\s+)?lista\s*/i, "")
+    .trim();
+}
+
+function stripAfterReminderClause(text) {
+  return String(text || "")
+    .replace(/\s+(y\s+que\s+)?(?:esa|esta|la)\s+lista\s+me\s+(?:hagas|haz)\s+acuerdo\b.*$/i, "")
+    .replace(/\s+(y\s+)?(?:recuerdamela|recuerdame|recordarme|hazme\s+acuerdo|hacerme\s+acuerdo|hacer\s+acuerdo|avisame)\b.*$/i, "")
+    .replace(/\s+pero\s+(?:a\s+\S+\s+)?(?:me\s+)?(?:acuerdame|recuerdame|hazme\s+acuerdo)\b.*$/i, "")
+    .replace(/\s+(?:acuerdame|recuerdame)\s+(\d+|un|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|quince|veinte|treinta)\s*(min|minuto|minutos|m)?\b.*$/i, "")
+    .replace(/\s+(?:en|dentro\s+de)\s+(\d+|un|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|quince|veinte|treinta)\s*(min|minuto|minutos|m|hora|horas|h|dia|dias|d)\b.*$/i, "")
+    .trim();
+}
+
+function inferListNameForV2(text, fallback) {
+  const normalized = normalizeText(text);
+  if (/\bsupermaxi\b/.test(normalized)) return "super";
+  if (/\bsuper\b|\bsupermercado\b/.test(normalized)) return "super";
+  if (/\bcompras?\b|\bcomprar\b/.test(normalized)) return "compras";
+  const cleanFallback = String(fallback || "").trim();
+  if (cleanFallback && !/^(pendientes|lista)$/i.test(cleanFallback)) return cleanFallback;
+  return "compras";
+}
+
+function formatListReminderTitle(listName) {
+  const clean = String(listName || "compras").trim() || "compras";
+  if (clean === "compras") return "lista de compras";
+  return "lista " + clean;
+}
+
+function isUsableListItem(item) {
+  const clean = normalizeText(item);
+  if (!clean) return false;
+  if (clean.length < 2) return false;
+  if (clean.split(" ").length > 6) return false;
+  if (/\b(recuerdame|recuerdamela|recordarme|hazme\s+acuerdo|hacer\s+acuerdo|me\s+hagas\s+acuerdo)\b/.test(clean)) return false;
+  if (/\b(me\s+puedes|puedes|quiero|queria|ayudes|ayudame|generar|crear|hacer\s+una\s+lista|lista\s+para|creo\s+que\s+eso|eso\s+necesito|entonces|gracias)\b/.test(clean)) return false;
+  if (/^(de|del|la|el|los|las|y|o|ah|eh)$/.test(clean)) return false;
+  return true;
+}
+
+function sanitizeListItem(item) {
+  return String(item || "")
+    .replace(/^\s*(y|o)\s+/i, "")
+    .replace(/\b(ah|eh)\b/ig, " ")
+    .replace(/[.,;:]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function expandCompoundListItem(item) {
+  const clean = String(item || "").trim();
+  const normalized = normalizeText(clean);
+  const matches = [];
+  const regex = /\b(comida\s+de\s+gatito|comida\s+para\s+peces|zanahoria\s+en\s+blanca|zanahoria|huevos?|leche|crema|pan|carne|queso|pollo|pescado|aceite|sal|agua|harina)\b/gi;
+  let match;
+  while ((match = regex.exec(normalized)) !== null) {
+    matches.push(match[1]);
+  }
+  if (matches.length > 1) return matches;
+  return [clean];
+}
+
+function referencesExistingList(text) {
+  return /\b(esa|esta|la|mi)\s+lista\b/.test(text) || /\b(lista\s+que\s+te\s+(?:di|dije|mande|pase)|lista\s+anterior)\b/.test(text);
+}
+
+function getLatestListReference(state) {
+  const clean = state && typeof state === "object" ? state : {};
+  const direct = normalizeListReference(clean.latest_list || clean.latestList || clean.last_ephemeral_list || clean.lastEphemeralList || null);
+  if (direct) return direct;
+  const core = clean.core_utility_state || clean.coreUtilityState || {};
+  return normalizeListReference(core.lastEphemeralList || core.last_ephemeral_list || null);
+}
+
+function getPendingReminderReference(state) {
+  const clean = state && typeof state === "object" ? state : {};
+  const pending = clean.pending_action || clean.pendingAction || null;
+  const draft = pending && typeof pending === "object" ? pending : {};
+  const title = String(draft.title || draft.subject || "").trim();
+  if (!title) return null;
+  return {
+    title: title,
+    message: String(draft.message || draft.body || draft.context || title).trim()
+  };
+}
+
+function normalizeListReference(value) {
+  const clean = value && typeof value === "object" ? value : {};
+  const items = cleanListItems(Array.isArray(clean.items) ? clean.items : []);
+  if (!items.length) return null;
+  const name = String(clean.name || clean.listName || clean.list_name || "compras").trim() || "compras";
+  return {
+    name: name,
+    title: String(clean.title || "lista " + name).trim(),
+    items: items
+  };
 }
 
 function isDocumentRequest(text) {
@@ -482,11 +720,18 @@ function parseSpokenNumber(value) {
 }
 
 function cleanupReminderSubject(text) {
-  return String(text || "")
-    .replace(/^\s*(hazme\s+acuerdo|recuerdame|recordarme|avisame|acuerdame)\s+(de\s+|para\s+)?/i, "")
+  const cleaned = String(text || "")
+    .replace(/^\s*(oye|hola|gracias|porfa|por favor)[,.\s]*/i, "")
+    .replace(/^\s*(me\s+puedes\s+)?(hazme\s+acuerdo|hacer\s+acuerdo|recuerdame|recordarme|me\s+lo\s+puedes\s+recordar|me\s+puedes\s+recordar|recordar|avisame|acuerdame)\s+(de\s+|para\s+)?/i, "")
     .replace(/\b(?:en|dentro\s+de)\s+\S+\s*(min|minuto|minutos|m|hora|horas|h|dia|dias|d)\b/gi, "")
     .replace(/\s+/g, " ")
     .trim();
+  const normalized = normalizeText(cleaned);
+  if (/\bcorreo\b/.test(normalized) && /\bcliente\b/.test(normalized) && /\bseguimiento\b/.test(normalized)) {
+    return "correo de seguimiento al cliente";
+  }
+  if (/\bcorreo\b/.test(normalized)) return "correo pendiente";
+  return cleaned;
 }
 
 function extractCrmFields(text) {

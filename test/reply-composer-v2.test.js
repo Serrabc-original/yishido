@@ -37,7 +37,7 @@ test("ReplyComposerV2 asks only the missing reminder time", () => {
   });
 
   assert.equal(reply.shouldSend, true);
-  assert.match(normalize(reply.text), /cuando quieres que te lo recuerde/);
+  assert.match(normalize(reply.text), /cuando quieres que te recuerde/);
   assert.equal((reply.text.match(/\?/g) || []).length, 1);
 });
 
