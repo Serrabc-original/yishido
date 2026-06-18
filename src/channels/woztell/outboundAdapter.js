@@ -92,11 +92,11 @@ export async function sendWoztellTemplateMessage(env, params, options) {
 
 export async function sendWoztellResponse(env, params, options) {
   const clean = params || {};
-  const tokenInfo = selectWoztellSendToken(env || {});
+  const tokenCandidates = selectWoztellSendTokens(env || {});
   const logger = getLogger(options);
   const activeContext = options && options.activeLogContext || {};
 
-  if (!tokenInfo.token) {
+  if (!tokenCandidates.length) {
     const missingResult = {
       ok: false,
       failed: true,
@@ -107,7 +107,6 @@ export async function sendWoztellResponse(env, params, options) {
     return missingResult;
   }
 
-  const url = "https://bot.api.woztell.com/sendResponses?accessToken=" + encodeURIComponent(tokenInfo.token);
   const baseParams = Object.assign({}, clean, {
     memberId: clean.memberId || activeContext.memberId || "",
     appId: clean.appId || activeContext.appId || ""
@@ -122,71 +121,81 @@ export async function sendWoztellResponse(env, params, options) {
     hasAccessTokenQuery: true
   }));
   console.log("WOZTELL_SEND_AUTH_MODE:", JSON.stringify({
-    tokenType: tokenInfo.mode,
+    tokenTypes: tokenCandidates.map(function (item) { return item.mode; }),
     hasWoztellAccessToken: Boolean(env && env.WOZTELL_ACCESS_TOKEN),
     hasWoztellOpenApiToken: Boolean(env && env.WOZTELL_OPEN_API_TOKEN)
   }));
 
-  for (const attempt of attempts) {
-    const payload = attempt.payload;
+  for (const tokenInfo of tokenCandidates) {
+    const url = "https://bot.api.woztell.com/sendResponses?accessToken=" + encodeURIComponent(tokenInfo.token);
 
-    logWoztellSendShape(payload, attempt.mode);
+    for (const attempt of attempts) {
+      const payload = attempt.payload;
 
-    if (clean.logPrefix === "WOZTELL_IMAGE_SEND") {
-      console.log("WOZTELL_IMAGE_SEND_PAYLOAD:", JSON.stringify(redactWoztellPayloadForLog(payload)));
-    }
-
-    let res;
-
-    try {
-      res = await getFetchWithTimeout(options)(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json; charset=utf-8"
-        },
-        body: JSON.stringify(payload)
-      }, 30000, "WOZTELL_SEND_TIMEOUT");
-    } catch (error) {
-      lastFailure = {
-        ok: false,
-        failed: true,
-        mode: attempt.mode,
-        status: 0,
-        body: String(error.message || error).slice(0, 1000)
-      };
-      console.error("WOZTELL_SEND_FAILED:", JSON.stringify(lastFailure));
-      continue;
-    }
-
-    const responseText = await res.text();
-
-    if (!res.ok) {
-      lastFailure = {
-        ok: false,
-        failed: true,
-        mode: attempt.mode,
-        status: res.status,
-        body: responseText.slice(0, 1000)
-      };
-      console.error("WOZTELL_SEND_FAILED:", JSON.stringify(lastFailure));
+      logWoztellSendShape(payload, attempt.mode);
 
       if (clean.logPrefix === "WOZTELL_IMAGE_SEND") {
-        console.error("WOZTELL_IMAGE_SEND_ERROR:", JSON.stringify({
-          status: res.status,
-          body: responseText.slice(0, 2000)
-        }));
+        console.log("WOZTELL_IMAGE_SEND_PAYLOAD:", JSON.stringify(redactWoztellPayloadForLog(payload)));
       }
 
-      if (!(attempt.mode === "recipientId" && shouldRetryWoztellWithMember(responseText, baseParams.memberId))) {
+      let res;
+
+      try {
+        res = await getFetchWithTimeout(options)(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json; charset=utf-8"
+          },
+          body: JSON.stringify(payload)
+        }, 30000, "WOZTELL_SEND_TIMEOUT");
+      } catch (error) {
+        lastFailure = {
+          ok: false,
+          failed: true,
+          mode: attempt.mode,
+          tokenType: tokenInfo.mode,
+          status: 0,
+          body: String(error.message || error).slice(0, 1000)
+        };
+        console.error("WOZTELL_SEND_FAILED:", JSON.stringify(lastFailure));
+        logger("WOZTELL_SEND_FAILED", sanitizeWoztellFailureForEvent(lastFailure, clean, activeContext));
         continue;
       }
 
-      continue;
+      const responseText = await res.text();
+
+      if (!res.ok) {
+        lastFailure = {
+          ok: false,
+          failed: true,
+          mode: attempt.mode,
+          tokenType: tokenInfo.mode,
+          status: res.status,
+          body: responseText.slice(0, 1000)
+        };
+        console.error("WOZTELL_SEND_FAILED:", JSON.stringify(lastFailure));
+        logger("WOZTELL_SEND_FAILED", sanitizeWoztellFailureForEvent(lastFailure, clean, activeContext));
+
+        if (clean.logPrefix === "WOZTELL_IMAGE_SEND") {
+          console.error("WOZTELL_IMAGE_SEND_ERROR:", JSON.stringify({
+            status: res.status,
+            body: responseText.slice(0, 2000)
+          }));
+        }
+
+        if (!(attempt.mode === "recipientId" && shouldRetryWoztellWithMember(responseText, baseParams.memberId))) {
+          continue;
+        }
+
+        continue;
+      }
+
+      parsed = parseMaybeJson(responseText);
+      successStatus = res.status;
+      break;
     }
 
-    parsed = parseMaybeJson(responseText);
-    successStatus = res.status;
-    break;
+    if (parsed) break;
   }
 
   if (!parsed) {
@@ -224,26 +233,32 @@ export async function sendWoztellResponse(env, params, options) {
 }
 
 export function selectWoztellSendToken(env) {
-  const clean = env || {};
-
-  if (clean.WOZTELL_ACCESS_TOKEN) {
-    return {
-      token: clean.WOZTELL_ACCESS_TOKEN,
-      mode: "WOZTELL_ACCESS_TOKEN"
-    };
-  }
-
-  if (clean.WOZTELL_OPEN_API_TOKEN) {
-    return {
-      token: clean.WOZTELL_OPEN_API_TOKEN,
-      mode: "WOZTELL_OPEN_API_TOKEN"
-    };
-  }
-
-  return {
+  const tokens = selectWoztellSendTokens(env);
+  return tokens[0] || {
     token: "",
     mode: "none"
   };
+}
+
+export function selectWoztellSendTokens(env) {
+  const clean = env || {};
+  const tokens = [];
+
+  if (clean.WOZTELL_ACCESS_TOKEN) {
+    tokens.push({
+      token: clean.WOZTELL_ACCESS_TOKEN,
+      mode: "WOZTELL_ACCESS_TOKEN"
+    });
+  }
+
+  if (clean.WOZTELL_OPEN_API_TOKEN) {
+    tokens.push({
+      token: clean.WOZTELL_OPEN_API_TOKEN,
+      mode: "WOZTELL_OPEN_API_TOKEN"
+    });
+  }
+
+  return tokens;
 }
 
 export function buildWoztellSendAttempts(params) {
@@ -298,6 +313,24 @@ export function redactIdForConsole(value) {
   if (!text) return "";
   if (text.length <= 4) return "***";
   return text.slice(0, 2) + "***" + text.slice(-2);
+}
+
+function sanitizeWoztellFailureForEvent(failure, params, activeContext) {
+  const clean = params || {};
+  const context = activeContext || {};
+  return {
+    traceId: clean.traceId || context.traceId || "",
+    turnId: clean.turnId || context.turnId || "",
+    doName: clean.doName || context.doName || "",
+    mode: failure && failure.mode || "",
+    tokenType: failure && failure.tokenType || "",
+    status: failure && failure.status || 0,
+    bodyPreview: String(failure && failure.body || "").slice(0, 240),
+    channelId: clean.channelId || "",
+    recipientId: clean.recipientId || "",
+    hasMemberId: Boolean(clean.memberId || context.memberId),
+    hasAppId: Boolean(clean.appId || context.appId)
+  };
 }
 
 export function fixMojibake(text) {

@@ -6,6 +6,7 @@ import {
   redactIdForConsole,
   redactWoztellPayloadForLog,
   selectWoztellSendToken,
+  selectWoztellSendTokens,
   sendWoztellImageMessage,
   sendWoztellTemplateMessage,
   sendWoztellTextMessage
@@ -27,6 +28,10 @@ test("Woztell outbound adapter chooses token and preserves memberId-first send p
 
   assert.equal(token.mode, "WOZTELL_ACCESS_TOKEN");
   assert.equal(fallbackToken.mode, "WOZTELL_OPEN_API_TOKEN");
+  assert.deepEqual(selectWoztellSendTokens({
+    WOZTELL_ACCESS_TOKEN: "access",
+    WOZTELL_OPEN_API_TOKEN: "open"
+  }).map(function (item) { return item.mode; }), ["WOZTELL_ACCESS_TOKEN", "WOZTELL_OPEN_API_TOKEN"]);
   assert.equal(attempts[0].mode, "memberId");
   assert.equal(attempts[0].payload.memberId, "member_1");
   assert.equal(Object.hasOwn(attempts[0].payload, "recipientId"), false);
@@ -98,6 +103,54 @@ test("Woztell outbound adapter sends text, image and template through sendRespon
   assert.equal(calls[1].body.response[0].type, "IMAGE");
   assert.equal(calls[2].body.response[0].type, "TEMPLATE");
   assert.deepEqual(redactWoztellPayloadForLog(calls[0].body).responseTypes, ["TEXT"]);
+});
+
+test("Woztell outbound adapter retries open api token when access token send fails", async () => {
+  const calls = [];
+  const failures = [];
+  const result = await sendWoztellTextMessage({
+    WOZTELL_ACCESS_TOKEN: "expired-access",
+    WOZTELL_OPEN_API_TOKEN: "working-open"
+  }, {
+    channelId: "channel_1",
+    memberId: "member_1",
+    appId: "app_1",
+    text: "Hola"
+  }, {
+    fetchWithTimeout: async function (url, options) {
+      calls.push({ url, body: JSON.parse(options.body) });
+      if (url.includes("expired-access")) {
+        return {
+          ok: false,
+          status: 401,
+          async text() {
+            return "{\"error\":\"invalid token\"}";
+          }
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return "{\"ok\":true}";
+        }
+      };
+    },
+    logEvent(event, details) {
+      if (event === "WOZTELL_SEND_FAILED") failures.push(details);
+    },
+    parseCustomerReplyModelOutput(text) {
+      return { shouldSend: true, text: String(text || "").trim() };
+    }
+  });
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].url.includes("expired-access"), true);
+  assert.equal(calls[1].url.includes("working-open"), true);
+  assert.equal(result.ok, true);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].tokenType, "WOZTELL_ACCESS_TOKEN");
+  assert.equal(failures[0].status, 401);
 });
 
 test("Woztell text adapter does not print raw recipient or message text in console logs", async () => {
