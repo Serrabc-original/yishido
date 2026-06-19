@@ -8,7 +8,7 @@ export function routeCoreUtilityIntent(userTurn, options) {
   const flags = cleanOptions.flags || {};
   const media = getTurnMediaCounts(userTurn);
 
-  if (isListIntent(normalized) && isReminderIntent(normalized)) {
+  if (isListIntent(normalized) && isReminderIntent(normalized) && !isReminderOnlyListReference(normalized)) {
     const listParsed = parseListCommand(text);
     const reminderParsed = parseReminderRequest(text, cleanOptions.timezone || "UTC", {
       now: cleanOptions.now
@@ -121,8 +121,18 @@ function isReminderIntent(text) {
 }
 
 function isListIntent(text) {
+  if (isReminderOnlyListReference(text)) return false;
   if (isReminderIntent(text) && !/\blista\b/.test(text)) return false;
   return /\b(lista|listado|compras|super|supermercado|anota|agrega|quita|elimina|muestrame|mostrar|marca como hecho|marca .*comprado|comprado|pendientes)\b/.test(text);
+}
+
+function isReminderOnlyListReference(text) {
+  if (!text || !isReminderIntent(text)) return false;
+  if (!/\b(la lista|esa lista|esta lista|lista de compras|lista del super|lista supermercado|lista que)\b/.test(text)) return false;
+  if (/\b(hazme|hacer|prepara|preparame|creame|crear|generar|genera|ayudar a generar|ayudame a generar)\s+(?:una\s+)?lista\b/.test(text)) return false;
+  if (/\b(anota|agrega|quita|elimina|marca)\b/.test(text)) return false;
+  if (/\b(con|de)\s+[\p{L}\p{N}\s,]+,\s*[\p{L}\p{N}]/u.test(text)) return false;
+  return true;
 }
 
 function isImageOcrIntent(text, media) {

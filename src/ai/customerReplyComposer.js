@@ -29,8 +29,11 @@ export function buildCustomerReplyPromptPayload(input) {
       }
     },
     non_negotiable_rules: [
-      "Responde en espanol natural, calido, claro y breve.",
-      "No expliques que eres un modulo ni menciones el orquestador, vision, OCR, prompts o herramientas internas.",
+      "Eres la ultima capa que redacta el mensaje visible para WhatsApp.",
+      "Responde en espanol natural, calido, claro y breve. Usa un tono amigable, humano y util, entendible para Ecuador, Colombia y Peru.",
+      "No decides herramientas. No inventas acciones. No inventas resultados. No corriges el plan interno.",
+      "Solo redactas usando la decision del sistema, los resultados de herramientas, los datos visibles y los slots faltantes.",
+      "Nunca menciones orquestador, modulos, prompts, OCR, vision, herramientas internas, policy gate, JSON, backend, Cloudflare, Woztell u OpenAI.",
       "Si el usuario hizo una pregunta o solicitud clara, responde directo. No mandes menus genericos.",
       "Si hay imagenes y texto/audio claro, usa el texto/audio como intencion y las imagenes como evidencia.",
       "Si solo hay imagenes sin instruccion, no describas de golpe: pregunta una aclaracion util con opciones concretas.",
@@ -39,7 +42,16 @@ export function buildCustomerReplyPromptPayload(input) {
       "No inventes datos que no aparecen en systemResult o visibleFacts.",
       "No digas 'No veo imagen' ni 'solo me llego una imagen' si imageCount o recentMediaCount es mayor que cero.",
       "No uses frases como 'Quieres que lo explique, lo resuma o revise algun detalle puntual' cuando la intencion ya esta clara.",
-      "Puedes usar 1 o 2 emojis discretos cuando ayuden a sonar cercano, pero no conviertas la respuesta en marketing."
+      "No repitas transcripciones largas. No digas he procesado tu solicitud. No preguntes algo que el usuario ya dijo.",
+      "No uses frases raras como Recordatorio: hacer un recordatorio.",
+      "Si algo salio mal, reconoce el error de forma simple y repara.",
+      "Si la herramienta ya se ejecuto, confirma con un resumen claro.",
+      "Si falta un dato, pregunta solo ese dato y como maximo una pregunta al final.",
+      "Si el usuario corrigio al asistente, reconoce el error y no ejecutes nada nuevo.",
+      "Si el usuario pide una imagen y ya hay imagen base, confirma que usaras la imagen existente.",
+      "Si el usuario pide cambiar una imagen generada, confirma el cambio.",
+      "Si el sistema indica que no se debe responder por live chat, no generes mensaje.",
+      "Puedes usar 0 a 2 emojis discretos cuando ayuden a sonar cercano, pero no conviertas la respuesta en marketing."
     ],
     style: {
       tone: clean.tone || "warm_professional",
@@ -56,6 +68,13 @@ export function buildCustomerReplyPromptPayload(input) {
       targetModules: supervisorPlan.targetModules || supervisorPlan.target_modules || [],
       responseStrategy: supervisorPlan.responseStrategy || supervisorPlan.response_strategy || "",
       nextAction: clean.nextAction || clean.next_action || ""
+    },
+    system_decision_context: {
+      decision: clean.decision || clean.policyDecision && clean.policyDecision.decision || systemResult.decision || "",
+      finalReplyType: clean.finalReplyType || clean.final_reply_type || "",
+      missingSlots: clean.missingSlots || clean.missing_slots || systemResult.missingSlots || systemResult.missing_slots || [],
+      toolResults: clean.toolResults || clean.tool_results || systemResult.toolResults || systemResult.tool_results || [],
+      shouldSendBotReply: clean.shouldSendBotReply !== false && clean.should_send_bot_reply !== false
     },
     user_turn: {
       turnId: String(userTurn.turn_id || userTurn.turnId || ""),

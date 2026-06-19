@@ -415,6 +415,39 @@ test("router exposes a compound list_reminder route for list plus reminder in on
   assert.equal(route.parsed.reminder.missingFields.length, 0);
 });
 
+test("router does not execute tools for corrections or meta questions", () => {
+  const correction = routeCoreUtilityIntent({
+    current_turn_text: "No no te estoy preguntando en cuantos minutos me vas a hacer acuerdo"
+  }, {
+    flags: { enableLists: true, enableReminders: true }
+  });
+  const meta = routeCoreUtilityIntent({
+    current_turn_text: "Cuando te dije eso?"
+  }, {
+    flags: { enableLists: true, enableReminders: true }
+  });
+
+  assert.equal(correction.intent, "general");
+  assert.equal(correction.shouldHandleInCore, false);
+  assert.equal(meta.intent, "general");
+  assert.equal(meta.shouldHandleInCore, false);
+});
+
+test("router treats reminder for an existing list without time as incomplete reminder", () => {
+  const route = routeCoreUtilityIntent({
+    current_turn_text: "Hazme acuerdo de la lista de compras"
+  }, {
+    flags: { enableLists: true, enableReminders: true },
+    now: "2026-06-17T05:50:00.000Z",
+    timezone: "America/Guayaquil"
+  });
+
+  assert.equal(route.intent, "reminder");
+  assert.equal(route.shouldHandleInCore, true);
+  assert.deepEqual(route.parsed.missingFields, ["date", "time"]);
+  assert.doesNotMatch(route.parsed.title, /hacer un recordatorio/i);
+});
+
 test("router treats dentro de and min relative reminder wording as complete", () => {
   const dentro = routeCoreUtilityIntent({
     current_turn_text: "[Audio transcrito]: Me puedes poner un recordatorio dentro de 20 minutos para llamar a un cliente",

@@ -35,6 +35,82 @@ export function normalizeWoztellMessageEventMeta(payload) {
   });
 }
 
+export function normalizeWoztellLiveChatMode(input) {
+  const clean = input || {};
+  const payload = clean.payload || clean.woztellPayload || {};
+  const data = safeObject(payload.data);
+  const meta = safeObject(payload.meta || data.meta);
+  const member = safeObject(payload.member || payload.memberInfo);
+  const dataMember = safeObject(data.member || data.memberInfo);
+  const eventMeta = clean.eventMeta || clean.messageEventMeta || {};
+  const eventWoztellMeta = safeObject(eventMeta.woztellMeta || eventMeta.woztell_meta);
+  const state = clean.data || clean.state || {};
+
+  const candidates = [
+    ["payload.conversation_mode", payload.conversation_mode],
+    ["payload.conversationMode", payload.conversationMode],
+    ["payload.liveChat", payload.liveChat],
+    ["payload.live_chat", payload.live_chat],
+    ["payload.liveChatStatus", payload.liveChatStatus],
+    ["payload.chatMode", payload.chatMode],
+    ["payload.mode", payload.mode],
+    ["data.conversation_mode", data.conversation_mode],
+    ["data.conversationMode", data.conversationMode],
+    ["data.liveChat", data.liveChat],
+    ["data.live_chat", data.live_chat],
+    ["data.liveChatStatus", data.liveChatStatus],
+    ["data.chatMode", data.chatMode],
+    ["data.mode", data.mode],
+    ["meta.conversation_mode", meta.conversation_mode],
+    ["meta.conversationMode", meta.conversationMode],
+    ["meta.liveChat", meta.liveChat],
+    ["meta.live_chat", meta.live_chat],
+    ["meta.liveChatStatus", meta.liveChatStatus],
+    ["meta.chatMode", meta.chatMode],
+    ["meta.mode", meta.mode],
+    ["member.conversation_mode", member.conversation_mode],
+    ["member.conversationMode", member.conversationMode],
+    ["member.liveChat", member.liveChat],
+    ["member.live_chat", member.live_chat],
+    ["member.liveChatStatus", member.liveChatStatus],
+    ["member.chatMode", member.chatMode],
+    ["member.mode", member.mode],
+    ["data.member.conversation_mode", dataMember.conversation_mode],
+    ["data.member.conversationMode", dataMember.conversationMode],
+    ["data.member.liveChat", dataMember.liveChat],
+    ["data.member.live_chat", dataMember.live_chat],
+    ["data.member.liveChatStatus", dataMember.liveChatStatus],
+    ["data.member.chatMode", dataMember.chatMode],
+    ["data.member.mode", dataMember.mode],
+    ["eventMeta.woztellMeta.conversation_mode", eventWoztellMeta.conversation_mode],
+    ["eventMeta.woztellMeta.conversationMode", eventWoztellMeta.conversationMode],
+    ["eventMeta.woztellMeta.liveChat", eventWoztellMeta.liveChat],
+    ["eventMeta.woztellMeta.live_chat", eventWoztellMeta.live_chat],
+    ["eventMeta.woztellMeta.liveChatStatus", eventWoztellMeta.liveChatStatus],
+    ["state.conversation_mode", state.conversation_mode],
+    ["state.conversationMode", state.conversationMode],
+    ["state.liveChat", state.liveChat],
+    ["state.live_chat", state.live_chat]
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = parseLiveChatValue(candidate[1]);
+    if (parsed.known) {
+      return {
+        isLiveChat: parsed.isLiveChat,
+        conversationMode: parsed.isLiveChat ? "live_chat" : "bot",
+        source: candidate[0]
+      };
+    }
+  }
+
+  return {
+    isLiveChat: false,
+    conversationMode: "unknown",
+    source: "not_provided"
+  };
+}
+
 export function buildWoztellEventSummary(payload) {
   const clean = payload || {};
   const data = clean.data || {};
@@ -128,4 +204,69 @@ export function buildWoztellChannelCapabilities(env) {
     brainLocation: "worker",
     channelRole: "whatsapp_crm_transport"
   };
+}
+
+function safeObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function parseLiveChatValue(value) {
+  if (typeof value === "boolean") {
+    return { known: true, isLiveChat: value };
+  }
+
+  if (typeof value === "number") {
+    if (value === 1) return { known: true, isLiveChat: true };
+    if (value === 0) return { known: true, isLiveChat: false };
+    return { known: false, isLiveChat: false };
+  }
+
+  const text = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+
+  if (!text) {
+    return { known: false, isLiveChat: false };
+  }
+
+  if ([
+    "livechat",
+    "live_chat",
+    "human",
+    "human_mode",
+    "humano",
+    "manual",
+    "manual_mode",
+    "agent",
+    "agent_mode",
+    "asesor",
+    "asesor_humano",
+    "live",
+    "active",
+    "enabled",
+    "on",
+    "true",
+    "1"
+  ].includes(text)) {
+    return { known: true, isLiveChat: true };
+  }
+
+  if ([
+    "bot",
+    "bot_mode",
+    "automation",
+    "automated",
+    "auto",
+    "automatic",
+    "false",
+    "0",
+    "off",
+    "disabled",
+    "inactive"
+  ].includes(text)) {
+    return { known: true, isLiveChat: false };
+  }
+
+  return { known: false, isLiveChat: false };
 }

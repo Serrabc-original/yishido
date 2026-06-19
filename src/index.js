@@ -109,6 +109,7 @@ import { buildRequestContext, buildSupervisorInput } from "./context/requestCont
 import {
   buildWoztellConversationIdentity,
   buildWoztellEventSummary,
+  normalizeWoztellLiveChatMode,
   normalizeWoztellMessageEventMeta
 } from "./channels/woztellChannelAdapter.js";
 import {
@@ -255,8 +256,8 @@ export default {
 
     console.log("WZ_PARSED_MESSAGE:", JSON.stringify({
       type: parsedMessage.type,
-      text: parsedMessage.text || "",
-      fileId: parsedMessage.fileId || "",
+      textLength: String(parsedMessage.text || "").length,
+      fileIdPreview: safeLogIdPreview(parsedMessage.fileId || ""),
       messageId: body.messageId || parsedMessage.messageId || ""
     }));
 
@@ -309,7 +310,7 @@ export default {
         });
       }
 
-      console.log("AUDIO_FILE_ID_EXTRACTED:", parsedMessage.fileId);
+      console.log("AUDIO_FILE_ID_EXTRACTED:", safeLogIdPreview(parsedMessage.fileId));
 
       const doName = buildConversationName(body);
 
@@ -323,7 +324,7 @@ export default {
       const id = env.CONVERSATION_DO.idFromName(doName);
       const stub = env.CONVERSATION_DO.get(id);
 
-      await stub.fetch("https://conversation.local/message", {
+      const doResponse = await stub.fetch("https://conversation.local/message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -334,6 +335,30 @@ export default {
           traceId: webhookTraceId
         })
       });
+
+      const doText = await doResponse.text();
+      let doData = {};
+      try {
+        doData = doText ? JSON.parse(doText) : {};
+      } catch (error) {
+        doData = { raw: doText };
+      }
+
+      if (doData.status === "livechat_early_exit") {
+        logEvent("AUDIO_QUEUE_SKIPPED_LIVECHAT", {
+          traceId: webhookTraceId,
+          doName: doName,
+          messageId: parsedMessage.messageId || body.messageId || "",
+          conversationMode: doData.conversationMode || ""
+        });
+
+        return jsonResponse({
+          status: "livechat_early_exit",
+          routed_to: "ConversationCoordinator",
+          doName: doName,
+          coordinator: doData
+        });
+      }
 
       await enqueueAudioJob(env, ctx, {
         type: "transcribe_audio",
@@ -1103,6 +1128,27 @@ export class ConversationCoordinator {
       return jsonResponse({ status: "debug_media_sent" });
     }
 
+    const liveChatMode = normalizeWoztellLiveChatMode({
+      payload: woztellPayload,
+      eventMeta: data.messageEventMeta,
+      data: data
+    });
+
+    if (liveChatMode.conversationMode !== "unknown") {
+      data.conversationMode = liveChatMode.conversationMode;
+      data.conversation_mode = liveChatMode.conversationMode;
+    }
+
+    if (isLiveChatEarlyExitEnabled(this.env) && liveChatMode.isLiveChat) {
+      return await this.liveChatEarlyExit({
+        data: data,
+        normalized: normalized,
+        messageId: messageId,
+        liveChatMode: liveChatMode,
+        traceId: incomingTraceId
+      });
+    }
+
     const atomicAppend = await this.appendInboundEventAtomically({
       dataSeed: data,
       normalized: normalized,
@@ -1292,6 +1338,51 @@ export class ConversationCoordinator {
       status: "buffered",
       pendingCount: data.pendingMessages.length,
       processAfter: data.processAfter
+    });
+  }
+
+  async liveChatEarlyExit(params) {
+    const clean = params || {};
+    const data = clean.data || {};
+    const normalized = clean.normalized || {};
+    const messageId = String(clean.messageId || normalized.messageId || "").trim();
+    const liveChatMode = clean.liveChatMode || {};
+    const traceId = String(clean.traceId || normalized.traceId || data.currentTraceId || "");
+    const nowIso = new Date().toISOString();
+
+    if (messageId) {
+      markMessagesProcessed(data, [messageId]);
+    }
+
+    data.conversationMode = "live_chat";
+    data.conversation_mode = "live_chat";
+    data.lastInboundAt = nowIso;
+    data.updatedAt = nowIso;
+    await this.saveData(data);
+
+    logEvent("LIVECHAT_EARLY_EXIT", {
+      traceId: traceId,
+      doName: data.doName || "",
+      messageId: messageId,
+      type: normalized.type || "",
+      conversationMode: "live_chat",
+      source: liveChatMode.source || "unknown",
+      hasText: Boolean(normalized.text && normalized.text !== "[AUDIO pending transcription]"),
+      hasMedia: Boolean(
+        normalized.fileId ||
+        normalized.media && normalized.media.length ||
+        normalized.audio && normalized.audio.length ||
+        normalized.video && normalized.video.length ||
+        normalized.files && normalized.files.length
+      )
+    });
+
+    return jsonResponse({
+      status: "livechat_early_exit",
+      conversationMode: "live_chat",
+      reason: "woztell_livechat",
+      messageId: messageId,
+      source: liveChatMode.source || "unknown"
     });
   }
 
@@ -5007,18 +5098,7 @@ function buildNeutralOrchestratorPayload(env, params, context) {
   const mediaBatchSummary = context.mediaBatchSummary;
 
   return {
-    instruction: [
-      "Return valid JSON only. Do not answer the user directly.",
-      "You are a neutral WhatsApp core orchestrator, not a marketing-only agent.",
-      "First classify the user intent. Only use marketing actions when intent is marketing.",
-      "If the user explicitly asks to generate, create, design or edit an image, classify intent as image_generation and use generate_image or edit_image. This is allowed even when the request is not marketing.",
-      "If intent is reminder or list and core utilities are enabled, return should_handle_in_core true and no marketing actions.",
-      "For general list, reminder, support, order, CRM or question requests, do not ask whether the user wants text or image.",
-      "For image_question or image_ocr, use vision analysis only; do not generate marketing copy unless the user explicitly asks for a post, ad, campaign, Instagram, copy, or content calendar.",
-      "If the request is unclear, ask one brief clarification question.",
-      "Use the customer conversation profile: answer clear requests directly, ask one missing detail at a time, and never return a generic meta-menu for clear user intent.",
-      "Never publish to Meta. Never call unavailable modules as if they were active."
-    ].join(" "),
+    instruction: buildOrchestratorInstruction(),
     customer_conversation_profile: getConversationPromptGuidance(),
     plan_schema: ORCHESTRATOR_PLAN_SCHEMA,
     available_intents: ["general", "marketing", "image_generation", "reminder", "list", "image_question", "image_ocr", "crm", "orders", "support", "elderly", "unknown"],
@@ -5068,6 +5148,30 @@ function buildNeutralOrchestratorPayload(env, params, context) {
       elderly: "Optional future module."
     }
   };
+}
+
+function buildOrchestratorInstruction() {
+  return [
+    "Return ONLY valid JSON. Do not use markdown. Do not answer the user directly.",
+    "You are Yishido's WhatsApp core orchestrator. Understand the user's real intent and produce a safe execution plan for the backend.",
+    "You are not the final reply writer, not a marketing-only agent, and you do not execute tools yourself.",
+    "The user may send text, audio transcripts, images, documents, or location. Treat audio transcripts as user input, but do not copy them literally.",
+    "Extract the real goal, entities, dates, items, corrections, missing details, and dependencies from the full turn and compact conversation state.",
+    "Language context: Spanish from Ecuador, Colombia, and Peru. Understand hacer acuerdo, hacerme acuerdo, and acordarme as remind me only when the user is actually requesting a reminder.",
+    "Do not trigger reminders or lists from keywords alone. The words recordatorio or lista can appear in examples, corrections, questions, or old context.",
+    "Classify turn type internally as one of new_request, multi_intent_request, clarification_answer, confirmation, rejection, correction, meta_question, smalltalk, image_followup, document_request, location_context, or unknown; map that decision into the existing plan schema fields.",
+    "For correction or meta-question examples such as No te estoy preguntando eso, Que??, Cuando te dije eso?, Esa no es la lista, or No, lo del audio, do not plan tools. Return ask_clarification or a safe no-action plan with one repair summary.",
+    "Separate multiple tasks in the same turn and preserve order and dependencies. For a list plus reminder, plan the list first and the reminder as dependent on that list.",
+    "Lists are ephemeral by default: format and return them unless the user explicitly asks to save. Extract clean items; never copy a full transcript as one item.",
+    "A reminder requires a clear subject and due date or time. If due_at is missing, ask only when. Do not use generic titles such as hacer un recordatorio when a specific subject exists.",
+    "CRM search may be read-only without confirmation. CRM create and update need explicit intent and structured fields; messy audio should be summarized for confirmation before saving. CRM delete always requires strong confirmation and must not execute immediately.",
+    "For document requests, search/read/send existing documents only if available. Do not generate new documents unless a tenant-specific document generation module exists.",
+    "For location, use it as context only. Do not invent location output.",
+    "For image_followup words like portada, disenalo, flyer, banner, otra version, mas cute, mas chevere, neon, or Miami Wave, use relevant campaign_assets, last_uploaded_image, or last_generated_image. Do not ask the user to resend an image that is already available.",
+    "For image questions or OCR, use vision analysis only. Do not generate marketing copy unless the user explicitly asks for copy, post, ad, campaign, Instagram content, flyer, banner, portada, or content calendar.",
+    "If conversation mode is live_chat or human, do not plan a bot reply. This is a logic gate, not a style choice.",
+    "Never publish to Meta. Never call unavailable modules. Never invent tool results. Ask only one missing detail when uncertain."
+  ].join(" ");
 }
 
 function logOrchestratorPlanSelected(plan, userTurn, params, provider) {
@@ -5160,16 +5264,7 @@ async function callClaudeOrchestratorPlan(env, params) {
   });
 
   const payload = {
-    instruction: [
-      "Return valid JSON only. Do not answer the user directly.",
-      "You are a neutral WhatsApp core orchestrator, not a marketing-only agent.",
-      "First classify intent as general, marketing, image_generation, reminder, list, image_question, image_ocr, crm, orders, support, elderly, or unknown.",
-      "Only use marketing actions when intent is marketing.",
-      "If the user explicitly asks to generate, create, design or edit an image, classify intent as image_generation and use generate_image or edit_image.",
-      "Do not ask whether the user wants text or image for ordinary lists, reminders, support, orders, CRM, or general questions.",
-      "Use the customer conversation profile: answer clear requests directly, ask one missing detail at a time, and never return a generic meta-menu for clear user intent.",
-      "If intent is unclear, ask one brief clarification question."
-    ].join(" "),
+    instruction: buildOrchestratorInstruction(),
     customer_conversation_profile: getConversationPromptGuidance(),
     plan_schema: ORCHESTRATOR_PLAN_SCHEMA,
     available_intents: ["general", "marketing", "image_generation", "reminder", "list", "image_question", "image_ocr", "crm", "orders", "support", "elderly", "unknown"],
@@ -5762,35 +5857,7 @@ async function generateCopyWithOpenAI(env, params) {
     }));
   }
 
-  const prompt = [
-    "Eres el copywriter de Yishido para WhatsApp.",
-    "Redacta SOLO el texto final que se enviara al usuario.",
-    "No generes imagenes. No digas que no puedes generar imagenes.",
-    "Si el usuario pidio modificar texto previo, modifica ese texto.",
-    "Usa el idioma del usuario.",
-    "Hazlo claro, comercial y listo para publicar.",
-    "",
-    "Brief:",
-    params.brief || "",
-    "",
-    "Mensajes consolidados:",
-    consolidatedMessagesText(params.messages || []),
-    "",
-    "Ultimo copy disponible:",
-    params.conversationState && (params.conversationState.last_copy || params.conversationState.lastCopy) || "",
-    "",
-    "Fuente de activo actual:",
-    params.current_asset_source || params.campaign_state && params.campaign_state.current_asset_source || "",
-    "",
-    "Analisis visual de imagen subida:",
-    hasVisualAnalysis ? JSON.stringify(visualAnalysis, null, 2) : "No hay analisis visual disponible.",
-    "",
-    "Instrucciones para usar el analisis visual:",
-    "- Si hay analisis visual, basa el copy en lo que realmente aparece en la imagen.",
-    "- Usa producto detectado, texto visible, colores, estilo, marketing_notes y recommended_angle.",
-    "- Si hay warnings, evita afirmar cosas dudosas.",
-    "- No uses contexto de campanas anteriores si contradice el analisis visual."
-  ].join("\n");
+  const prompt = buildCopywriterPrompt(params, visualAnalysis, hasVisualAnalysis);
 
   const res = await fetchWithTimeout("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -5835,6 +5902,52 @@ async function generateCopyWithOpenAI(env, params) {
   }
 
   return output.trim();
+}
+
+function buildCopywriterPrompt(params, visualAnalysis, hasVisualAnalysis) {
+  const clean = params || {};
+  const analysis = visualAnalysis || clean.uploaded_image_analysis || clean.campaign_state && clean.campaign_state.uploaded_image_analysis || {};
+  const hasAnalysis = Boolean(hasVisualAnalysis || analysis && typeof analysis === "object" && Object.keys(analysis).length > 0);
+
+  return [
+    "Eres el copywriter de Yishido para WhatsApp.",
+    "Redacta SOLO el texto final solicitado.",
+    "No expliques tu proceso. No uses markdown pesado.",
+    "No generes imagenes. No digas que no puedes generar imagenes; si hay una capa de imagen, ella se encargara.",
+    "No manejes listas personales, recordatorios, CRM, soporte tecnico ni acciones internas.",
+    "Usa este prompt solo cuando la intencion sea copy comercial, anuncio, post, caption, mensaje de ventas, campana, calendario de contenido, mejora de texto previo o texto para flyer/banner/portada.",
+    "Si el usuario pidio modificar texto previo, modifica ese texto.",
+    "Usa el idioma del usuario.",
+    "Manten el tono pedido por el usuario o por la configuracion del tenant.",
+    "Si el usuario pidio algo listo para publicar, entrega solo el texto publicable.",
+    "Si pidio varias opciones, entrega opciones breves y diferenciadas.",
+    "Conserva la intencion del texto previo y mejora claridad, gancho y llamada a la accion.",
+    "No inventes precios, promociones, fechas, direcciones, garantias ni beneficios no dados.",
+    "Si falta un dato esencial para un anuncio, escribe una version generica sin inventar.",
+    "Estilo: claro, comercial, natural, directo, WhatsApp/social friendly, sin sonar exagerado.",
+    "",
+    "Brief:",
+    clean.brief || "",
+    "",
+    "Mensajes consolidados:",
+    consolidatedMessagesText(clean.messages || []),
+    "",
+    "Ultimo copy disponible:",
+    clean.conversationState && (clean.conversationState.last_copy || clean.conversationState.lastCopy) || "",
+    "",
+    "Fuente de activo actual:",
+    clean.current_asset_source || clean.campaign_state && clean.campaign_state.current_asset_source || "",
+    "",
+    "Analisis visual de imagen subida:",
+    hasAnalysis ? JSON.stringify(analysis, null, 2) : "No hay analisis visual disponible.",
+    "",
+    "Instrucciones para usar el analisis visual:",
+    "- Si hay analisis visual, basa el copy en lo que realmente aparece en la imagen.",
+    "- Usa producto detectado, texto visible, colores, estilo, marketing_notes y recommended_angle.",
+    "- Si hay warnings, evita afirmar cosas dudosas.",
+    "- No uses contexto de campanas anteriores si contradice el analisis visual.",
+    "- No conviertas una solicitud personal en marketing."
+  ].join("\n");
 }
 
 async function analyzeUploadedImageWithOpenAI(env, params) {
@@ -6048,6 +6161,13 @@ function safeUrlPreview(value) {
   }
 }
 
+function safeLogIdPreview(value) {
+  const raw = String(value || "");
+  if (!raw) return "";
+  if (raw.length <= 10) return raw.slice(0, 2) + "***";
+  return raw.slice(0, 6) + "***" + raw.slice(-4);
+}
+
 function summarizeVisionTextForLog(text) {
   const raw = String(text || "");
 
@@ -6081,20 +6201,7 @@ function redactSensitiveLogText(text) {
 }
 
 function buildVisionRequestBody(params) {
-  const promptText = [
-    "Analiza esta imagen para un asistente general de WhatsApp.",
-    "Devuelve solo JSON estructurado.",
-    "Identifica el sujeto principal, texto visible, marcas, colores, estilo, objetos y posibles usos.",
-    "Si el usuario pide OCR, prioriza visible_text. Si pregunta como funciona algo, describe solo lo visible y marca incertidumbre en warnings.",
-    "Incluye marketing_notes solo si la imagen o el caption sugieren un uso comercial o de contenido.",
-    "No inventes datos no visibles. Si algo no se ve, dejalo vacio o agregalo en warnings.",
-    "El JSON debe tener estas llaves exactas:",
-    "main_subject, product_type, visible_text, brand_or_labels, colors, style, objects_detected, marketing_notes, possible_use_cases, recommended_angle, warnings, confidence.",
-    "confidence debe ser un numero entre 0 y 1.",
-    "",
-    "Caption/contexto del usuario:",
-    params.caption || ""
-  ].join("\n");
+  const promptText = buildVisionPromptText(params);
 
   const body = {
     model: params.model,
@@ -6128,6 +6235,36 @@ function buildVisionRequestBody(params) {
   }
 
   return body;
+}
+
+function buildVisionPromptText(params) {
+  const clean = params || {};
+  return [
+    "Analyze this image for a general WhatsApp assistant.",
+    "Return ONLY valid JSON. Do not use markdown. Do not answer the user directly.",
+    "Your job is to extract visible facts from the image so other system layers can help the user.",
+    "Do not invent anything that is not visible. Do not identify real people by name. Do not infer private or sensitive attributes.",
+    "If something is uncertain, include it in warnings.",
+    "Prioritize the user's instruction: OCR should prioritize visible_text; identification should describe visible evidence and uncertainty; design/editing should describe visual elements useful for generation or editing; price comparison should extract prices, product names, quantities, brands, and labels.",
+    "If the user sent only an image with no instruction, provide neutral structured facts only.",
+    "Marketing is not the default. Include marketing_notes only if the caption or context explicitly suggests marketing, copy, post, ad, flyer, banner, portada, campaign, or content calendar.",
+    "Use the existing backend schema exactly. Map facts into these keys:",
+    "main_subject: main visible subject or null-like empty string.",
+    "product_type: product/category if visible; otherwise empty.",
+    "visible_text: readable text as a concise string. If there are several lines, separate them with semicolons.",
+    "brand_or_labels: visible brands, logos, labels, product names, or empty.",
+    "colors: dominant visible colors.",
+    "style: visual style, layout, lighting, blur/cropping notes when useful.",
+    "objects_detected: visible objects and people descriptions without identifying real people.",
+    "marketing_notes: null-like empty string unless marketing is explicit.",
+    "possible_use_cases: possible intents such as image_question, ocr, design_reference, product_review, price_review, or unknown.",
+    "recommended_angle: design or answer angle only when supported by visible evidence.",
+    "warnings: uncertainty notes, low quality, missing data, unreadable text, or sensitive inference boundaries.",
+    "confidence must be a number from 0 to 1.",
+    "",
+    "Caption/contexto del usuario:",
+    clean.caption || ""
+  ].join("\n");
 }
 
 async function sendVisionRequest(env, requestBody) {
@@ -7923,6 +8060,8 @@ function normalizeCoordinatorData(data) {
     phone: String(clean.phone || ""),
     member: String(clean.member || ""),
     app: String(clean.app || ""),
+    conversationMode: String(clean.conversationMode || clean.conversation_mode || "unknown"),
+    conversation_mode: String(clean.conversation_mode || clean.conversationMode || "unknown"),
     channelIdentity: clean.channelIdentity || clean.channel_identity || null,
     messageEventMeta: clean.messageEventMeta || clean.message_event_meta || null,
     lastInboundAt: String(clean.lastInboundAt || clean.last_inbound_at || ""),
@@ -10348,6 +10487,10 @@ function normalizeTextForIntent(text) {
     .trim();
 }
 
+function isLiveChatEarlyExitEnabled(env) {
+  return String(env && env.LIVECHAT_EARLY_EXIT_ENABLED || "true").toLowerCase() !== "false";
+}
+
 function extractPlainTurnText(text) {
   const lines = String(text || "").split(/\r?\n/);
   const clean = [];
@@ -11095,20 +11238,57 @@ function consolidatedMessagesText(messages) {
 }
 
 function buildImagePrompt(userPrompt, state) {
+  const cleanState = state || {};
+  const hasSourceAsset = Boolean(
+    cleanState.last_uploaded_image ||
+    cleanState.last_image_url ||
+    cleanState.current_asset_source ||
+    cleanState.uploaded_image_analysis
+  );
+
   return [
-    "Create a professional social media image.",
+    "Create or edit a WhatsApp-ready visual based on the user's design brief.",
+    "Use the uploaded/source image as the main visual reference when one is provided.",
+    "Preserve the main subject unless the user explicitly asked to change it.",
+    hasSourceAsset ? "A source image or previous asset is already available. Do not ask for a new image." : "If no source image is available, follow only the design brief.",
+    "Visual goal: create a clean, professional, visually appealing composition suitable for WhatsApp, social media, cover art, flyer, banner, or post, depending on the user's request.",
+    "Composition rules:",
+    "- Keep one clear focal point.",
+    "- Avoid clutter.",
+    "- Use strong lighting and clear contrast.",
+    "- Make the image look intentional and polished.",
+    "- Do not include tiny unreadable text.",
+    "- Do not add random words.",
+    "- Do not add watermarks.",
+    "- Do not add fake logos or brands unless explicitly provided.",
+    "- Do not invent contact information, prices, dates, addresses, or promotions.",
+    "Text rules:",
+    "- If exact text is provided, include only that exact text.",
+    "- If no exact text is provided, avoid adding text.",
+    "- If text is needed, keep it short, large, readable, and correctly spelled.",
+    "- Do not include long paragraphs inside the image.",
+    "Style: use the style requested by the user. Interpret neon, Miami Wave, mas cute, portada, flyer, banner, or post as visual style/edit requests, not as clarification requests.",
     "Quality: low generation setting is used by backend.",
-    "Use a clean commercial composition.",
-    "Do not include tiny unreadable text.",
     "",
     "User/design brief:",
     userPrompt || "",
     "",
-    "Uploaded image analysis:",
-    state && state.uploaded_image_analysis ? JSON.stringify(state.uploaded_image_analysis, null, 2) : "No uploaded image analysis available.",
+    "Source image analysis:",
+    cleanState.uploaded_image_analysis ? JSON.stringify(cleanState.uploaded_image_analysis, null, 2) : "No uploaded image analysis available.",
     "",
-    "Relevant last copy:",
-    getLastCopyFromState(state)
+    "Relevant previous image/copy context:",
+    getLastCopyFromState(cleanState),
+    "",
+    "Required text, if any:",
+    cleanState.required_text || cleanState.requiredText || "",
+    "",
+    "Negative constraints:",
+    "- no unreadable microtext",
+    "- no random typography",
+    "- no fake contact info",
+    "- no irrelevant objects",
+    "- no extra limbs or distorted subjects",
+    "- no watermarks"
   ].join("\n");
 }
 
@@ -11947,6 +12127,10 @@ export {
   mapOrchestratorActions,
   analyzeMediaBatch,
   buildMediaBatchSummary,
+  buildOrchestratorInstruction,
+  buildCopywriterPrompt,
+  buildVisionPromptText,
+  buildImagePrompt,
   createTaskIntakeFromText,
   updateTaskIntakeWithMessage,
   buildTaskIntakeDecision,

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ConversationCoordinator, buildMediaBatch } from "../src/index.js";
+import worker, { ConversationCoordinator, buildMediaBatch } from "../src/index.js";
 
 function createMemoryState() {
   const storage = new Map();
@@ -1774,6 +1774,90 @@ test("legacy single-message media batch still preserves same-turn assets", () =>
 
   assert.equal(batch.assetCount, 2);
   assert.deepEqual(batch.fileIds, ["img_a", "img_b"]);
+});
+
+test("livechat text exits before buffering, LLM calls, and bot replies", async () => {
+  const state = createMemoryState();
+  const fetchCalls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async function (url) {
+    fetchCalls.push(String(url));
+    throw new Error("livechat early exit should not call external fetch");
+  };
+  const coordinator = new ConversationCoordinator(state, env());
+  const message = textMessage("Hola, estoy hablando con un asesor", "msg_livechat_text");
+  message.payload.data.liveChat = true;
+
+  try {
+    const response = await coordinator.fetch(localMessageRequest(message));
+    const body = await response.json();
+    const saved = await state.storage.get("data");
+
+    assert.equal(body.status, "livechat_early_exit");
+    assert.equal(body.conversationMode, "live_chat");
+    assert.equal(saved.conversationMode, "live_chat");
+    assert.equal(saved.pendingMessages.length, 0);
+    assert.deepEqual(saved.processedMessageIds, ["msg_livechat_text"]);
+
+    await coordinator.processBuffer();
+    assert.equal(fetchCalls.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("livechat audio webhook skips audio queue after coordinator early exit", async () => {
+  const doCalls = [];
+  const audioJobs = [];
+  const payload = basePayload("AUDIO", {
+    messageId: "msg_livechat_audio",
+    fileId: "aud_livechat",
+    mimeType: "audio/ogg",
+    liveChat: true
+  });
+  payload.eventType = "INBOUND";
+
+  const response = await worker.fetch(new Request("https://worker.test/webhook", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }), Object.assign(env(), {
+    CONVERSATION_DO: {
+      idFromName(name) {
+        return name;
+      },
+      get(id) {
+        return {
+          async fetch(url, options) {
+            doCalls.push({
+              id: id,
+              url: String(url),
+              body: JSON.parse(String(options && options.body || "{}"))
+            });
+            return json({
+              status: "livechat_early_exit",
+              conversationMode: "live_chat",
+              messageId: "msg_livechat_audio"
+            });
+          }
+        };
+      }
+    },
+    AUDIO_QUEUE: {
+      async send(job) {
+        audioJobs.push(job);
+      }
+    }
+  }), {
+    waitUntil(promise) {
+      return promise;
+    }
+  });
+  const body = await response.json();
+
+  assert.equal(body.status, "livechat_early_exit");
+  assert.equal(doCalls.length, 1);
+  assert.equal(audioJobs.length, 0);
 });
 
 test("status events do not contaminate pending messages", async () => {

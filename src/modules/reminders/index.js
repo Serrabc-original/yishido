@@ -398,6 +398,9 @@ function extractReminderTitle(text) {
 
 function extractSmartReminderTitle(text) {
   const raw = String(text || "").replace(/\s+/g, " ");
+  const referencedListTitle = extractReferencedListReminderTitle(raw);
+  if (referencedListTitle) return referencedListTitle;
+
   const compoundListTitle = extractCompoundListReminderTitle(raw);
   if (compoundListTitle) return compoundListTitle;
 
@@ -413,6 +416,18 @@ function extractSmartReminderTitle(text) {
   const actionMatches = Array.from(raw.matchAll(/\b((?:llamar|comprar|pagar|hacer|enviar|revisar|mandar|escribir|actualizar)\b[^.?!,;]{0,160})/gi));
   if (actionMatches.length) return cleanupReminderTitle(actionMatches[actionMatches.length - 1][1]);
 
+  return "";
+}
+
+function extractReferencedListReminderTitle(text) {
+  const normalized = normalizeText(text);
+  if (!/\b(recuerdame|recordarme|recordatorio|avisame|hazme acuerdo|acuerdame)\b/.test(normalized)) return "";
+  if (/\b(hazme|hacer|prepara|preparame|creame|crear|generar|genera|ayudar a generar|ayudame a generar)\s+(?:una\s+)?lista\b/.test(normalized)) return "";
+  if (/\b(?:esta|esa|la)?\s*lista\s+(?:necesito\s+que\s+)?(?:son|sean)\b/.test(normalized)) return "";
+  if (/\b(?:lista|cosas)\s+que\s+(?:tengo\s+que\s+)?comprar\b[^.?!]*?(?:son|sean)\b/.test(normalized)) return "";
+  if (/\blista\s+de\s+compras\b/.test(normalized)) return "lista de compras";
+  if (/\blista\s+(?:del|de)\s+super\b/.test(normalized)) return "lista del super";
+  if (/\b(la lista|esa lista|esta lista|lista que)\b/.test(normalized)) return "lista";
   return "";
 }
 

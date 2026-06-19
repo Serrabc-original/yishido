@@ -95,7 +95,7 @@ export function rankMediaMemory(data, userTurn, options) {
         : asset.source === "generated_image" ? 0.78
           : 0.65;
     const generatedFollowupBoost = asset.source === "generated_image" && signals.referencesGeneratedImage ? 0.26 : 0;
-    const visualFollowupBoost = signals.referencesMedia && signals.affirmsPreviousAction ? 0.22 : 0;
+    const visualFollowupBoost = signals.referencesMedia && signals.affirmsPreviousAction ? 0.26 : 0;
     const uploadedBaseFollowupBoost = asset.source !== "generated_image" && signals.referencesGeneratedImage && signals.affirmsPreviousAction ? 0.06 : 0;
     const score = clampScore(
       (isCurrent ? 1 : 0) * 0.42 +
